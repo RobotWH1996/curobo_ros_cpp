@@ -1,0 +1,8 @@
+<launch>
+  <arg name="mode" default="debug"/>
+  <arg name="artifacts" default="$(find-pkg-share curobo_ros_cpp)/artifacts"/>
+  <node pkg="curobo_ros_cpp" exec="curobo_motion_planning_node" name="curobo_motion_planning_node" output="screen">
+    <param from="$(find-pkg-share curobo_ros_cpp)/config/$(var mode).yaml"/>
+    <param name="artifacts_directory" value="$(var artifacts)"/>
+  </node>
+</launch>

@@ -1,0 +1,13 @@
+<?xml version="1.0"?>
+<package format="3">
+ <name>curobo_ros_cpp</name><version>0.1.0</version>
+ <description>Native CUDA cuRobo ROS planning and manipulation</description>
+ <maintainer email="ai@example.com">AI robotics</maintainer><license>Apache-2.0</license>
+ <buildtool_depend>ament_cmake</buildtool_depend>
+ <depend>ament_index_cpp</depend><depend>rclcpp</depend><depend>rclcpp_action</depend><depend>curobo_ros_interfaces</depend>
+ <depend>sensor_msgs</depend><depend>geometry_msgs</depend><depend>trajectory_msgs</depend>
+ <depend>control_msgs</depend><depend>controller_manager_msgs</depend><depend>moveit_msgs</depend>
+ <depend>visualization_msgs</depend><depend>tf2_ros</depend><depend>tf2_eigen</depend><depend>urdf</depend>
+ <depend>eigen</depend><depend>yaml-cpp</depend><depend>libfcl-dev</depend>
+ <export><build_type>ament_cmake</build_type></export>
+</package>

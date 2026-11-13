@@ -157,6 +157,23 @@ int main(int argc, char **argv) {
           status = 1;
           break;
         }
+        std::vector<std::string> expected_names;
+        for (const auto &name : node->robot->full_joint_names)
+          if (name.rfind("Wheel", 0) != 0) expected_names.push_back(name);
+        if (expected_names.size() == node->robot->full_joint_names.size())
+          throw std::runtime_error("wheel output regression requires a model with wheels");
+        auto check_output = [&](const Trajectory &trajectory) {
+          if (trajectory.joint_names != expected_names)
+            throw std::runtime_error("task output lost body/gripper joints or retained wheels");
+          for (const auto &point : trajectory.points)
+            if (point.positions.size() != expected_names.size() ||
+                point.velocities.size() != expected_names.size() ||
+                point.accelerations.size() != expected_names.size())
+              throw std::runtime_error("task output columns differ after wheel projection");
+        };
+        check_output(result.trajectory);
+        for (const auto &trajectory : result.trajectories) check_output(trajectory);
+        std::cout << "TASK_OUTPUT_NO_WHEELS_PASS " << expected_names.size() << std::endl;
       }
 
       const auto both_start = node->robot->check(joint_map, "both_arms", false);

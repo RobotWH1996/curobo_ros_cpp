@@ -397,7 +397,7 @@ void RobotModel::clear_environment() {
 // 用关节速度上限把夹爪行程换成秒。
 double RobotModel::gripper_duration(const std::string &joint, double start, double target) const {
   const double delta = std::abs(target - start);
-  if (delta < 1e-8) return 0.;
+  if (delta <= .0005) return 0.;
   const auto bounds = limits.at(joint);
   const auto speed = velocity_limits.at(joint);
   if (speed <= 0 || bounds.second <= bounds.first)

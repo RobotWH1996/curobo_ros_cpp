@@ -6,6 +6,7 @@
 #include <limits>
 #include <queue>
 #include <random>
+#include <rclcpp/rclcpp.hpp>
 
 namespace curobo_ros_cpp {
 // 把产物里的原始上限乘上速度比例。速度、加速度、加加速度分别乘一次、两次、三次。
@@ -70,7 +71,14 @@ PlanResult NativePlanner::solve(Group &group, const JointMap &state,
   const auto current = positions(group, state);
   group.start.upload(current);
   std::vector<float> prm_goal;
+  const auto logger = rclcpp::get_logger("curobo_motion_planning_node");
+  std::vector<std::string> failures;
   for (int attempt = 0; attempt < attempts; ++attempt) {
+    auto reject = [&](const std::string &reason) {
+      failures.push_back("[" + std::to_string(attempt + 1) + "] " + reason);
+      RCLCPP_WARN(logger, "【规划尝试】group=%s ｜ %d/%d ｜ %s", group.name.c_str(),
+                  attempt + 1, attempts, reason.c_str());
+    };
     result.timing.attempts = attempt + 1;
     std::vector<std::vector<float>> valid_goals = goals;
     if (pose) {
@@ -93,19 +101,55 @@ PlanResult NativePlanner::solve(Group &group, const JointMap &state,
       const auto solutions = group.ik_solution.host(group.ik_seeds * group.dof);
       result.timing.ik_ms += elapsed_ms(before);
       valid_goals.clear();
+      int ik_passed = 0;
+      std::string first_collision;
       const auto check_started = Clock::now();
       for (int seed = 0; seed < group.ik_seeds; ++seed)
         if (flags[seed]) {
+          ++ik_passed;
           JointMap full = state;
           std::vector<float> q;
           for (int j = 0; j < group.dof; ++j) {
             q.push_back(solutions[seed * group.dof + j]);
             full[group.names[j]] = q.back();
           }
-          if (!robot_.check(full, group.name, true, false, payload_))
+          const auto collision = robot_.check(full, group.name, true, false, payload_);
+          if (!collision)
             valid_goals.push_back(std::move(q));
+          else if (first_collision.empty())
+            first_collision = collision->message();
         }
       result.timing.check_ms += elapsed_ms(check_started);
+      RCLCPP_INFO(logger, "【IK 候选】group=%s ｜ 尝试 %d/%d ｜ IK通过 %d/%d ｜ "
+                          "FCL剔除 %zu ｜ 可用 %zu",
+                  group.name.c_str(), attempt + 1, attempts, ik_passed, group.ik_seeds,
+                  static_cast<size_t>(ik_passed) - valid_goals.size(), valid_goals.size());
+      if (valid_goals.empty()) {
+        if (ik_passed) {
+          reject("IK有解，但FCL终点碰撞剔除全部候选；首个碰撞=" + first_collision);
+        } else {
+          const auto position = group.ik_position_error.host(group.ik_seeds);
+          const auto orientation = group.ik_orientation_error.host(group.ik_seeds);
+          const auto collision = group.ik_collision.host(group.ik_seeds);
+          int best = 0;
+          double score = std::numeric_limits<double>::infinity();
+          for (int seed = 0; seed < group.ik_seeds; ++seed) {
+            const double candidate = position[seed] / settings.position_tolerance +
+                                     orientation[seed] / settings.orientation_tolerance;
+            if (std::isfinite(candidate) && candidate < score) {
+              score = candidate;
+              best = seed;
+            }
+          }
+          reject("IK无通过候选（不可直接判定机械不可达）；最佳位姿种子=" +
+                 std::to_string(best) + " position_error_m=" + std::to_string(position[best]) +
+                 " limit_m=" + std::to_string(settings.position_tolerance) +
+                 " orientation_error_rad=" + std::to_string(orientation[best]) +
+                 " limit_rad=" + std::to_string(settings.orientation_tolerance) +
+                 " collision_cost=" + std::to_string(collision[best]));
+        }
+        continue;
+      }
     }
     if (valid_goals.empty()) continue;
     std::vector<float> packed;
@@ -141,6 +185,13 @@ PlanResult NativePlanner::solve(Group &group, const JointMap &state,
     result.timing.graph_ms += group.planner->last_rrt_time() * 1000;
     result.timing.trajopt_ms += std::max(0., total - group.planner->last_rrt_time() * 1000);
     if (!success) {
+      reject("IK/目标候选有效，但轨迹求解器成功标志=0；cost=" +
+             std::to_string(group.cost.host(1).front()) + " collision_cost=" +
+             std::to_string(group.collision.host(1).front()) + " RRT允许=" +
+             std::to_string(request.allow_rrt) + " RRT使用=" +
+             std::to_string(group.used_rrt.host(1).front()) + " RRT迭代=" +
+             std::to_string(group.rrt_iterations.host(1).front()) +
+             " solve_ms=" + std::to_string(total));
       if (allow_graph && settings.graph == "prm" && prm_goal.empty())
         prm_goal = valid_goals.front();
       continue;
@@ -151,7 +202,7 @@ PlanResult NativePlanner::solve(Group &group, const JointMap &state,
       endpoint[group.names[j]] = result.trajectory.points.back().positions[j];
     const auto check = robot_.check(endpoint, group.name, true, false, payload_);
     if (check) {
-      result.message = "FCL endpoint collision " + check->message();
+      reject("求解器成功，但FCL终点验收碰撞：" + check->message());
       continue;
     }
     result.success = true;
@@ -160,8 +211,8 @@ PlanResult NativePlanner::solve(Group &group, const JointMap &state,
   }
   if (allow_graph && settings.graph == "prm" && !prm_goal.empty())
     return plan_prm(group, state, prm_goal);
-  if (result.message.empty())
-    result.message = "planning failed after " + std::to_string(attempts) + " attempts";
+  result.message = "planning failed after " + std::to_string(attempts) + " attempts";
+  for (const auto &failure : failures) result.message += "; " + failure;
   return result;
 }
 // 关节目标直接优化，不经过逆解。
@@ -193,6 +244,14 @@ PlanResult NativePlanner::plan_joint(const std::string &name, const JointMap &st
 // 位姿先逆解出关节目标，再做轨迹优化。
 PlanResult NativePlanner::plan_pose(const std::string &name, const JointMap &state,
                                     const std::map<std::string, Transform> &targets, int attempts) {
+  for (const auto &[tool, target] : targets) {
+    const Eigen::Quaterniond q(target.linear());
+    const auto &p = target.translation();
+    RCLCPP_INFO(rclcpp::get_logger("curobo_motion_planning_node"),
+                "【规划目标】group=%s tool=%s ｜ 基座系 position_m=[%.6f, %.6f, %.6f] "
+                "orientation_xyzw=[%.6f, %.6f, %.6f, %.6f]",
+                name.c_str(), tool.c_str(), p.x(), p.y(), p.z(), q.x(), q.y(), q.z(), q.w());
+  }
   synchronize(name, state);
   auto &group = get(name);
   fill_targets(group, state, targets);

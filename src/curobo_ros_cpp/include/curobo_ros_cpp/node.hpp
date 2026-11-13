@@ -7,6 +7,7 @@
 #include <curobo_ros_interfaces/action/pick_place.hpp>
 #include <curobo_ros_interfaces/action/place.hpp>
 #include <curobo_ros_interfaces/msg/mpc_plan.hpp>
+#include <curobo_ros_interfaces/msg/trajectory_block.hpp>
 #include <curobo_ros_interfaces/msg/mpc_target.hpp>
 #include <curobo_ros_interfaces/srv/compute_ik.hpp>
 #include <curobo_ros_interfaces/srv/plan_joint_goal.hpp>
@@ -95,7 +96,8 @@ class PlanningNode : public rclcpp::Node {
   // 把本阶段的工具目标画到 /curobo/goal_waypoints。
   void publish_goals(const std::string &stage, const std::map<std::string, Transform> &goals);
   // 发布规划轨迹，按配置生成 RViz 显示路径和末端折线。start 提供未规划关节的起始值。
-  void publish(const std::string &group, const JointMap &start, const Trajectory &trajectory);
+  void publish(const std::string &group, const JointMap &start, const Trajectory &trajectory,
+               bool command = true);
   // 执行抓取、放置或组合任务。至少提供 pick 或 place 其中一个。
   // timeout 是整任务预算，单位秒。started 使用单调时钟，并可包含进入求解器前的排队时间。
   // cancelled 查询取消状态，feedback 接收阶段与状态信息。启用执行时等待控制器结果。
@@ -103,7 +105,8 @@ class PlanningNode : public rclcpp::Node {
       const interfaces::msg::PickTask *pick, const interfaces::msg::PlaceTask *place,
       double timeout, const std::function<bool()> &cancelled,
       const std::function<void(const std::string &, const std::string &)> &feedback,
-      Clock::time_point started = Clock::now());
+      Clock::time_point started = Clock::now(), const std::string &task_id = {},
+      bool stop_at_pick = false);
 
   std::unique_ptr<RobotModel> robot;       // 名义模型和 FCL
   std::unique_ptr<NativePlanner> planner;  // GPU 求解器
@@ -166,6 +169,10 @@ class PlanningNode : public rclcpp::Node {
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_sub_;  // 关节反馈
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_;  // 场景点云
   rclcpp::Subscription<interfaces::msg::MpcTarget>::SharedPtr target_sub_;  // 跟随目标
+  rclcpp::Publisher<interfaces::msg::TrajectoryBlock>::SharedPtr block_pub_;
+  rclcpp::Subscription<interfaces::msg::TrajectoryBlock>::SharedPtr block_cancel_sub_;
+  std::mutex block_cancel_mutex_;
+  std::string block_cancel_task_id_;
   rclcpp::Publisher<Trajectory>::SharedPtr trajectory_pub_;  // 规划出的关节轨迹
   rclcpp::Publisher<moveit_msgs::msg::DisplayTrajectory>::SharedPtr display_pub_;  // RViz 轨迹预览
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr marker_pub_;  // 末端折线

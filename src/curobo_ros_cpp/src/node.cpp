@@ -182,6 +182,15 @@ PlanningNode::PlanningNode(const rclcpp::NodeOptions &options)
       subscription_options);
   trajectory_pub_ = create_publisher<Trajectory>(
       parameter<std::string>("planned_trajectory_topic", "/curobo/planned_trajectory"), 1);
+  const auto block_topic =
+      parameter<std::string>("planned_trajectory_topic", "/curobo/planned_trajectory") + "/blocks";
+  block_pub_ = create_publisher<interfaces::msg::TrajectoryBlock>(block_topic, 16);
+  block_cancel_sub_ = create_subscription<interfaces::msg::TrajectoryBlock>(
+      block_topic, 16, [this](interfaces::msg::TrajectoryBlock::ConstSharedPtr message) {
+        if (!message->cancel || message->task_id.empty()) return;
+        std::lock_guard<std::mutex> guard(block_cancel_mutex_);
+        block_cancel_task_id_ = message->task_id;
+      }, subscription_options);
   display_pub_ = create_publisher<moveit_msgs::msg::DisplayTrajectory>("/display_planned_path", 1);
   const auto marker = parameter<std::string>("trajectory_marker_topic", "");
   marker_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(
@@ -440,14 +449,14 @@ void PlanningNode::publish_goals(const std::string &stage,
 }
 // 同时发轨迹话题、MoveIt 显示和末端折线。
 void PlanningNode::publish(const std::string &group, const JointMap &start,
-                           const Trajectory &trajectory) {
+                           const Trajectory &trajectory, bool command) {
   auto output = trajectory;
-  if (output.joint_names.size() == robot->profile.groups.at(group).size() && group != "both_arms")
-    output = expand_trajectory(output, robot->profile.groups.at("both_arms"), start);
   output.header.frame_id = base;
   output.header.stamp = now();
-  trajectory_pub_->publish(output);
+  if (command) trajectory_pub_->publish(output);
   if (!parameter<bool>("visualize_trajectory", true)) return;
+  if (output.joint_names.size() == robot->profile.groups.at(group).size() && group != "both_arms")
+    output = expand_trajectory(output, robot->profile.groups.at("both_arms"), start);
   moveit_msgs::msg::DisplayTrajectory display;
   display.model_id = robot_model_id_.empty() ? robot->profile.id : robot_model_id_;
   for (const auto &joint : start) {
@@ -526,12 +535,11 @@ void PlanningNode::plan_joint(
       parts.push_back(std::move(result.trajectory));
     }
     if (parts.empty()) throw std::runtime_error("empty waypoints");
-    auto trajectory = parts.size() == 1
-                          ? parts.front()
-                          : blend_trajectories(parts, robot->profile.groups.at(request->group_name),
-                                               planner->dynamic_limits(request->group_name),
-                                               std::vector<bool>(parts.size(), false))
-                                .trajectory;
+    auto trajectory =
+        blend_trajectories(parts, robot->profile.groups.at(request->group_name),
+                           planner->dynamic_limits(request->group_name),
+                           std::vector<bool>(parts.size(), false))
+            .trajectory;
     planner->validate(request->group_name, initial, trajectory);
     publish(request->group_name, initial, trajectory);
     execution->submit(request->group_name, trajectory, [] { return false; });
@@ -745,7 +753,17 @@ template <class Action>
 void PlanningNode::run_action(std::shared_ptr<rclcpp_action::ServerGoalHandle<Action>> handle,
                               double timeout, Clock::time_point started) {
   auto goal = handle->get_goal();
-  auto cancelled = [&] { return shutdown_ || !rclcpp::ok() || handle->is_canceling(); };
+  std::string task_id;
+  constexpr char hex[] = "0123456789abcdef";
+  for (auto byte : handle->get_goal_id()) {
+    task_id += hex[byte >> 4];
+    task_id += hex[byte & 15];
+  }
+  auto cancelled = [&] {
+    if (shutdown_ || !rclcpp::ok() || handle->is_canceling()) return true;
+    std::lock_guard<std::mutex> guard(block_cancel_mutex_);
+    return block_cancel_task_id_ == task_id;
+  };
   auto feedback = [&](const std::string &stage, const std::string &message) {
     auto value = std::make_shared<typename Action::Feedback>();
     value->stage = stage;
@@ -754,11 +772,12 @@ void PlanningNode::run_action(std::shared_ptr<rclcpp_action::ServerGoalHandle<Ac
   };
   TaskResult outcome;
   if constexpr (std::is_same_v<Action, interfaces::action::Pick>)
-    outcome = manipulate(&goal->task, nullptr, timeout, cancelled, feedback, started);
+    outcome = manipulate(&goal->task, nullptr, timeout, cancelled, feedback, started, task_id,
+                         goal->stop_at_pick);
   else if constexpr (std::is_same_v<Action, interfaces::action::Place>)
-    outcome = manipulate(nullptr, &goal->task, timeout, cancelled, feedback, started);
+    outcome = manipulate(nullptr, &goal->task, timeout, cancelled, feedback, started, task_id);
   else
-    outcome = manipulate(&goal->pick, &goal->place, timeout, cancelled, feedback, started);
+    outcome = manipulate(&goal->pick, &goal->place, timeout, cancelled, feedback, started, task_id);
   auto result = std::make_shared<typename Action::Result>();
   result->success = outcome.success;
   result->execution_requested = outcome.execution_requested;

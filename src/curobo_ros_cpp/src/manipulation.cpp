@@ -26,6 +26,13 @@ Trajectory interval(const Trajectory &trajectory, double start, double end) {
   add(end);
   return result;
 }
+Trajectory without_wheel_joints(const Trajectory &trajectory) {
+  std::vector<std::string> names;
+  for (const auto &name : trajectory.joint_names)
+    if (name.rfind("Wheel", 0) != 0) names.push_back(name);
+  return names.size() == trajectory.joint_names.size() ? trajectory :
+                                                         select_joints(trajectory, names);
+}
 struct ContactPath {
   Transform start, end;
 };
@@ -35,7 +42,7 @@ TaskResult PlanningNode::manipulate(
     const interfaces::msg::PickTask *pick, const interfaces::msg::PlaceTask *place, double timeout,
     const std::function<bool()> &cancelled,
     const std::function<void(const std::string &, const std::string &)> &feedback,
-    Clock::time_point started) {
+    Clock::time_point started, const std::string &task_id, bool stop_at_pick) {
   TaskResult result;
   result.execution_requested = execution->enabled();
   const double task_timeout = timeout > 0. ? timeout : parameter<double>("pick_place_timeout", 180.);
@@ -70,6 +77,22 @@ TaskResult PlanningNode::manipulate(
     }
   } restore{planner.get(), planner->payload(), planner->world_state(), get_logger()};
   bool submitted = false;
+  const bool external_stream = !execution->enabled() && !task_id.empty();
+  uint32_t block_revision = 0;
+  builtin_interfaces::msg::Time stream_stamp;
+  auto send_block = [&](bool final, bool cancel) {
+    if (!external_stream) return;
+    if (block_revision == 0) stream_stamp = now();
+    interfaces::msg::TrajectoryBlock message;
+    message.task_id = task_id;
+    message.block_index = ++block_revision;
+    message.final = final;
+    message.cancel = cancel;
+    result.trajectory.header.frame_id = base;
+    result.trajectory.header.stamp = stream_stamp;
+    message.trajectory = result.trajectory;
+    block_pub_->publish(message);
+  };
   auto check = [&] {
     if (cancelled()) throw std::runtime_error("cancelled");
     if (timed_out()) throw std::runtime_error("Action timeout");
@@ -183,7 +206,7 @@ TaskResult PlanningNode::manipulate(
       object.source_pose = robot->tool(current, group) * object.in_tool;
       planner->set_payload(object);
     }
-    if (pick) current[gripper] = pick->open_position;
+    if (pick && !stop_at_pick) current[gripper] = pick->open_position;
     std::vector<std::pair<Transform, Eigen::Vector3d>> source_exclusions;
     const auto frozen_cloud = update_world(group, initial, parameter<bool>("use_pointcloud", true));
     // 抬升或撤退后，用冻结点云去掉已处理物体并刷新碰撞场景。
@@ -202,7 +225,7 @@ TaskResult PlanningNode::manipulate(
     std::vector<JointMap> stage_states;
     std::vector<std::string> stages;
     double open_from = initial.at(gripper), open_to = pick ? pick->open_position : open_from;
-    bool opening = pick;
+    bool opening = pick && !stop_at_pick;
     auto set_stage = [&](const std::string &stage) {
       check();
       result.stage = stage;
@@ -226,7 +249,15 @@ TaskResult PlanningNode::manipulate(
         part = planner->plan_pose(group, current, {{tool, in_base(waypoint.pose)}});
       else
         throw std::invalid_argument("waypoint.type must be joint or pose");
-      if (!part.success) throw std::runtime_error(part.message);
+      if (!part.success) {
+        RCLCPP_ERROR(get_logger(),
+                     "【阶段失败】group=%s stage=%s ｜ 耗时 %.1f 毫秒 ｜ ik %.1f ｜ graph %.1f ｜ "
+                     "trajopt %.1f ｜ fcl %.1f ｜ attempts %d ｜ %s",
+                     group.c_str(), stage.c_str(), elapsed_ms(before), part.timing.ik_ms,
+                     part.timing.graph_ms, part.timing.trajopt_ms, part.timing.check_ms,
+                     part.timing.attempts, part.message.c_str());
+        throw std::runtime_error(part.message);
+      }
       check();
       auto full = expand_trajectory(part.trajectory, names, current);
       for (size_t i = 0; i < names.size(); ++i) current[names[i]] = full.points.back().positions[i];
@@ -292,7 +323,7 @@ TaskResult PlanningNode::manipulate(
           }
         }
       }
-      result.trajectories.push_back(merged.trajectory);
+      result.trajectories.push_back(without_wheel_joints(merged.trajectory));
       std::string labels, shown;
       for (const auto &stage : stages) {
         if (!labels.empty()) labels += "+";
@@ -314,9 +345,10 @@ TaskResult PlanningNode::manipulate(
     auto commit = [&](Trajectory chunk) {
       if (chunk.points.empty()) return;
       check();
-      completed.push_back(std::move(chunk));
+      completed.push_back(without_wheel_joints(chunk));
       result.trajectory = concatenate(completed);
-      publish(group, initial, result.trajectory);
+      publish(group, initial, result.trajectory, !external_stream);
+      if (external_stream) send_block(false, false);
       execution->submit(group, result.trajectory, stopped);
       submitted = execution->enabled();
       RCLCPP_INFO(get_logger(), "【提交】第 %zu 块 ｜ 已等待 %.1f 毫秒", completed.size(),
@@ -337,7 +369,7 @@ TaskResult PlanningNode::manipulate(
       }
       append_hold(gripper_path, parameter<double>("gripper_wait_time", 1.));
       current[gripper] = target;
-      result.trajectories.push_back(gripper_path);
+      result.trajectories.push_back(without_wheel_joints(gripper_path));
       result.trajectory_stages.push_back(stage);
       commit(block.points.empty() ? gripper_path : concatenate({block, gripper_path}));
     };
@@ -354,12 +386,14 @@ TaskResult PlanningNode::manipulate(
         move(pick->waypoints[i], "pick_via_" + std::to_string(i), false, {});
       move(empty, "prepick", false, prepick);
       move(empty, "pick", true, grasp);
-      close(pick->close_position, "close");
-      object.source_pose = robot->tool(current, group) * object.in_tool;
-      planner->set_payload(object);
-      move(empty, "lift", true, lift);
-      refresh_world();
-      if (!pick->end_pose.type.empty()) move(pick->end_pose, "end", false, {});
+      if (!stop_at_pick) {
+        close(pick->close_position, "close");
+        object.source_pose = robot->tool(current, group) * object.in_tool;
+        planner->set_payload(object);
+        move(empty, "lift", true, lift);
+        refresh_world();
+        if (!pick->end_pose.type.empty()) move(pick->end_pose, "end", false, {});
+      }
     }
     if (place) {
       const auto reference = in_base(place->tool_pose);
@@ -384,6 +418,7 @@ TaskResult PlanningNode::manipulate(
     auto remainder = arm_block();
     if (!remainder.points.empty()) commit(std::move(remainder));
     check();
+    if (external_stream) send_block(true, false);
     const double planning_ms = elapsed_ms(started);
     if (submitted) {
       execution->wait(stopped);
@@ -400,6 +435,7 @@ TaskResult PlanningNode::manipulate(
     close_task("成功");
   } catch (const std::exception &error) {
     result.message = cancelled() ? "Action cancelled" : timed_out() ? "Action timeout" : error.what();
+    if (block_revision && external_stream) send_block(true, true);
     if (submitted) execution->cancel();
     const auto label = stage_text(result.stage);
     RCLCPP_ERROR(get_logger(), "【任务】失败 ｜ 阶段 %s ｜ 总耗时 %.1f 毫秒 ｜ 已提交 %s ｜ 错误：%s",

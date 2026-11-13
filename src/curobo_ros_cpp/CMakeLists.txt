@@ -32,7 +32,7 @@ add_library(curobo_planning
   src/native_planner_mpc.cpp
 )
 target_include_directories(curobo_planning PUBLIC include ${FCL_INCLUDE_DIRS})
-ament_target_dependencies(curobo_planning sensor_msgs geometry_msgs trajectory_msgs urdf curobo_ros_interfaces)
+ament_target_dependencies(curobo_planning rclcpp sensor_msgs geometry_msgs trajectory_msgs urdf curobo_ros_interfaces)
 target_link_libraries(curobo_planning curobo_runtime CUDA::cudart Eigen3::Eigen yaml-cpp fcl)
 target_compile_options(curobo_planning PRIVATE -Wall -Wextra -Wpedantic)
 set_target_properties(curobo_planning PROPERTIES BUILD_RPATH "${CUROBO_NATIVE_BUILD}" INSTALL_RPATH "$ORIGIN")

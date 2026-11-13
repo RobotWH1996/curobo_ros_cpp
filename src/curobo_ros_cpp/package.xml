@@ -8,6 +8,8 @@
  <depend>sensor_msgs</depend><depend>geometry_msgs</depend><depend>trajectory_msgs</depend>
  <depend>control_msgs</depend><depend>controller_manager_msgs</depend><depend>moveit_msgs</depend>
  <depend>visualization_msgs</depend><depend>tf2_ros</depend><depend>tf2_eigen</depend><depend>urdf</depend>
+ <exec_depend>launch</exec_depend><exec_depend>launch_ros</exec_depend>
+ <exec_depend>robot_state_publisher</exec_depend>
  <depend>eigen</depend><depend>yaml-cpp</depend><depend>libfcl-dev</depend>
  <export><build_type>ament_cmake</build_type></export>
 </package>

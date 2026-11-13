@@ -2,6 +2,8 @@ curobo_ros_interfaces/PickTask task
 # Execution is controlled by the node debug/deploy configuration.
 # Whole-task timeout; zero uses node default.
 float64 timeout
+# Debug approach only: prepick -> pick, keep gripper unchanged, then stop.
+bool stop_at_pick false
 ---
 bool success
 bool execution_requested

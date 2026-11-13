@@ -97,10 +97,14 @@ source install/setup.bash
 ```bash
 source <curobo_ros_cpp>/install/setup.bash
 export ROS_DOMAIN_ID=<与机器人网络一致>
-ros2 launch curobo_ros_cpp curobo_motion_planning.launch.xml mode:=deploy
+ros2 launch curobo_ros_cpp curobo_motion_planning_deploy.launch.py mode:=deploy
 ```
 
 `mode` 选择 `share/curobo_ros_cpp/config/<mode>.yaml`，默认 `debug`。产物默认从已安装包的 `share/curobo_ros_cpp/artifacts` 加载。也可在启动时用 `artifacts:=<目录>` 指定其他产物。
+部署 launch 默认同时启动 `robot_state_publisher`，使用导出的 `robot.urdf` 和配置中的
+`joint_states_topic` 发布机器人 TF。相机驱动已发布光学系静态外参时保持默认
+`publish_camera_tf:=false`；仅在没有外部发布者时才设置 `publish_camera_tf:=true`，
+并核对 `camera_xyz`、`camera_rpy`。只测试 TF 时可设置 `start_planner:=false`。
 
 ```text
 启动
@@ -160,6 +164,19 @@ ros2 launch curobo_ros_cpp curobo_motion_planning.launch.xml mode:=deploy
 `/place` 同样两段：接近和放置用 OPT 与接触插补，释放后把物体留在场景里，撤退沿用接触段规则。`gripper_duration` 仍留在消息里，节点不使用它。
 
 点云过滤由 `self_filter_mode` 控制。`off` 跳过本体判断，`observe` 生成过滤诊断，`apply` 将过滤结果用于规划。单臂组只判断运动臂的本体点。同一体素包含本体点和环境点时，优先保留环境点作为代表。
+抓放内部继续使用全模型固定关节；发往执行桥接的轨迹不携带四个轮关节。桥接不控制轮子，
+因此不再要求外部轮编码器状态，也不会用零值代替真实反馈。
+
+## 旧任务客户端与实机部署
+
+`deploy` 抓放按 Action UUID 向 `/curobo/planned_trajectory/blocks` 发布不可变累积前缀，
+每个消息带递增 `block_index`，最后单独发布 `final=true`；失败或取消发送取消标记。
+同一任务不再向普通轨迹话题重复发送执行指令。普通关节规划仍输出请求组的关节。
+`Pick.stop_at_pick=true` 仅执行 prepick → pick，保持当前夹爪开度；放置点调试也可映射到这个入口。
+运行旧 `lycus_task_flow` 时先 source 旧任务工作区，再 source 本包安装目录，让更新后的消息接口优先。
+
+实机 deploy 保留 `self_filter_mode=apply`、`gripper_wait_time=0` 和 `[33,65]` IK 预热。
+机器人模型和导出 AOT 必须一起更新；不要仅替换几何目录的 URDF。
 
 ## 接口
 

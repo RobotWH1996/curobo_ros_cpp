@@ -1,7 +1,9 @@
 <launch>
   <arg name="mode" default="debug"/>
+  <arg name="log_level" default="info"/>
   <arg name="artifacts" default="$(find-pkg-share curobo_ros_cpp)/artifacts"/>
-  <node pkg="curobo_ros_cpp" exec="curobo_motion_planning_node" name="curobo_motion_planning_node" output="screen">
+  <node pkg="curobo_ros_cpp" exec="curobo_motion_planning_node" name="curobo_motion_planning_node"
+        output="screen" args="--ros-args --log-level curobo_motion_planning_node:=$(var log_level)">
     <param from="$(find-pkg-share curobo_ros_cpp)/config/$(var mode).yaml"/>
     <param name="artifacts_directory" value="$(var artifacts)"/>
   </node>

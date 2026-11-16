@@ -1,0 +1,44 @@
+# 普通 MPC 循环路点。改完直接重新运行 call_follow_mpc.sh。
+# 每条按顺序下发，停留 duration_s 秒后切下一条，末尾回到第一条。
+# 只写 left 时右臂钉在当前末端；只写 right 时左臂钉住。两边都写则双臂一起跟。
+# 位姿是工具末端在 frame_id 下的绝对位姿。姿态填真实四元数，不要用 (0, 0, 0, 1)。
+# 第 1、2、3 条都是当时的 left_arm_ee_link，相对 base_link。
+frame_id: base_link
+publish_hz: 10.0
+timeout: 0.0
+position_tolerance: 0.0
+orientation_tolerance: 0.0
+waypoints:
+  - duration_s: 8.0
+    left:
+      position:
+        x: -0.028443784354
+        y: 1.185588578104
+        z: 1.367753706228
+      orientation:
+        x: -0.003277624538
+        y: 0.704113175990
+        z: 0.065113908480
+        w: 0.707088446729
+  - duration_s: 8.0
+    left:
+      position:
+        x: 0.673044163035
+        y: 0.840277286021
+        z: 1.201921285940
+      orientation:
+        x: 0.157791211539
+        y: -0.043820756899
+        z: -0.502351495000
+        w: 0.849013928211
+  - duration_s: 8.0
+    left:
+      position:
+        x: 0.869987060852
+        y: 0.340714549556
+        z: 1.245803977803
+      orientation:
+        x: -0.003875268929
+        y: -0.174825017350
+        z: -0.751947891572
+        w: 0.635606453680

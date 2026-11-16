@@ -10,7 +10,8 @@ namespace curobo_ros_cpp {
 MpcProposal NativePlanner::mpc_step(const std::string &name, const JointMap &state,
                                     const std::map<std::string, Transform> &targets,
                                     const TrajectorySample &physical_handoff, int executed_knots,
-                                    bool reset, double velocity_scale) {
+                                    bool reset, double velocity_scale,
+                                    const std::vector<double> &cold_seed_goal, bool joint_goal) {
   if (!std::isfinite(velocity_scale) || velocity_scale <= 0. || velocity_scale > 1.)
     throw std::invalid_argument("invalid MPC velocity scale");
   auto handoff = physical_handoff;
@@ -20,7 +21,7 @@ MpcProposal NativePlanner::mpc_step(const std::string &name, const JointMap &sta
   const auto started = Clock::now();
   synchronize(name, state, true);
   auto &group = get(name, true);
-  fill_targets(group, state, targets);
+  if (!joint_goal) fill_targets(group, state, targets);
   auto q = positions(group, state);
   if (handoff.position.size() == group.dof)
     for (int j = 0; j < group.dof; ++j) q[j] = handoff.position[j];
@@ -44,17 +45,31 @@ MpcProposal NativePlanner::mpc_step(const std::string &name, const JointMap &sta
   group.mpc_initialized = true;
   if (reset) {
     std::vector<float> seed;
-    for (int i = 0; i < group.knots; ++i) seed.insert(seed.end(), q.begin(), q.end());
+    if ((joint_goal || !cold_seed_goal.empty()) && cold_seed_goal.size() != q.size())
+      throw std::invalid_argument("invalid MPC cold seed joint count");
+    for (int i = 0; i < group.knots; ++i) {
+      const double fraction = static_cast<double>(i + 1) / group.knots;
+      for (size_t j = 0; j < q.size(); ++j) {
+        const double endpoint = cold_seed_goal.empty() ? q[j] : cold_seed_goal[j];
+        seed.push_back(q[j] + fraction * (endpoint - q[j]));
+      }
+    }
     group.knots_buffer.upload(seed);
-    curobo::robot::MpcCartesianConfig configuration;
-    configuration.constrain_path = false;
-    group.mpc->reset_cartesian(group.ik_goals.get(), group.ik_quaternions.get(),
-                               group.knots_buffer.get(), configuration);
-  } else
+    if (joint_goal) {
+      group.goal.upload(std::vector<float>(cold_seed_goal.begin(), cold_seed_goal.end()));
+      group.mpc->reset(group.goal.get(), group.knots_buffer.get());
+    } else {
+      curobo::robot::MpcCartesianConfig configuration;
+      configuration.constrain_path = false;
+      group.mpc->reset_cartesian(group.ik_goals.get(), group.ik_quaternions.get(),
+                                 group.knots_buffer.get(), configuration);
+    }
+  } else if (!joint_goal) {
     group.mpc->update_cartesian_target(group.ik_goals.get(), group.ik_quaternions.get());
+  }
   std::vector<float> reference = q, dof_weights(group.dof, 0.F);
   float posture_weight = 0.F;
-  if (settings.mpc_posture_weight > 0.) {
+  if (!joint_goal && settings.mpc_posture_weight > 0.) {
     group.start.upload(q);
     group.kinematics->forward(group.start.get(), group.fk_position.get(), group.fk_quaternion.get(),
                               group.fk_jacobian.get(), 1, 1);
@@ -106,7 +121,7 @@ MpcProposal NativePlanner::mpc_step(const std::string &name, const JointMap &sta
       }
     }
   }
-  if (settings.mpc_run_ik) {
+  if (!joint_goal && settings.mpc_run_ik) {
     auto ik = inverse_kinematics(name, state, targets, true);
     if (ik.success) {
       for (int j = 0; j < group.dof; ++j) reference[j] = ik.trajectory.points.back().positions[j];
@@ -114,7 +129,7 @@ MpcProposal NativePlanner::mpc_step(const std::string &name, const JointMap &sta
       posture_weight = std::max(1.F, posture_weight);
     }
   }
-  group.mpc->set_joint_tracking(reference, dof_weights, posture_weight);
+  if (!joint_goal) group.mpc->set_joint_tracking(reference, dof_weights, posture_weight);
   if (handoff.position.size() == group.dof)
     upload(group.start, handoff.position);
   else
@@ -127,7 +142,9 @@ MpcProposal NativePlanner::mpc_step(const std::string &name, const JointMap &sta
   result.success = output.feasible;
   result.sample_dt = output.trajectory_dt / velocity_scale;
   result.knot_dt = result.sample_dt * group.interpolation_steps;
-  result.message = result.success ? "MPC feasible" : "MPC infeasible";
+  result.message = result.success ? "MPC feasible" : "MPC infeasible (candidate=" +
+      std::to_string(output.selected_candidate) + ", cost=" + std::to_string(output.cost) +
+      ", collision_cost=" + std::to_string(output.collision_cost) + ")";
   if (!result.success) return result;
   result.trajectory.joint_names = group.names;
   const auto count = static_cast<size_t>(group.horizon) * group.dof;

@@ -191,10 +191,12 @@ class NativePlanner {
   // 计算一拍 MPC。state 用于同步机器人几何，handoff 提供本拍起点的关节状态。
   // executed_knots 指相对上次接受轨迹推进的控制点数，reset 请求冷启动。
   // velocity_scale 用于转换求解和执行时间尺度，可行结果仍需由调用方接受。
+  // joint_goal 固定预测末端的关节目标，由 cold_seed_goal 提供。
   MpcProposal mpc_step(const std::string &group, const JointMap &state,
                        const std::map<std::string, Transform> &targets,
                        const TrajectorySample &handoff, int executed_knots, bool reset,
-                       double velocity_scale = 1.);
+                       double velocity_scale = 1.,
+                       const std::vector<double> &cold_seed_goal = {}, bool joint_goal = false);
   // 接受本拍 MPC 结果，下一拍从这里热启动。
   void accept_mpc(const std::string &group);
   // 丢弃所有组的 MPC 热启动状态。

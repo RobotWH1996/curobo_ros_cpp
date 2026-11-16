@@ -9,6 +9,15 @@
 #include <tf2_eigen/tf2_eigen.hpp>
 #include <type_traits>
 namespace curobo_ros_cpp {
+namespace {
+std::string group_list(const std::vector<std::string> &groups) {
+  std::string result;
+  for (const auto &group : groups)
+    result += (result.empty() ? "" : ", ") + group;
+  return result.empty() ? "无" : result;
+}
+
+}  // namespace
 // 按参数加载机器人和求解器。预热只覆盖配置里列出的规划组。
 PlanningNode::PlanningNode(const rclcpp::NodeOptions &options)
     : Node("curobo_motion_planning_node",
@@ -19,7 +28,7 @@ PlanningNode::PlanningNode(const rclcpp::NodeOptions &options)
   std::string step = "启动";
   std::string step_group;
   try {
-  RCLCPP_INFO(get_logger(), "【初始化】开始加载机器人与规划器");
+  RCLCPP_INFO(get_logger(), "【启动 · 加载】读取机器人模型、碰撞几何和 GPU 产物");
   step = "碰撞模型";
   const auto share = ament_index_cpp::get_package_share_directory("curobo_ros_cpp");
   const auto artifacts =
@@ -228,11 +237,13 @@ PlanningNode::PlanningNode(const rclcpp::NodeOptions &options)
                   label.c_str(), elapsed_ms(stage));
     }
   }
+  std::vector<std::string> mpc_warm;
   if (parameter<bool>("mpc_prewarm", false)) {
     step = "模型预测";
     const auto stage = Clock::now();
-    for (const auto &group : parameter<std::vector<std::string>>(
-             "mpc_prewarm_modes", {"left_arm", "right_arm", "both_arms"})) {
+    mpc_warm = parameter<std::vector<std::string>>(
+        "mpc_prewarm_modes", {"left_arm", "right_arm", "both_arms"});
+    for (const auto &group : mpc_warm) {
       step_group = group;
       planner->initialize(group, true);
       std::map<std::string, Transform> targets;
@@ -264,7 +275,16 @@ PlanningNode::PlanningNode(const rclcpp::NodeOptions &options)
   add_action<interfaces::action::Place>("place");
   add_action<interfaces::action::PickPlace>("pick_place");
   add_action<interfaces::action::FollowMpc>("follow_mpc");
-  RCLCPP_INFO(get_logger(), "【初始化】完成 ｜ 总耗时 %.1f 毫秒 ｜ 可以接收任务", elapsed_ms(started));
+  RCLCPP_INFO(get_logger(),
+              "【规划节点就绪】机器人 %s ｜ 基座 %s ｜ %s ｜ 启动 %.1f ms",
+              id.c_str(), base.c_str(), execution->enabled() ? "控制器执行" : "仅规划",
+              elapsed_ms(started));
+  RCLCPP_INFO(get_logger(),
+              "【规划节点 · 接口】服务 plan_pose_goal, plan_joint_goal, compute_ik ｜ "
+              "Action follow_mpc, pick, place, pick_place");
+  RCLCPP_INFO(get_logger(),
+              "【规划节点 · 预热】OPT 初始化组 [%s] ｜ MPC 预热组 [%s] ｜ OPT 图搜索 %s",
+              group_list(warm).c_str(), group_list(mpc_warm).c_str(), planner->settings.graph.c_str());
   } catch (const std::exception &error) {
     if (step_group.empty())
       RCLCPP_FATAL(get_logger(), "【初始化 · %s】未完成 ｜ 错误：%s", step.c_str(), error.what());
@@ -447,6 +467,22 @@ void PlanningNode::publish_goals(const std::string &stage,
   }
   goal_pub_->publish(markers);
 }
+namespace {
+void append_delete_all(visualization_msgs::msg::MarkerArray &markers, const std::string &frame,
+                       const std::string &ns) {
+  visualization_msgs::msg::Marker clear;
+  clear.header.frame_id = frame;
+  clear.ns = ns;
+  clear.action = visualization_msgs::msg::Marker::DELETEALL;
+  markers.markers.push_back(clear);
+}
+}  // namespace
+// 清掉上一次 OPT 绿线和 MPC 预测。两条线命名空间不同，只发新线不会盖掉旧线。
+void PlanningNode::clear_path_markers() {
+  visualization_msgs::msg::MarkerArray markers;
+  for (const char *ns : {"left_arm", "right_arm", "curobo_mpc"}) append_delete_all(markers, base, ns);
+  marker_pub_->publish(markers);
+}
 // 同时发轨迹话题、MoveIt 显示和末端折线。
 void PlanningNode::publish(const std::string &group, const JointMap &start,
                            const Trajectory &trajectory, bool command) {
@@ -468,6 +504,7 @@ void PlanningNode::publish(const std::string &group, const JointMap &start,
   display.trajectory.push_back(motion);
   display_pub_->publish(display);
   if (parameter<bool>("compute_ee_paths", true)) {
+    clear_path_markers();
     visualization_msgs::msg::MarkerArray markers;
     for (const auto &tool : robot->profile.tools) {
       if (group != "both_arms" && tool.first != group) continue;
@@ -496,6 +533,62 @@ void PlanningNode::publish(const std::string &group, const JointMap &start,
     }
     marker_pub_->publish(markers);
   }
+}
+// 每拍先清掉上一拍的预测和已经提交的绿线，再画当前预测。
+void PlanningNode::publish_mpc_preview(const std::string &group, const JointMap &start,
+                                       const Trajectory &trajectory,
+                                       const std::map<std::string, Transform> &targets) {
+  if (!parameter<bool>("visualize_trajectory", true) || trajectory.points.size() < 2) return;
+  clear_path_markers();
+  visualization_msgs::msg::MarkerArray markers;
+  int id = 1;
+  for (const auto &tool : robot->profile.tools) {
+    if (group != "both_arms" && tool.first != group) continue;
+    visualization_msgs::msg::Marker marker;
+    marker.header.frame_id = base;
+    marker.ns = "curobo_mpc";
+    marker.id = id++;
+    marker.type = marker.LINE_STRIP;
+    marker.action = marker.ADD;
+    marker.pose.orientation.w = 1.;
+    marker.scale.x = .01;
+    const bool right = tool.first == "right_arm";
+    marker.color.r = right ? 1. : 0.;
+    marker.color.g = right ? .25 : 1.;
+    marker.color.b = right ? .85 : 0.;
+    marker.color.a = 1.;
+    for (size_t i = 0; i < trajectory.points.size(); ++i) {
+      auto state = start;
+      for (size_t j = 0; j < trajectory.joint_names.size() && j < trajectory.points[i].positions.size();
+           ++j)
+        state[trajectory.joint_names[j]] = trajectory.points[i].positions[j];
+      const auto at = robot->tool(state, tool.first);
+      geometry_msgs::msg::Point point;
+      point.x = at.translation().x();
+      point.y = at.translation().y();
+      point.z = at.translation().z();
+      marker.points.push_back(point);
+    }
+    if (marker.points.size() >= 2) markers.markers.push_back(std::move(marker));
+  }
+  int sphere = 100;
+  for (const auto &target : targets) {
+    visualization_msgs::msg::Marker marker;
+    marker.header.frame_id = base;
+    marker.ns = "curobo_mpc";
+    marker.id = sphere++;
+    marker.type = marker.SPHERE;
+    marker.action = marker.ADD;
+    marker.pose = pose_msg(target.second);
+    marker.scale.x = marker.scale.y = marker.scale.z = .028;
+    const bool right = target.first.find("right") != std::string::npos;
+    marker.color.r = right ? 1. : 0.;
+    marker.color.g = right ? .25 : 1.;
+    marker.color.b = right ? .85 : 0.;
+    marker.color.a = 1.;
+    markers.markers.push_back(marker);
+  }
+  marker_pub_->publish(markers);
 }
 // 逐个关节路点规划，再拼成一条轨迹。忙时直接拒绝。
 void PlanningNode::plan_joint(

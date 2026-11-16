@@ -98,6 +98,13 @@ class PlanningNode : public rclcpp::Node {
   // 发布规划轨迹，按配置生成 RViz 显示路径和末端折线。start 提供未规划关节的起始值。
   void publish(const std::string &group, const JointMap &start, const Trajectory &trajectory,
                bool command = true);
+  // 把本拍 MPC 预测末端画到同一条 Marker 话题，命名空间 curobo_mpc。
+  // 左臂绿色，右臂品红。时间戳为 0，RViz 用最新 TF。
+  void publish_mpc_preview(const std::string &group, const JointMap &start,
+                           const Trajectory &trajectory,
+                           const std::map<std::string, Transform> &targets);
+  // 删除左右臂和 curobo_mpc 上一次留下的末端线。
+  void clear_path_markers();
   // 执行抓取、放置或组合任务。至少提供 pick 或 place 其中一个。
   // timeout 是整任务预算，单位秒。started 使用单调时钟，并可包含进入求解器前的排队时间。
   // cancelled 查询取消状态，feedback 接收阶段与状态信息。启用执行时等待控制器结果。

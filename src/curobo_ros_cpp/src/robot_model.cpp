@@ -2,10 +2,13 @@
 // 解析机器人配置和 URDF，计算 CPU 正运动学并执行 FCL 碰撞检查。
 #include "curobo_ros_cpp/robot_model.hpp"
 
+#include <atomic>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <queue>
 #include <sstream>
+#include <thread>
 #include <unordered_map>
 
 namespace curobo_ros_cpp {
@@ -183,16 +186,31 @@ RobotModel::RobotModel(const std::string &urdf, const std::string &robot_yaml,
     for (size_t i = 0; i < faces; ++i)
       mesh.faces.emplace_back(packed_faces[i * 3], packed_faces[i * 3 + 1],
                               packed_faces[i * 3 + 2]);
+    if (mesh.vertices.empty()) throw std::invalid_argument("empty collision mesh");
     mesh.lower = mesh.vertices.front();
     mesh.upper = mesh.lower;
     for (const auto &point : mesh.vertices) {
       mesh.lower = mesh.lower.cwiseMin(point);
       mesh.upper = mesh.upper.cwiseMax(point);
     }
-    mesh.model = make_model(mesh.vertices, mesh.faces);
-    mesh.object = std::make_unique<fcl::CollisionObjectd>(mesh.model);
+    if (mesh.faces.empty()) throw std::invalid_argument("empty collision mesh");
     meshes_.push_back(std::move(mesh));
   }
+  // Each link owns its BVH. Build independent trees in parallel during startup.
+  std::atomic_size_t next_mesh{0};
+  const auto build_meshes = [&] {
+    for (size_t i = next_mesh.fetch_add(1); i < meshes_.size(); i = next_mesh.fetch_add(1)) {
+      auto &mesh = meshes_[i];
+      mesh.model = make_model(mesh.vertices, mesh.faces);
+      mesh.object = std::make_unique<fcl::CollisionObjectd>(mesh.model);
+    }
+  };
+  std::vector<std::future<void>> mesh_builders;
+  const auto builders = std::min(4u, std::max(1u, std::thread::hardware_concurrency()));
+  for (unsigned i = 1; i < builders; ++i)
+    mesh_builders.push_back(std::async(std::launch::async, build_meshes));
+  build_meshes();
+  for (auto &builder : mesh_builders) builder.get();
   for (const auto &mesh : meshes_) {
     auto link = urdf_.getLink(mesh.link);
     while (link && link->parent_joint) {

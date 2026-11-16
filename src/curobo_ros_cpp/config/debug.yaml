@@ -21,6 +21,7 @@ curobo_motion_planning_node:
     waypoint_joint_tolerance: 0.1       # 中间关节路点允许的单关节误差 (rad)
     trajopt_velocity_scale: 0.5         # TrajOpt 下发时把轨迹时间拉长：0.5 ≈ 半速
     mpc_velocity_scale: 1.0             # MPC 下发时把轨迹时间拉长：0.5 ≈ 半速；跟手时建议 1.0，否则每拍只走前半段
+    mpc_follow_velocity_scale: 0.425    # 普通 /follow_mpc 的速度倍率，与 mpc_velocity_scale 相乘；下次 Action 生效
     execute_trajectory: true            # true：TrajOpt 规划成功后、以及 /follow_mpc 每拍下发 FollowJointTrajectory
     switch_controllers: true            # true：单臂/双臂之间 switch_controller
     execute_timeout: 60.0               # 等控制器执行完成的超时 (s)
@@ -44,7 +45,7 @@ curobo_motion_planning_node:
     pick_place_max_placed_objects: 16   # 本次离线任务已放置物体容量
 
     # --- 可视化（调试开）---
-    visualize_trajectory: true          # true：TrajOpt 绿线 + MPC 预测末端/目标球 + /display_planned_path
+    visualize_trajectory: true          # true：TrajOpt 绿线、MPC 每拍预测（curobo_mpc，左绿右品红）和 /display_planned_path
     compute_ee_paths: true              # true：TrajOpt 对规划轨迹做 FK 出末端路径（绿线需要它）
     visualize_mesh_obstacles: true      # true：点云体素发到 /curobo/collision_world（TrajOpt / MPC 共用）
     visualize_goal_waypoints: true      # true：笛卡尔和关节角的路点/目标都发到 /curobo/goal_waypoints，规划失败也保留
@@ -82,6 +83,7 @@ curobo_motion_planning_node:
     mpc_joint_state_max_age: 1.0        # MPC 运动组关节反馈接收超时 (s)
     mpc_warm_start_iters: 50            # 热启动迭代，必须是 inner_iters 25 的倍数。默认 200 次求解约 150 ms
     mpc_cold_start_iters: 100           # 第一拍迭代，同样是 25 的倍数
+    mpc_follow_joint_goal: true         # /follow_mpc 先做碰撞检查 IK，再用 MPC 跟踪关节终点
     mpc_run_ik: false                   # 纯笛卡尔跟踪；开了会加关节空间吸引点，末端容易停在半路
     mpc_posture_weight: 5.0             # 只沿末端零空间往构型目标收。0 关闭
     mpc_posture: l                     # 构型目标：l 或 zero。运行中 ros2 param set 即可切换

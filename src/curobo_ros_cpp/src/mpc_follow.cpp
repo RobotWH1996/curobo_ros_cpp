@@ -174,7 +174,6 @@ std::shared_ptr<interfaces::action::FollowMpc::Result> PlanningNode::follow_mpc(
   bool needs_goal_seed = false;
   bool reseed_after_failure = false;
   std::vector<double> goal_joints;
-  std::vector<double> last_joint_target;
   std::optional<rclcpp::Time> brake_end;
   bool brake_pending = false;
   interfaces::msg::MpcTarget::SharedPtr accepted_target;
@@ -230,7 +229,6 @@ std::shared_ptr<interfaces::action::FollowMpc::Result> PlanningNode::follow_mpc(
         needs_goal_seed = false;
         reseed_after_failure = false;
         goal_joints.clear();
-        last_joint_target.clear();
         brake_end.reset();
         brake_pending = false;
         accepted_target.reset();
@@ -459,11 +457,10 @@ std::shared_ptr<interfaces::action::FollowMpc::Result> PlanningNode::follow_mpc(
             seed_goal.assign(endpoint.data(), endpoint.data() + endpoint.size());
           }
           const bool joint_goal = !seed_goal.empty();
-          const bool initialize_seed = reset || force_seed || last_joint_target != seed_goal;
+          const bool initialize_seed = reset || force_seed;
           proposal = planner->mpc_step(group, joints, solve_targets, handoff,
                                        initialize_seed ? 0 : seed_shift,
                                        initialize_seed, execution_scale, seed_goal, joint_goal);
-          last_joint_target = std::move(seed_goal);
           initialize_next_seed = false;
           needs_goal_seed = false;
           reseed_after_failure = track_joint_goal && !proposal.success;

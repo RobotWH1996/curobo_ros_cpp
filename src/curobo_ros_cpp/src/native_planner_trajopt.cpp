@@ -523,6 +523,21 @@ void NativePlanner::warmup(const std::string &name, int iterations) {
   }
 }
 
+std::vector<uint8_t> NativePlanner::configuration_violations(
+    Group &group, const std::vector<std::vector<float>> &samples) {
+  if (samples.empty()) return {};
+  if (samples.size() > static_cast<size_t>(group.capacity))
+    throw std::runtime_error("PRM sample capacity exceeded");
+  std::vector<float> positions;
+  positions.reserve(samples.size() * group.dof);
+  for (const auto &sample : samples)
+    positions.insert(positions.end(), sample.begin(), sample.end());
+  group.validate_position.upload(positions);
+  group.planner->validate_configurations(group.validate_position.get(), samples.size(),
+                                         group.configuration_violations.get());
+  return group.configuration_violations.host(samples.size());
+}
+
 // 优化失败后的 PRM 关节路径。RRT 走求解器内部，不进这个函数。
 PlanResult NativePlanner::plan_prm(Group &group, const JointMap &state,
                                    const std::vector<float> &goal) {
@@ -530,8 +545,7 @@ PlanResult NativePlanner::plan_prm(Group &group, const JointMap &state,
   const auto start = positions(group, state);
   PlanResult result;
   const auto endpoint_failure = [&](const std::vector<float> &position) -> std::string {
-    // Keep the GPU acceptance criterion, then explain a rejection using the exported bounds.
-    if (gpu_valid(group, {position})) return {};
+    // Explain a GPU rejection using the exported bounds.
     const float tolerance = group.planner->config().trajectory_optimization.constraint_tolerance;
     for (int j = 0; j < group.dof; ++j) {
       const float value = position[j];
@@ -545,15 +559,17 @@ PlanResult NativePlanner::plan_prm(Group &group, const JointMap &state,
     }
     return "关节角都在允许范围内，但 GPU 检查失败。可能发生了碰撞，也可能是数值异常";
   };
-  for (const auto &[label, position] : {std::pair{"起点", &start}, std::pair{"目标", &goal}}) {
-    const auto failure = endpoint_failure(*position);
-    if (!failure.empty()) {
-      result.message = std::string("PRM ") + label + "检查失败。" + failure + "。";
+  const auto endpoints = configuration_violations(group, {start, goal});
+  for (size_t i = 0; i < endpoints.size(); ++i)
+    if (endpoints[i]) {
+      const auto *label = i == 0 ? "起点" : "目标";
+      result.message = std::string("PRM ") + label + "检查失败。" +
+                       endpoint_failure(i == 0 ? start : goal) + "。";
       return result;
     }
-  }
   constexpr int random_samples = 180;
-  std::vector<std::vector<float>> nodes{start, goal};
+  std::vector<std::vector<float>> candidates;
+  candidates.reserve(random_samples);
   std::mt19937 random(137);
   for (int i = 0; i < random_samples; ++i) {
     std::vector<float> q;
@@ -561,12 +577,12 @@ PlanResult NativePlanner::plan_prm(Group &group, const JointMap &state,
       const auto bounds = robot_.limits.at(name);
       q.push_back(std::uniform_real_distribution<float>(bounds.first, bounds.second)(random));
     }
-    nodes.push_back(std::move(q));
+    candidates.push_back(std::move(q));
   }
-  std::vector<std::vector<float>> valid{start, goal};
-  for (size_t i = 2; i < nodes.size(); ++i)
-    if (gpu_valid(group, {nodes[i]})) valid.push_back(std::move(nodes[i]));
-  nodes = std::move(valid);
+  const auto invalid = configuration_violations(group, candidates);
+  std::vector<std::vector<float>> nodes{start, goal};
+  for (size_t i = 0; i < candidates.size(); ++i)
+    if (!invalid[i]) nodes.push_back(std::move(candidates[i]));
   const auto distance = [](const auto &a, const auto &b) {
     double value = 0.;
     for (size_t i = 0; i < a.size(); ++i) value += (a[i] - b[i]) * (a[i] - b[i]);
@@ -602,7 +618,8 @@ PlanResult NativePlanner::plan_prm(Group &group, const JointMap &state,
         edge.push_back(std::move(q));
       }
       ++checked_edges;
-      if (!gpu_valid(group, edge)) {
+      const auto edge_invalid = configuration_violations(group, edge);
+      if (std::any_of(edge_invalid.begin(), edge_invalid.end(), [](uint8_t v) { return v != 0; })) {
         ++blocked_edges;
         continue;
       }

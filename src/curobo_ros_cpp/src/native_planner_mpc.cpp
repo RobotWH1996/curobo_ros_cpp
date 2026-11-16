@@ -35,18 +35,14 @@ MpcProposal NativePlanner::mpc_step(const std::string &name, const JointMap &sta
   upload(group.mpc_velocity, handoff.velocity);
   upload(group.mpc_acceleration, handoff.acceleration);
   upload(group.mpc_jerk, handoff.jerk);
-  if (handoff.position.size() == group.dof) {
-    std::vector<float> values(group.dof);
-    for (int j = 0; j < group.dof; ++j) values[j] = handoff.position[j];
-    group.start.upload(values);
-  }
-  reset = reset || !group.mpc_initialized;
+  if ((joint_goal || !cold_seed_goal.empty()) && cold_seed_goal.size() != q.size())
+    throw std::invalid_argument("invalid MPC seed or joint goal count");
+  reset = reset || !group.mpc_initialized || group.mpc_joint_goal != joint_goal;
   group.mpc->set_iterations(reset ? settings.mpc_cold_iterations : settings.mpc_iterations);
-  group.mpc_initialized = true;
+  if (joint_goal)
+    group.goal.upload(std::vector<float>(cold_seed_goal.begin(), cold_seed_goal.end()));
   if (reset) {
     std::vector<float> seed;
-    if ((joint_goal || !cold_seed_goal.empty()) && cold_seed_goal.size() != q.size())
-      throw std::invalid_argument("invalid MPC cold seed joint count");
     for (int i = 0; i < group.knots; ++i) {
       const double fraction = static_cast<double>(i + 1) / group.knots;
       for (size_t j = 0; j < q.size(); ++j) {
@@ -56,7 +52,6 @@ MpcProposal NativePlanner::mpc_step(const std::string &name, const JointMap &sta
     }
     group.knots_buffer.upload(seed);
     if (joint_goal) {
-      group.goal.upload(std::vector<float>(cold_seed_goal.begin(), cold_seed_goal.end()));
       group.mpc->reset(group.goal.get(), group.knots_buffer.get());
     } else {
       curobo::robot::MpcCartesianConfig configuration;
@@ -64,7 +59,12 @@ MpcProposal NativePlanner::mpc_step(const std::string &name, const JointMap &sta
       group.mpc->reset_cartesian(group.ik_goals.get(), group.ik_quaternions.get(),
                                  group.knots_buffer.get(), configuration);
     }
-  } else if (!joint_goal) {
+    group.mpc_initialized = true;
+    group.mpc_joint_goal = joint_goal;
+    executed_knots = 0;
+  } else if (joint_goal) {
+    group.mpc->update_joint_goal(group.goal.get());
+  } else {
     group.mpc->update_cartesian_target(group.ik_goals.get(), group.ik_quaternions.get());
   }
   std::vector<float> reference = q, dof_weights(group.dof, 0.F);
@@ -130,10 +130,6 @@ MpcProposal NativePlanner::mpc_step(const std::string &name, const JointMap &sta
     }
   }
   if (!joint_goal) group.mpc->set_joint_tracking(reference, dof_weights, posture_weight);
-  if (handoff.position.size() == group.dof)
-    upload(group.start, handoff.position);
-  else
-    group.start.upload(q);
   const auto output =
       group.mpc->step(group.start.get(), group.mpc_velocity.get(), group.mpc_acceleration.get(),
                       group.mpc_jerk.get(), executed_knots);

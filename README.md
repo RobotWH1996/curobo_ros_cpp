@@ -76,7 +76,7 @@ curobo_ros_cpp/
 
 `update_fixed_transforms` 会写进运动学、逆解、轨迹优化和 MPC，夹爪与被锁关节变了以后，下一次求解用的是新几何。`set_tool_upright` 只加在正在动的那只工具上，权重来自 `keep_tool_z_vertical`。`set_joint_tracking` 用末端雅可比的零空间把关节往 `mpc_posture` 收，不把末端从目标上拉开。
 
-这三个接口必须在这份 fast 源码里。换提交、机器人模型、控制点数、内部插值或 `CUROBO_CUDA_ARCH` 之后，要重新导出 `artifacts`，并重新跑 `build.sh`。`CUROBO_CUDA_ARCH` 未设置时脚本使用 87。
+这些接口必须在这份 fast 源码里。换提交、机器人模型、控制点数、内部插值或 `CUROBO_CUDA_ARCH` 之后，要重新导出 `artifacts`，并重新跑 `build.sh`。`CUROBO_CUDA_ARCH` 未设置时脚本使用 87。
 
 ## 构建
 
@@ -209,7 +209,7 @@ OPT 的 `/pick`、`/place`、`/pick_place` 仍使用 `pick_place_cloud_max_age`�
 
 跟随期间持续发送 `MpcTarget` 与运动关节反馈。`mpc_target_max_age` 和 `mpc_joint_state_max_age` 默认都是 1 秒，以本机单调接收时间判断。目标或关节反馈过期时，Action 中止并请求取消控制器目标。`/curobo/mpc_plan` 的成功结果携带交接起点，轨迹点的 `time_from_start` 相对该起点计时。
 
-普通 MPC 可用 `./src/curobo_ros_cpp/tests/call_follow_mpc.sh` 测试三个循环路点。调试配置启用 `mpc_follow_joint_goal`，用碰撞检查通过的 IK 解确定关节终点，再由 MPC 滚动求解。速度和路点停留时间分别由 `mpc_follow_velocity_scale` 和 `tests/follow_mpc_waypoints.yaml` 配置。
+普通 MPC 可用 `./src/curobo_ros_cpp/tests/call_follow_mpc.sh` 测试三个循环路点。调试配置启用 `mpc_follow_joint_goal`，用碰撞检查通过的 IK 解确定关节终点，再由 MPC 滚动求解。debug 和 deploy 默认都启用 `mpc_follow_joint_goal`，跟随速度倍率均为 `0.425`（再乘以 `mpc_velocity_scale`）。路点停留时间由 `tests/follow_mpc_waypoints.yaml` 配置。
 
 启动时传入 `log_level:=debug` 可查看普通 MPC 逐拍的场景、求解和控制器交接耗时。
 

@@ -21,9 +21,9 @@ curobo_motion_planning_node:
     trajopt_interpolation_steps: 2      # OPT 内部 B 样条采样密度，1–32；原默认 4，输出间隔由 interpolation_dt 控制
     position_tolerance: 0.005           # 笛卡尔位置成功阈值 (m)，也用于中间笛卡尔路点验收
     orientation_tolerance: 0.05         # 笛卡尔姿态成功阈值 (rad)，也用于中间笛卡尔路点验收
-    waypoint_joint_tolerance: 0.1       # 中间关节路点允许的单关节误差 (rad)
     trajopt_velocity_scale: 0.5         # TrajOpt 下发时把轨迹时间拉长：0.5 ≈ 半速
     mpc_velocity_scale: 1.0             # MPC 下发时把轨迹时间拉长：0.5 ≈ 半速；跟手时建议 1.0，否则每拍只走前半段
+    mpc_follow_velocity_scale: 0.425    # 跟随时再乘一次。实际速度 = mpc_velocity_scale × 这个值，下次 /follow_mpc 生效
     execute_trajectory: false           # 部署：只发轨迹 topic，不 FollowJointTrajectory
     switch_controllers: false           # 部署：不切 left/right/both 控制器
     execute_prewarm_group: ""           # 部署不下发，不在启动时切控制器
@@ -85,6 +85,7 @@ curobo_motion_planning_node:
     mpc_joint_state_max_age: 1.0        # MPC 运动组关节反馈接收超时 (s)
     mpc_warm_start_iters: 50            # 沿用上一拍结果时的迭代次数，必须是 25 的倍数。次数越大越慢
     mpc_cold_start_iters: 100           # 每次跟随的第一拍，以及目标突然变化时的迭代次数，必须是 25 的倍数
+    mpc_follow_joint_goal: true         # true：先求一个不碰的关节目标，再让跟随去追它。false：直接追末端位姿
     mpc_run_ik: false                   # false：只追末端位姿。true：再把逆解当成关节吸引点，手臂可能停在半路
     mpc_posture_weight: 5.0             # 在不改变末端目标的关节方向上，把姿态收向 mpc_posture。0 表示不收
     mpc_posture: l                      # 要收向的姿态：l 是预设构型，zero 是各关节 0。运行中可用 ros2 param set 修改

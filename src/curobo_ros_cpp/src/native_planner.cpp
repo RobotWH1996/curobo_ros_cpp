@@ -116,20 +116,22 @@ std::unique_ptr<NativePlanner::Group> NativePlanner::create_group(const std::str
   group->kinematics = std::make_unique<curobo::robot::Kinematics>(root.string());
   auto ik_config = configuration.inverse_kinematics;
   group->ik = group->planner->create_inverse_kinematics(ik_config);
-  ik_config.num_seeds = 1;
-  ik_config.lm_num_seeds = 1;
-  ik_config.check_self_collision = false;
-  group->contact_ik =
-      std::make_unique<curobo::robot::InverseKinematics>(root.string(), ik_config, nullptr);
-  ik_config.max_batch_size = Group::kIkBatchCapacity;
-  group->batch_ik =
-      std::make_unique<curobo::robot::InverseKinematics>(root.string(), ik_config, nullptr);
-  ik_config.max_batch_size = 1;
-  ik_config.num_seeds = 4;
-  ik_config.lm_num_seeds = 4;
-  ik_config.exit_early = false;
-  group->refine_ik =
-      std::make_unique<curobo::robot::InverseKinematics>(root.string(), ik_config, nullptr);
+  if (!mpc_mode) {
+    ik_config.num_seeds = 1;
+    ik_config.lm_num_seeds = 1;
+    ik_config.check_self_collision = false;
+    group->contact_ik =
+        std::make_unique<curobo::robot::InverseKinematics>(root.string(), ik_config, nullptr);
+    ik_config.max_batch_size = Group::kIkBatchCapacity;
+    group->batch_ik =
+        std::make_unique<curobo::robot::InverseKinematics>(root.string(), ik_config, nullptr);
+    ik_config.max_batch_size = 1;
+    ik_config.num_seeds = 4;
+    ik_config.lm_num_seeds = 4;
+    ik_config.exit_early = false;
+    group->refine_ik =
+        std::make_unique<curobo::robot::InverseKinematics>(root.string(), ik_config, nullptr);
+  }
   group->horizon = group->planner->info().trajectory_steps;
   group->capacity = trajopt["interpolation_buffer_size"].as<int>();
   // World masks preserve self-collision spheres, including the stationary arm and torso.
@@ -178,6 +180,7 @@ std::unique_ptr<NativePlanner::Group> NativePlanner::create_group(const std::str
   group->fk_quaternion.resize(group->tools * 4);
   group->fk_jacobian.resize(group->tools * 6 * group->dof);
   group->validate_position.resize(group->seeds * outputs);
+  if (!mpc_mode) group->configuration_violations.resize(group->capacity);
   group->validate_velocity.resize(group->seeds * outputs);
   group->validate_acceleration.resize(group->seeds * outputs);
   group->validate_jerk.resize(group->seeds * outputs);
@@ -240,9 +243,9 @@ void NativePlanner::synchronize(const std::string &name, const JointMap &state, 
   if (transforms != group.last_fixed) {
     group.planner->update_fixed_transforms(transforms);
     group.kinematics->update_fixed_transforms(transforms);
-    group.contact_ik->update_fixed_transforms(transforms);
-    group.refine_ik->update_fixed_transforms(transforms);
-    group.batch_ik->update_fixed_transforms(transforms);
+    if (group.contact_ik) group.contact_ik->update_fixed_transforms(transforms);
+    if (group.refine_ik) group.refine_ik->update_fixed_transforms(transforms);
+    if (group.batch_ik) group.batch_ik->update_fixed_transforms(transforms);
     if (group.mpc) group.mpc->update_fixed_transforms(transforms);
     group.last_fixed = std::move(transforms);
   }

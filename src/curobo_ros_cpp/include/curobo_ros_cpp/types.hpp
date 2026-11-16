@@ -112,13 +112,10 @@ struct Payload {
   Eigen::Vector3d size = Eigen::Vector3d::Zero();    // 包围盒三边长度，米
   Transform in_tool = Transform::Identity();         // 盒子中心相对工具的位姿
   Transform source_pose = Transform::Identity();     // 抓取前工件在基座系的位姿，用于从点云里挖掉原位置
-  uint64_t source_sequence = 0;                      // 预留的源点云序号
 };
 
 // 一次求解各阶段的墙钟耗时，毫秒。日志里的 ik、graph、trajopt、fcl 都从这里来。
 struct Timing {
-  double state_ms = 0.;     // 读取关节并同步到求解器
-  double world_ms = 0.;     // 更新碰撞场景
   double ik_ms = 0.;        // 逆解
   double graph_ms = 0.;     // RRT 或 PRM
   double trajopt_ms = 0.;   // 轨迹优化

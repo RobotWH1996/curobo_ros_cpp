@@ -11,6 +11,17 @@
 #include <utility>
 namespace curobo_ros_cpp {
 namespace {
+// 单路点的原轨迹能通过重定时预检就直接使用，否则仍走常规重定时。
+Trajectory prepare_opt_trajectory(std::vector<Trajectory> &parts,
+                                  const std::vector<std::string> &joints,
+                                  const DynamicLimits &limits, const rclcpp::Logger &logger) {
+  if (parts.size() == 1) {
+    if (!trajectory_needs_retiming(parts.front(), joints, limits)) return std::move(parts.front());
+    RCLCPP_DEBUG(logger, "【OPT · 拼接】单路点轨迹需要重定时");
+  }
+  return blend_trajectories(parts, joints, limits, std::vector<bool>(parts.size(), false)).trajectory;
+}
+
 std::string group_list(const std::vector<std::string> &groups) {
   std::string result;
   for (const auto &group : groups)
@@ -98,7 +109,6 @@ PlanningNode::PlanningNode(const rclcpp::NodeOptions &options)
   settings.position_tolerance = parameter<double>("position_tolerance", .005);
   settings.orientation_tolerance = parameter<double>("orientation_tolerance", .05);
   settings.path_tolerance = parameter<double>("pick_place_path_tolerance", .01);
-  settings.joint_tolerance = parameter<double>("waypoint_joint_tolerance", .1);
   settings.device = parameter<std::string>("mpc_device", "cuda:0");
   if (settings.dt <= 0 || settings.velocity_scale <= 0 || settings.velocity_scale > 1.)
     throw std::invalid_argument("invalid timing or velocity scale");
@@ -719,15 +729,7 @@ void PlanningNode::plan_joint(
     phase_started = Clock::now();
     const auto &joints = robot->profile.groups.at(request->group_name);
     const auto limits = planner->dynamic_limits(request->group_name);
-    const bool use_single_segment =
-        parts.size() == 1 && !trajectory_needs_retiming(parts.front(), joints, limits);
-    if (parts.size() == 1 && !use_single_segment)
-      RCLCPP_DEBUG(get_logger(), "【OPT · 拼接】单路点轨迹需要重定时");
-    auto trajectory = use_single_segment
-                          ? std::move(parts.front())
-                          : blend_trajectories(parts, joints, limits,
-                                               std::vector<bool>(parts.size(), false))
-                                .trajectory;
+    auto trajectory = prepare_opt_trajectory(parts, joints, limits, get_logger());
     const double blend_ms = elapsed_ms(phase_started);
     phase_started = Clock::now();
     planner->validate(request->group_name, initial, trajectory);
@@ -825,23 +827,17 @@ void PlanningNode::plan_pose(const std::shared_ptr<interfaces::srv::PlanPoseGoal
     }
     phase_started = Clock::now();
     Trajectory trajectory;
-    if (parts.size() == 1)
-      trajectory = parts.front();
-    else {
-      try {
-        trajectory = blend_trajectories(parts, robot->profile.groups.at(request->group_name),
-                                        planner->dynamic_limits(request->group_name),
-                                        std::vector<bool>(parts.size(), false))
-                         .trajectory;
-      } catch (const std::runtime_error &error) {
-        if (std::string(error.what()) != "via waypoint cannot be passed continuously") throw;
-        RCLCPP_WARN(get_logger(), "【OPT · 拼接】无法连续通过路点，改用联合多路点求解");
-        const auto unified_started = Clock::now();
-        auto unified = planner->plan_pose_waypoints(request->group_name, initial, route);
-        log_opt_result(get_logger(), route.size(), route.size(), unified, elapsed_ms(unified_started));
-        if (!unified.success) throw std::runtime_error(unified.message);
-        trajectory = std::move(unified.trajectory);
-      }
+    try {
+      trajectory = prepare_opt_trajectory(parts, robot->profile.groups.at(request->group_name),
+                                          planner->dynamic_limits(request->group_name), get_logger());
+    } catch (const std::runtime_error &error) {
+      if (std::string(error.what()) != "via waypoint cannot be passed continuously") throw;
+      RCLCPP_WARN(get_logger(), "【OPT · 拼接】无法连续通过路点，改用联合多路点求解");
+      const auto unified_started = Clock::now();
+      auto unified = planner->plan_pose_waypoints(request->group_name, initial, route);
+      log_opt_result(get_logger(), route.size(), route.size(), unified, elapsed_ms(unified_started));
+      if (!unified.success) throw std::runtime_error(unified.message);
+      trajectory = std::move(unified.trajectory);
     }
     const double blend_ms = elapsed_ms(phase_started);
     phase_started = Clock::now();

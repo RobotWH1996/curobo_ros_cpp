@@ -21,7 +21,6 @@ curobo_motion_planning_node:
     trajopt_interpolation_steps: 2      # OPT 内部 B 样条采样密度，1–32；原默认 4，输出间隔由 interpolation_dt 控制
     position_tolerance: 0.005           # 笛卡尔位置成功阈值 (m)，也用于中间笛卡尔路点验收
     orientation_tolerance: 0.05         # 笛卡尔姿态成功阈值 (rad)，也用于中间笛卡尔路点验收
-    waypoint_joint_tolerance: 0.1       # 中间关节路点允许的单关节误差 (rad)
     trajopt_velocity_scale: 0.5         # TrajOpt 下发时把轨迹时间拉长：0.5 ≈ 半速
     mpc_velocity_scale: 1.0             # MPC 下发时把轨迹时间拉长：0.5 ≈ 半速；跟手时建议 1.0，否则每拍只走前半段
     mpc_follow_velocity_scale: 0.425    # 跟随时再乘一次。实际速度 = mpc_velocity_scale × 这个值，下次 /follow_mpc 生效

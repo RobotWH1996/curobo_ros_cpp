@@ -28,6 +28,7 @@ struct NativePlanner::Group {
   int knots = 16, dof = 0, tools = 0, horizon = 0, seeds = 2, ik_seeds = 32, capacity = 4000;
   int interpolation_steps = 1;  // 相邻控制点之间的采样步数，来自导出 manifest
   bool mpc_initialized = false;  // MPC 是否已初始化，可据此决定是否需要冷启动
+  bool mpc_joint_goal = false;  // 上一次 reset 选择的目标类型。切换类型时重新初始化。
   YAML::Node metadata;  // 导出产物的 deployment.json，用于初始化关节、工具和固定变换
   std::vector<FixedJoint> fixed_joints;  // 同步阶段遍历的锁定关节配置
   // names、tool_names、link_names 分别按导出产物的活动关节、工具帧和连杆顺序排列。
@@ -50,6 +51,7 @@ struct NativePlanner::Group {
       ik_solution, ik_position_error, ik_orientation_error, ik_collision;
   // IK 成功标志、轨迹种子有效标志、OPT 成功标志，以及是否实际使用 RRT。
   DeviceArray<uint8_t> ik_success, seed_valid, success, used_rrt;
+  DeviceArray<uint8_t> configuration_violations;  // PRM 各采样状态独立的校验结果
   DeviceArray<int32_t> rrt_iterations;  // 求解器写回的 RRT 搜索迭代数
   // 控制点、离散位置和各阶导数、轨迹时间步长，以及优化和碰撞代价输出。
   DeviceArray<float> knots_buffer, trajectory_position, trajectory_velocity,

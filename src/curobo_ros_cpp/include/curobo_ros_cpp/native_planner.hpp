@@ -91,7 +91,6 @@ struct PlannerSettings {
   double position_tolerance = .005;   // 位置成功阈值，米
   double orientation_tolerance = .05; // 姿态成功阈值，弧度
   double path_tolerance = .01;        // 接触直线允许的横向偏差，米
-  double joint_tolerance = .1;        // 关节路点验收阈值，弧度
   std::string device = "cuda:0";      // 求解使用的 CUDA 设备
 };
 
@@ -192,7 +191,7 @@ class NativePlanner {
   // 计算一拍 MPC。state 用于同步机器人几何，handoff 提供本拍起点的关节状态。
   // executed_knots 指相对上次接受轨迹推进的控制点数，reset 请求冷启动。
   // velocity_scale 用于转换求解和执行时间尺度，可行结果仍需由调用方接受。
-  // joint_goal 固定预测末端的关节目标，由 cold_seed_goal 提供。
+  // joint_goal 固定预测末端的关节目标，由 cold_seed_goal 提供；同类目标更新保留已接受的种子。
   MpcProposal mpc_step(const std::string &group, const JointMap &state,
                        const std::map<std::string, Transform> &targets,
                        const TrajectorySample &handoff, int executed_knots, bool reset,
@@ -227,6 +226,9 @@ class NativePlanner {
   Trajectory output(Group &group, bool scaled);
   // 一批关节样本的 GPU 碰撞和限位检查，全部通过才返回真。
   bool gpu_valid(Group &group, const std::vector<std::vector<float>> &samples);
+  // 批量检查 PRM 静止状态，返回与输入顺序相同的违规标志，0 表示通过。
+  std::vector<uint8_t> configuration_violations(
+      Group &group, const std::vector<std::vector<float>> &samples);
   // 轨迹优化失败时用 PRM 找一条关节路径，再交给优化器。
   PlanResult plan_prm(Group &group, const JointMap &state, const std::vector<float> &target);
 

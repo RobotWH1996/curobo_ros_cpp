@@ -170,9 +170,10 @@ class NativePlanner {
                                  const std::vector<std::map<std::string, Transform>> &targets);
   // 求一个工具目标集合的逆解。成功时结果只含一个关节点，供后续规划使用。
   // collision 启用带场景的逆解和 FCL 验收，关闭时使用接触逆解。
+  // prefer_nearby 在带碰撞验收时按距起点的关节距离尝试候选。
   PlanResult inverse_kinematics(const std::string &group, const JointMap &state,
                                 const std::map<std::string, Transform> &targets,
-                                bool collision = true);
+                                bool collision = true, bool prefer_nearby = false);
   // 按基座系 start 和 end 生成接触段。沿直线与姿态插值求 IK，再重定时。
   // 验收位置限位、关节连续性、动态限位及末端路径偏差，接触段跳过碰撞检查。
   PlanResult interpolate(const std::string &group, const JointMap &state, const Transform &start,

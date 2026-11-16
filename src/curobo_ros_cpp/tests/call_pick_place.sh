@@ -29,7 +29,9 @@ place 的放置目标继续读 YAML，不从抓取感知目标推断放置位置
 debug/deploy（execute_trajectory）配置决定，不由本脚本修改。
 脚本使用节点的当前 /joint_states，不设置机器人初始关节角。
 ROS_DOMAIN_ID 沿用当前终端。感知消息类型来自相邻的 curobo_ros_python 工作空间，
-可用 CUROBO_PERCEPTION_SETUP 指向别的 setup.bash。可用 CUROBO_PYTHON 指定 Python。
+可用 CUROBO_PERCEPTION_SETUP 指向别的 setup.bash。该环境里若有旧的
+curobo_ros_interfaces，会被丢掉，Action 类型始终用本仓库的安装结果。
+可用 CUROBO_PYTHON 指定 Python。
 EOF
 }
 
@@ -59,6 +61,28 @@ if [[ -f "$perception_setup" ]]; then
 fi
 # shellcheck disable=SC1090
 source "$workspace_setup"
+# 感知工作空间自带一份 curobo_ros_interfaces。它排在前面时，客户端会用旧的
+# Pick 目标，节点收不到这条请求，脚本就停在「等待节点」。
+if [[ -n "${perception_setup:-}" && -f "$perception_setup" ]]; then
+    perception_root="$(realpath -m -- "$(dirname -- "$perception_setup")/..")"
+    drop_foreign_interfaces() {
+        local name="$1" value="${!1-}" entry resolved kept=""
+        [[ -n "$value" ]] || return 0
+        local IFS=':'
+        for entry in $value; do
+            resolved="$(realpath -m -- "$entry")"
+            [[ "$resolved" == "$perception_root/install/curobo_ros_interfaces"* ||
+               "$resolved" == "$perception_root/build/curobo_ros_interfaces"* ]] && continue
+            kept="${kept:+$kept:}$entry"
+        done
+        printf -v "$name" '%s' "$kept"
+        export "$name"
+    }
+    for path_name in AMENT_PREFIX_PATH CMAKE_PREFIX_PATH PYTHONPATH LD_LIBRARY_PATH; do
+        drop_foreign_interfaces "$path_name"
+    done
+    unset -f drop_foreign_interfaces
+fi
 
 python_bin="${CUROBO_PYTHON:-$repo_root/../curobo/.venv/bin/python}"
 if [[ -z "${CUROBO_PYTHON:-}" && ! -x "$python_bin" ]]; then

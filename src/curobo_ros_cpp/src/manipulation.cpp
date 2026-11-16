@@ -208,7 +208,7 @@ TaskResult PlanningNode::manipulate(
     }
     if (pick && !stop_at_pick) current[gripper] = pick->open_position;
     std::vector<std::pair<Transform, Eigen::Vector3d>> source_exclusions;
-    const auto frozen_cloud = update_world(group, initial, parameter<bool>("use_pointcloud", true));
+    const auto frozen_cloud = update_world(group, initial, /*check_receive_age=*/true);
     // 抬升或撤退后，用冻结点云去掉已处理物体并刷新碰撞场景。
     auto refresh_world = [&]() {
       auto points = frozen_cloud.points;

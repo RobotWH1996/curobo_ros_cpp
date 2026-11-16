@@ -52,6 +52,18 @@ void Executor::prepare_group(std::unique_lock<std::mutex> &guard, const std::str
   if (group_ == group) return;
   const auto topic = arm_topic(group);
   auto transport = client(topic);
+  std::vector<rclcpp_action::Client<Follow>::SharedPtr> grippers;
+  auto add_gripper = [&](const std::string &joint) {
+    const auto controller = profile_.gripper_controllers.find(joint);
+    if (controller != profile_.gripper_controllers.end())
+      grippers.push_back(client(controller->second));
+  };
+  if (group == "both_arms") {
+    for (const auto &item : profile_.grippers) add_gripper(item.second);
+  } else if (const auto gripper = profile_.grippers.find(group);
+             gripper != profile_.grippers.end()) {
+    add_gripper(gripper->second);
+  }
   guard.unlock();
   if (switch_) {
     wait_ready([&](auto interval) { return switch_client_->wait_for_service(interval); },
@@ -73,6 +85,9 @@ void Executor::prepare_group(std::unique_lock<std::mutex> &guard, const std::str
   }
   wait_ready([&](auto interval) { return transport->wait_for_action_server(interval); },
              2., stopped, "arm controller unavailable");
+  for (const auto &grip : grippers)
+    wait_ready([&](auto interval) { return grip->wait_for_action_server(interval); },
+               2., stopped, "gripper controller unavailable");
   guard.lock();
   group_ = group;
 }

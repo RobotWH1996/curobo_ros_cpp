@@ -163,6 +163,14 @@ ros2 launch curobo_ros_cpp curobo_motion_planning_deploy.launch.py mode:=deploy
 
 `/place` 同样两段：接近和放置用 OPT 与接触插补，释放后把物体留在场景里，撤退沿用接触段规则。`gripper_duration` 仍留在消息里，节点不使用它。
 
+`pointcloud_mode` 是启动参数，修改后重启节点。代码、debug 和 deploy 默认都用 `optional`。
+
+- `off` 不订阅点云，保留静态场景和机器人自碰撞检测。
+- `optional` 使用可用的点云。点云缺失、不可用或未通过抓放的接收时间检查时，告警并在没有点云障碍的场景中规划。
+- `required` 要求场景更新有可用点云，否则返回错误。MPC 跟随在本拍更新失败时跳过本拍规划。
+
+OPT 的 `/pick`、`/place`、`/pick_place` 仍使用 `pick_place_cloud_max_age`（默认 2 秒）检查点云接收时间。重放离线点云会重新计时。`pointcloud_mode` 优先于旧的 `use_pointcloud` 和 `require_pointcloud`。仅提供旧参数时，节点会转换到对应模式并提示迁移。
+
 点云过滤由 `self_filter_mode` 控制。`off` 跳过本体判断，`observe` 生成过滤诊断，`apply` 将过滤结果用于规划。单臂组只判断运动臂的本体点。同一体素包含本体点和环境点时，优先保留环境点作为代表。
 抓放内部继续使用全模型固定关节；发往执行桥接的轨迹不携带四个轮关节。桥接不控制轮子，
 因此不再要求外部轮编码器状态，也不会用零值代替真实反馈。

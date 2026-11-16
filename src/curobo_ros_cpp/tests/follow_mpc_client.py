@@ -106,14 +106,19 @@ def spin_until(node, future, timeout_sec=None):
     return future.done()
 
 
-def cancel_goal(node, handle):
+def cancel_goal(node, handle, result_future):
     print("正在取消跟随", file=sys.stderr, flush=True)
+    deadline = time.monotonic() + 5.0
     acknowledgement = handle.cancel_goal_async()
+    if result_future is None:
+        result_future = handle.get_result_async()
     try:
         if not spin_until(node, acknowledgement, timeout_sec=5.0):
             print("取消确认超时", file=sys.stderr, flush=True)
+        if not spin_until(node, result_future, timeout_sec=max(0.0, deadline - time.monotonic())):
+            print("取消后没有收到跟随结果", file=sys.stderr, flush=True)
     except KeyboardInterrupt:
-        print("再次中断，不再等待取消确认", file=sys.stderr, flush=True)
+        print("再次中断，不再等待取消结果", file=sys.stderr, flush=True)
 
 
 class RoutePublisher(Node):
@@ -186,6 +191,7 @@ def main(argv=None):
     client = ActionClient(node, FollowMpc, "follow_mpc")
     handle = None
     goal_future = None
+    result_future = None
     try:
         if not client.wait_for_server(timeout_sec=10.0):
             raise RuntimeError("找不到 /follow_mpc，请先启动规划节点")
@@ -236,9 +242,9 @@ def main(argv=None):
             if handle is None and goal_future is not None and goal_future.done():
                 handle = goal_future.result()
             if handle is not None and handle.accepted:
-                cancel_goal(node, handle)
+                cancel_goal(node, handle, result_future)
             else:
-                print("已中断，未提交跟随", file=sys.stderr, flush=True)
+                print("已中断，未收到可取消的目标句柄", file=sys.stderr, flush=True)
             raise SystemExit(130)
         value = result_future.result()
         print(f"跟随结束 success={value.result.success} {value.result.message}", flush=True)

@@ -8,6 +8,7 @@
 #include <sstream>
 #include <tf2_eigen/tf2_eigen.hpp>
 #include <type_traits>
+#include <utility>
 namespace curobo_ros_cpp {
 namespace {
 std::string group_list(const std::vector<std::string> &groups) {
@@ -24,10 +25,35 @@ PlanningNode::PlanningNode(const rclcpp::NodeOptions &options)
            rclcpp::NodeOptions(options).automatically_declare_parameters_from_overrides(true)),
       tf_(get_clock()),
       listener_(tf_) {
-  const auto started = Clock::now();
   std::string step = "启动";
   std::string step_group;
   try {
+  step = "点云模式";
+  const bool legacy_cloud_config = has_parameter("use_pointcloud") ||
+                                   has_parameter("require_pointcloud");
+  std::string pointcloud_mode;
+  if (legacy_cloud_config && !has_parameter("pointcloud_mode")) {
+    const bool use_cloud = parameter<bool>("use_pointcloud", true);
+    const bool require_cloud = parameter<bool>("require_pointcloud", false);
+    if (!use_cloud && require_cloud)
+      throw std::invalid_argument("use_pointcloud=false conflicts with require_pointcloud=true");
+    pointcloud_mode = !use_cloud ? "off" : require_cloud ? "required" : "optional";
+    declare_parameter<std::string>("pointcloud_mode", pointcloud_mode);
+    RCLCPP_WARN(get_logger(), "【点云】旧参数已转为 pointcloud_mode=%s", pointcloud_mode.c_str());
+  } else {
+    pointcloud_mode = parameter<std::string>("pointcloud_mode", "optional");
+    if (legacy_cloud_config)
+      RCLCPP_WARN(get_logger(), "【点云】以 pointcloud_mode 为准，请移除 use_pointcloud 和 require_pointcloud");
+  }
+  if (pointcloud_mode == "off")
+    pointcloud_mode_ = PointCloudMode::Off;
+  else if (pointcloud_mode == "required")
+    pointcloud_mode_ = PointCloudMode::Required;
+  else if (pointcloud_mode == "optional")
+    pointcloud_mode_ = PointCloudMode::Optional;
+  else
+    throw std::invalid_argument("pointcloud_mode must be off, optional or required");
+  RCLCPP_INFO(get_logger(), "【点云】模式 %s", pointcloud_mode.c_str());
   RCLCPP_INFO(get_logger(), "【启动 · 加载】读取机器人模型、碰撞几何和 GPU 产物");
   step = "碰撞模型";
   const auto share = ament_index_cpp::get_package_share_directory("curobo_ros_cpp");
@@ -168,7 +194,7 @@ PlanningNode::PlanningNode(const rclcpp::NodeOptions &options)
         joint_time_ = received;
       },
       subscription_options);
-  if (parameter<bool>("use_pointcloud", true))
+  if (pointcloud_mode_ != PointCloudMode::Off)
     cloud_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
         parameter<std::string>("pointcloud_topic", "/all_points"), rclcpp::SensorDataQoS(),
         [this](sensor_msgs::msg::PointCloud2::SharedPtr message) {
@@ -177,7 +203,7 @@ PlanningNode::PlanningNode(const rclcpp::NodeOptions &options)
           cloud_time_ = Clock::now();
         },
         subscription_options);
-  if (cloud_settings_.self_filter_mode != "off")
+  if (pointcloud_mode_ != PointCloudMode::Off && cloud_settings_.self_filter_mode != "off")
     for (const auto &name : {"input", "removed", "environment"})
       self_filter_pubs_[name] = create_publisher<sensor_msgs::msg::PointCloud2>(
           std::string("/curobo/self_filter/") + name, 1);
@@ -271,6 +297,9 @@ PlanningNode::PlanningNode(const rclcpp::NodeOptions &options)
       "compute_ik",
       std::bind(&PlanningNode::compute_ik, this, std::placeholders::_1, std::placeholders::_2),
       rmw_qos_profile_services_default, callbacks_));
+  action_callbacks_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+  action_completion_timer_ = create_wall_timer(
+      std::chrono::milliseconds(5), [this] { publish_action_completion(); }, action_callbacks_);
   add_action<interfaces::action::Pick>("pick");
   add_action<interfaces::action::Place>("place");
   add_action<interfaces::action::PickPlace>("pick_place");
@@ -278,14 +307,14 @@ PlanningNode::PlanningNode(const rclcpp::NodeOptions &options)
   RCLCPP_INFO(get_logger(),
               "【规划节点就绪】机器人 %s ｜ 基座 %s ｜ %s ｜ 启动 %.1f ms",
               id.c_str(), base.c_str(), execution->enabled() ? "控制器执行" : "仅规划",
-              elapsed_ms(started));
+              elapsed_ms(startup_time_));
   RCLCPP_INFO(get_logger(),
               "【规划节点 · 接口】服务 plan_pose_goal, plan_joint_goal, compute_ik ｜ "
               "Action follow_mpc, pick, place, pick_place");
   RCLCPP_INFO(get_logger(),
               "【规划节点 · 预热】OPT 初始化组 [%s] ｜ MPC 预热组 [%s] ｜ OPT 图搜索 %s",
               group_list(warm).c_str(), group_list(mpc_warm).c_str(), planner->settings.graph.c_str());
-  RCLCPP_INFO(get_logger(), "-------------初始化已完成，用时 %.1f ms--------------------------------", elapsed_ms(started));
+  worker_ = std::thread([this] { run_action_worker(); });
   } catch (const std::exception &error) {
     if (step_group.empty())
       RCLCPP_FATAL(get_logger(), "【初始化 · %s】未完成 ｜ 错误：%s", step.c_str(), error.what());
@@ -297,9 +326,34 @@ PlanningNode::PlanningNode(const rclcpp::NodeOptions &options)
     throw std::runtime_error("【初始化】未完成");
   }
 }
+void PlanningNode::prewarm_execution() {
+  if (execution && execution->enabled()) {
+    const auto group = parameter<std::string>("execute_prewarm_group", "left_arm");
+    if (!group.empty()) {
+      const auto stage = Clock::now();
+      try {
+        execution->prepare(group, [] { return !rclcpp::ok(); });
+        RCLCPP_INFO(get_logger(), "【初始化 · 控制器】完成 ｜ 规划组 %s ｜ 耗时 %.1f 毫秒",
+                    arm_text(group).c_str(), elapsed_ms(stage));
+      } catch (const std::exception &error) {
+        if (!rclcpp::ok()) return;
+        RCLCPP_ERROR(get_logger(),
+                     "【初始化 · 控制器】未完成 ｜ 规划组 %s ｜ %s。首次下发时会再试",
+                     arm_text(group).c_str(), error.what());
+      }
+    }
+  }
+  if (!rclcpp::ok()) return;
+  RCLCPP_INFO(get_logger(), "-------------初始化已完成，用时 %.1f ms--------------------------------",
+              elapsed_ms(startup_time_));
+}
 // 停止下发并等动作线程结束，避免析构时还在访问求解器。
 PlanningNode::~PlanningNode() {
-  shutdown_ = true;
+  {
+    std::lock_guard<std::mutex> guard(workers_mutex_);
+    shutdown_ = true;
+  }
+  worker_ready_.notify_one();
   execution->cancel();
   if (worker_.joinable()) worker_.join();
 }
@@ -326,25 +380,21 @@ Transform PlanningNode::in_base(const geometry_msgs::msg::PoseStamped &pose) {
                                                    tf2::durationFromSec(1.))) *
          value;
 }
-// 处理一帧点云并写入碰撞场景。点云缺失时可以选择沿用上一帧。
+// 处理一帧点云并写入碰撞场景。可选点云不可用时保留静态障碍和物体几何。
 PreparedCloud PlanningNode::update_world(const std::string &group, const JointMap &joints,
-                                         bool required) {
+                                         bool check_receive_age) {
+  if (pointcloud_mode_ == PointCloudMode::Off) return {};
+  const bool required = pointcloud_mode_ == PointCloudMode::Required;
   try {
     sensor_msgs::msg::PointCloud2::SharedPtr cloud;
     {
       std::lock_guard<std::mutex> guard(input_mutex_);
       cloud = cloud_;
-      if (required && cloud &&
+      if (check_receive_age && cloud &&
           elapsed_ms(cloud_time_) > parameter<double>("pick_place_cloud_max_age", 2.) * 1000.)
         throw std::runtime_error("pointcloud expired");
     }
-    if (!cloud) {
-      if (required || parameter<bool>("require_pointcloud", false))
-        throw std::runtime_error("no pointcloud received");
-      planner->clear_world();
-      cached_message_ = nullptr;
-      return {};
-    }
+    if (!cloud) throw std::runtime_error("no pointcloud received");
     const bool same_cloud = cached_message_ == cloud.get() && cached_group_ == group &&
                             cached_payload_ == planner->payload().has_value() &&
                             cached_generation_ == planner->world_generation();
@@ -365,8 +415,8 @@ PreparedCloud PlanningNode::update_world(const std::string &group, const JointMa
       at = tf2::transformToEigen(
           tf_.lookupTransform(base, frame, tf2::TimePointZero, tf2::durationFromSec(1.)));
     auto prepared = prepare_cloud(*cloud, at, cloud_settings_, *robot, joints, group);
-    if (required && prepared.points.empty() && prepared.removed.empty())
-      throw std::runtime_error("required pointcloud has no usable points inside planning bounds");
+    if (prepared.points.empty() && prepared.removed.empty())
+      throw std::runtime_error("pointcloud has no usable points inside planning bounds");
     for (const auto &publisher : self_filter_pubs_)
       if (publisher.second->get_subscription_count()) {
         const auto &points = publisher.first == "input"     ? prepared.input
@@ -438,8 +488,21 @@ PreparedCloud PlanningNode::update_world(const std::string &group, const JointMa
     cached_generation_ = planner->world_generation();
     return prepared;
   } catch (const std::exception &error) {
-    if (required || parameter<bool>("require_pointcloud", false)) throw;
-    RCLCPP_WARN(get_logger(), "【场景】更新失败，沿用上一帧 ｜ 错误：%s", error.what());
+    if (required) throw;
+    planner->set_world({}, cloud_settings_.pitch, cloud_mode_, voxel_center_, voxel_dimensions_);
+    if (cached_message_ && parameter<bool>("visualize_mesh_obstacles", false)) {
+      visualization_msgs::msg::MarkerArray markers;
+      visualization_msgs::msg::Marker marker;
+      marker.header.frame_id = base;
+      marker.ns = "pointcloud";
+      marker.id = 0;
+      marker.action = marker.DELETE;
+      markers.markers.push_back(marker);
+      world_pub_->publish(markers);
+    }
+    cached_message_ = nullptr;
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                         "【场景】本次不使用点云障碍 ｜ 原因：%s", error.what());
     return {};
   }
 }
@@ -754,8 +817,65 @@ void PlanningNode::compute_ik(const std::shared_ptr<interfaces::srv::ComputeIK::
     response->message = error.what();
   }
 }
+void PlanningNode::run_action_worker() {
+  while (true) {
+    std::function<void()> action;
+    {
+      std::unique_lock<std::mutex> lock(workers_mutex_);
+      worker_ready_.wait(lock, [this] { return shutdown_ || pending_action_; });
+      if (shutdown_) return;
+      action = std::exchange(pending_action_, {});
+    }
+    try {
+      action();
+    } catch (const std::exception &error) {
+      RCLCPP_ERROR(get_logger(), "Action completion could not be queued: %s", error.what());
+      busy_ = false;
+    } catch (...) {
+      RCLCPP_ERROR(get_logger(), "Unknown Action completion error");
+      busy_ = false;
+    }
+  }
+}
+
+void PlanningNode::publish_action_completion() {
+  std::function<void()> completion;
+  {
+    std::lock_guard<std::mutex> guard(workers_mutex_);
+    completion = std::exchange(pending_completion_, {});
+  }
+  if (!completion) return;
+  try {
+    completion();
+  } catch (const std::exception &error) {
+    RCLCPP_ERROR(get_logger(), "Failed to finish Action: %s", error.what());
+  } catch (...) {
+    RCLCPP_ERROR(get_logger(), "Unknown error finishing Action");
+  }
+  // Goal admission runs in the same mutually exclusive callback group.
+  busy_ = false;
+}
+
 template <class Action>
-// 同一时刻只接受一个动作。新目标到来前先收回上一个工作线程。
+void PlanningNode::complete_action(
+    const std::shared_ptr<rclcpp_action::ServerGoalHandle<Action>> &handle,
+    const std::shared_ptr<typename Action::Result> &result) {
+  std::lock_guard<std::mutex> guard(workers_mutex_);
+  pending_completion_ = [handle, result] {
+    if (!rclcpp::ok() || !result || !handle->is_active()) return;
+    if (handle->is_canceling()) {
+      if (result->success) result->message = "Action cancelled";
+      result->success = false;
+      handle->canceled(result);
+    } else if (result->success) {
+      handle->succeed(result);
+    } else {
+      handle->abort(result);
+    }
+  };
+}
+
+template <class Action>
 void PlanningNode::add_action(const std::string &name) {
   actions_.push_back(rclcpp_action::create_server<Action>(
       this, name,
@@ -780,25 +900,23 @@ void PlanningNode::add_action(const std::string &name) {
         auto fail = [this, handle](const char *message) noexcept {
           RCLCPP_ERROR(get_logger(), "Action worker failed: %s", message);
           try {
-            if (!rclcpp::ok() || !handle->is_active()) return;
             auto result = std::make_shared<typename Action::Result>();
             result->success = false;
             result->message = message;
-            if (handle->is_canceling())
-              handle->canceled(result);
-            else
-              handle->abort(result);
+            complete_action<Action>(handle, result);
           } catch (const std::exception &error) {
             RCLCPP_ERROR(get_logger(), "Failed to finish Action: %s", error.what());
+            busy_ = false;
           } catch (...) {
             RCLCPP_ERROR(get_logger(), "Unknown error finishing Action");
+            busy_ = false;
           }
         };
         try {
           std::lock_guard<std::mutex> guard(workers_mutex_);
-          if (worker_.joinable()) worker_.join();
-          worker_ = std::thread([this, handle, started, fail] {
+          pending_action_ = [this, handle, started, fail] {
             bool can_cancel_execution = false;
+            std::shared_ptr<typename Action::Result> result;
             try {
               double timeout = handle->get_goal()->timeout;
               if constexpr (!std::is_same_v<Action, interfaces::action::FollowMpc>) {
@@ -820,9 +938,9 @@ void PlanningNode::add_action(const std::string &name) {
               check();
               can_cancel_execution = !execution->active();
               if constexpr (std::is_same_v<Action, interfaces::action::FollowMpc>)
-                follow_mpc(handle, started);
+                result = follow_mpc(handle, started);
               else
-                run_action<Action>(handle, timeout, started);
+                result = run_action<Action>(handle, timeout, started);
             } catch (const std::exception &error) {
               if (can_cancel_execution) execution->cancel();
               fail(error.what());
@@ -830,22 +948,22 @@ void PlanningNode::add_action(const std::string &name) {
               if (can_cancel_execution) execution->cancel();
               fail("Unknown Action exception");
             }
-            busy_ = false;
-          });
+            if (result) complete_action<Action>(handle, result);
+          };
+          worker_ready_.notify_one();
         } catch (const std::exception &error) {
           fail(error.what());
-          busy_ = false;
         } catch (...) {
-          fail("Failed to start Action worker");
-          busy_ = false;
+          fail("Failed to queue Action");
         }
       },
-      rcl_action_server_get_default_options(), callbacks_));
+      rcl_action_server_get_default_options(), action_callbacks_));
 }
 template <class Action>
-// 把抓取、放置或抓放目标交给 manipulate，再按结果结束动作。
-void PlanningNode::run_action(std::shared_ptr<rclcpp_action::ServerGoalHandle<Action>> handle,
-                              double timeout, Clock::time_point started) {
+// 把抓取、放置或抓放目标交给 manipulate，返回结果，不在这里结束动作。
+std::shared_ptr<typename Action::Result> PlanningNode::run_action(
+    std::shared_ptr<rclcpp_action::ServerGoalHandle<Action>> handle, double timeout,
+    Clock::time_point started) {
   auto goal = handle->get_goal();
   std::string task_id;
   constexpr char hex[] = "0123456789abcdef";
@@ -881,12 +999,7 @@ void PlanningNode::run_action(std::shared_ptr<rclcpp_action::ServerGoalHandle<Ac
   result->trajectory = std::move(outcome.trajectory);
   result->trajectories = std::move(outcome.trajectories);
   result->trajectory_stages = std::move(outcome.trajectory_stages);
-  if (!rclcpp::ok()) return;
-  if (handle->is_canceling())
-    handle->canceled(result);
-  else if (result->success)
-    handle->succeed(result);
-  else
-    handle->abort(result);
+  if (!rclcpp::ok()) return nullptr;
+  return result;
 }
 }  // namespace curobo_ros_cpp

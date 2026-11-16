@@ -21,6 +21,17 @@ from rosidl_runtime_py.set_message import set_message_fields
 from curobo_ros_interfaces.action import Pick, Place, PickPlace
 
 
+def spin_until(node, future, timeout_sec=None):
+    """Short waits so Ctrl+C is delivered between messages."""
+    deadline = None if timeout_sec is None else time.monotonic() + timeout_sec
+    while rclpy.ok() and not future.done():
+        remaining = None if deadline is None else deadline - time.monotonic()
+        if remaining is not None and remaining <= 0.0:
+            return False
+        rclpy.spin_once(node, timeout_sec=0.1 if remaining is None else min(0.1, remaining))
+    return future.done()
+
+
 def save_result(result, action_name, output):
     """Export trajectory data for an external consumer; this function never commands motion."""
     document = {
@@ -119,16 +130,29 @@ def main(argv=None):
 
         started = time.perf_counter()
         future = client.send_goal_async(goal, feedback_callback=feedback)
-        rclpy.spin_until_future_complete(node, future)
-        handle = future.result()
-        if handle is None or not handle.accepted:
-            raise RuntimeError("Goal rejected")
-        result_future = handle.get_result_async()
+        print(f"已提交 /{args.action}，等待节点", file=sys.stderr, flush=True)
+        handle = None
         try:
-            rclpy.spin_until_future_complete(node, result_future)
+            if not spin_until(node, future):
+                raise RuntimeError("没有收到目标确认")
+            handle = future.result()
+            if handle is None or not handle.accepted:
+                raise RuntimeError("Goal rejected")
+            result_future = handle.get_result_async()
+            if not spin_until(node, result_future):
+                raise RuntimeError("没有收到任务结果")
         except KeyboardInterrupt:
-            cancel = handle.cancel_goal_async()
-            rclpy.spin_until_future_complete(node, cancel, timeout_sec=5.0)
+            try:
+                if handle is None and spin_until(node, future, timeout_sec=2.0):
+                    handle = future.result()
+                if handle is not None and handle.accepted:
+                    print("正在取消任务", file=sys.stderr, flush=True)
+                    if not spin_until(node, handle.cancel_goal_async(), timeout_sec=5.0):
+                        print("取消确认超时", file=sys.stderr, flush=True)
+                else:
+                    print("已中断，未收到可取消的目标句柄", file=sys.stderr, flush=True)
+            except KeyboardInterrupt:
+                print("再次中断，不再等待取消确认", file=sys.stderr, flush=True)
             raise
         value = result_future.result().result
         elapsed = time.perf_counter() - started

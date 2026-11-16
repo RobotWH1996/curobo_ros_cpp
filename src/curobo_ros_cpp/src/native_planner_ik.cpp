@@ -92,7 +92,7 @@ void NativePlanner::fill_targets(Group &group, const JointMap &state,
 // 求一帧逆解。碰撞开关只影响这一次调用。
 PlanResult NativePlanner::inverse_kinematics(const std::string &name, const JointMap &state,
                                              const std::map<std::string, Transform> &targets,
-                                             bool collision) {
+                                             bool collision, bool prefer_nearby) {
   synchronize(name, state);
   auto &group = get(name);
   fill_targets(group, state, targets);
@@ -146,19 +146,33 @@ PlanResult NativePlanner::inverse_kinematics(const std::string &name, const Join
   PlanResult result;
   result.timing.ik_ms = elapsed_ms(before);
   result.trajectory.joint_names = group.names;
+  std::vector<int> candidates;
   for (int seed = 0; seed < request.num_solutions; ++seed)
-    if (success[seed]) {
-      JointMap full = state;
-      for (int j = 0; j < group.dof; ++j) full[group.names[j]] = solutions[seed * group.dof + j];
-      if (collision && robot_.check(full, name, true, false, payload_)) continue;
-      trajectory_msgs::msg::JointTrajectoryPoint point;
-      for (int j = 0; j < group.dof; ++j)
-        point.positions.push_back(solutions[seed * group.dof + j]);
-      result.trajectory.points.push_back(std::move(point));
-      result.success = true;
-      result.message = "IK success";
-      break;
-    }
+    if (success[seed]) candidates.push_back(seed);
+  if (collision && prefer_nearby) {
+    const auto distance = [&](int seed) {
+      double squared = 0.;
+      for (int j = 0; j < group.dof; ++j) {
+        const double delta = solutions[seed * group.dof + j] - start[j];
+        squared += delta * delta;
+      }
+      return squared;
+    };
+    std::stable_sort(candidates.begin(), candidates.end(),
+                     [&](int a, int b) { return distance(a) < distance(b); });
+  }
+  for (const int seed : candidates) {
+    JointMap full = state;
+    for (int j = 0; j < group.dof; ++j) full[group.names[j]] = solutions[seed * group.dof + j];
+    if (collision && robot_.check(full, name, true, false, payload_)) continue;
+    trajectory_msgs::msg::JointTrajectoryPoint point;
+    for (int j = 0; j < group.dof; ++j)
+      point.positions.push_back(solutions[seed * group.dof + j]);
+    result.trajectory.points.push_back(std::move(point));
+    result.success = true;
+    result.message = "IK success";
+    break;
+  }
   if (!result.success) result.message = "IK failed reachability, collision or pose tolerance";
   return result;
 }

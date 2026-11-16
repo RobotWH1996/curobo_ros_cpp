@@ -23,6 +23,7 @@ curobo_motion_planning_node:
     mpc_velocity_scale: 1.0             # MPC 下发时把轨迹时间拉长：0.5 ≈ 半速；跟手时建议 1.0，否则每拍只走前半段
     execute_trajectory: false           # 部署：只发轨迹 topic，不 FollowJointTrajectory
     switch_controllers: false           # 部署：不切 left/right/both 控制器
+    execute_prewarm_group: ""           # 部署不下发，不在启动时切控制器
     execute_timeout: 60.0               # 等控制器执行完成的超时 (s)；未下发时可忽略
     joint_states_topic: /joint_states   # 当前关节
     base_frame: base_link               # 规划参考系；PoseStamped.frame_id 空或等于此值则不查 TF
@@ -50,11 +51,11 @@ curobo_motion_planning_node:
     visualize_goal_waypoints: false     # false：不发笛卡尔和关节角的 /curobo/goal_waypoints
 
     # --- 点云碰撞 ---
-    use_pointcloud: true                # false：不订点云，按空场景规划
+    pointcloud_mode: "optional"         # off 不订阅；optional 不可用时继续规划；required 拒绝
     self_filter_mode: "apply"             # off / observe（仅可视化）/ apply（实际删点）；启动参数
     self_filter_padding: 0.05           # mesh表面向外距离，m；可能误删贴近本体的障碍
     self_filter_max_processing_ms: 300.0 # 单帧几何过滤预算，ms；超时整帧保留，非硬实时限制
-    pointcloud_topic: /all_points       # 点云；空字符串则不用点云碰撞
+    pointcloud_topic: /all_points       # 点云话题
     pointcloud_collision: mesh         # TrajOpt 点云碰撞：mesh 三角网格，voxel 距离场。MPC 仍用网格
     pointcloud_voxel_dims: [2.0, 2.0, 2.0]      # voxel 时盒子边长 (m)，base_link。mesh 时忽略
     pointcloud_voxel_center: [0.2, 0.0, 1.0]    # voxel 时盒子中心 (m)。盒子外的点当作没有障碍
@@ -67,7 +68,6 @@ curobo_motion_planning_node:
     pointcloud_bounds_min: [0.00, -1.15, 0.20]   # xmin, ymin, zmin (m)
     pointcloud_bounds_max: [1.05, 1.15, 1.90]    # xmax, ymax, zmax (m)
     pointcloud_exclude_boxes: ""        # 真机不裁固定盒子。仿真 debug 才填 bag 里的夹爪
-    require_pointcloud: false           # true：没有点云/TF 则规划失败；false：告警后按空场景
     pointcloud_parent_frame: base_link  # 点云变到此系再进规划（应与 base_frame 一致）
     pointcloud_child_frame: auto       # auto 读机器人光学系，未配置或显式留空则用消息 header.frame_id
 

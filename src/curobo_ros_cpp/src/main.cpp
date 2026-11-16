@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // 进程入口，初始化 ROS 2，启动规划节点及执行器。
 #include "curobo_ros_cpp/node.hpp"
+#include <thread>
 // 启动规划节点并阻塞到退出。初始化失败时异常信息已经由节点写成中文日志。
 int main(int argc, char **argv) {
   rclcpp::init(argc, argv);
@@ -9,7 +10,16 @@ int main(int argc, char **argv) {
     auto node = std::make_shared<curobo_ros_cpp::PlanningNode>();
     rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 6);
     executor.add_node(node);
-    executor.spin();
+    // 先转执行器，控制器预热才能收到切换回复，完成日志写在预热之后。
+    std::thread spinner([&executor] { executor.spin(); });
+    try {
+      node->prewarm_execution();
+      if (spinner.joinable()) spinner.join();
+    } catch (...) {
+      executor.cancel();
+      if (spinner.joinable()) spinner.join();
+      throw;
+    }
   } catch (const std::exception &error) {
     RCLCPP_FATAL(rclcpp::get_logger("curobo_ros_cpp"), "%s", error.what());
     result = 1;

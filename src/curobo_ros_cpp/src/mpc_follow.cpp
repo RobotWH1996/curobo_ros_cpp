@@ -5,8 +5,115 @@
 #include <cstdint>
 #include "curobo_ros_cpp/node.hpp"
 namespace curobo_ros_cpp {
+namespace {
+constexpr double kTargetPositionJump = .08;  // m
+constexpr double kTargetRotationJump = .30;  // rad
+constexpr double kSwitchLead = .16;          // s
+constexpr double kMaxJointAdvance = .45;     // rad per prediction horizon
+
+double rotation_distance(const Transform &a, const Transform &b) {
+  return Eigen::Quaterniond(a.linear()).angularDistance(Eigen::Quaterniond(b.linear()));
+}
+
+bool target_changed(const geometry_msgs::msg::PoseStamped &a,
+                    const geometry_msgs::msg::PoseStamped &b) {
+  if (a.header.frame_id != b.header.frame_id) return true;
+  try {
+    const auto first = transform(a.pose);
+    const auto second = transform(b.pose);
+    return (first.translation() - second.translation()).norm() >= kTargetPositionJump ||
+           rotation_distance(first, second) >= kTargetRotationJump;
+  } catch (const std::exception &) {
+    return true;
+  }
+}
+
+Trajectory stop_trajectory(const std::vector<std::string> &names,
+                           const TrajectorySample &start, double stop_time) {
+  // 积分三次速度曲线，保持初始位置、速度和加速度，末端速度与加速度均为零。
+  Trajectory trajectory;
+  trajectory.joint_names = names;
+  const Eigen::VectorXd end = start.position + start.velocity * (stop_time / 2.) +
+                              start.acceleration * (stop_time * stop_time / 12.);
+  trajectory.points.resize(2);
+  auto &first = trajectory.points.front();
+  auto &last = trajectory.points.back();
+  first.positions.assign(start.position.data(), start.position.data() + start.position.size());
+  first.velocities.assign(start.velocity.data(), start.velocity.data() + start.velocity.size());
+  first.accelerations.assign(start.acceleration.data(),
+                             start.acceleration.data() + start.acceleration.size());
+  last.positions.assign(end.data(), end.data() + end.size());
+  last.velocities.assign(names.size(), 0.);
+  last.accelerations.assign(names.size(), 0.);
+  last.time_from_start = duration(stop_time);
+  return trajectory;
+}
+
+std::map<std::string, Transform> intermediate_targets(
+    const std::map<std::string, Transform> &starts,
+    const std::map<std::string, Transform> &targets, double scale) {
+  auto waypoints = targets;
+  for (auto &[tool, pose] : waypoints) {
+    const auto &start = starts.at(tool);
+    const double distance = (pose.translation() - start.translation()).norm();
+    const double angle = rotation_distance(start, pose);
+    const double fraction =
+        scale / std::max({1., distance / .24, angle / .65});
+    pose.translation() = start.translation() + fraction * (pose.translation() - start.translation());
+    pose.linear() = Eigen::Quaterniond(start.linear())
+                        .slerp(fraction, Eigen::Quaterniond(pose.linear())).toRotationMatrix();
+  }
+  return waypoints;
+}
+
+bool moving_away(const RobotModel &robot, JointMap state, const Trajectory &trajectory,
+                 double handoff_time, const std::map<std::string, Transform> &targets) {
+  const auto start = robot.forward(state);
+  const double end = seconds(trajectory.points.back().time_from_start);
+  const auto next = sample_trajectory(trajectory, std::min(end, handoff_time + .18));
+  for (size_t j = 0; j < trajectory.joint_names.size(); ++j)
+    state[trajectory.joint_names[j]] = next.position[j];
+  const auto poses = robot.forward(state);
+  for (const auto &[tool, goal] : targets) {
+    const double position_change = (poses.at(tool).translation() - goal.translation()).norm() -
+                                   (start.at(tool).translation() - goal.translation()).norm();
+    const double rotation_change = rotation_distance(poses.at(tool), goal) -
+                                   rotation_distance(start.at(tool), goal);
+    if (position_change > .005 || (position_change >= -.003 && rotation_change > .045))
+      return true;
+  }
+  return false;
+}
+
+bool advances_toward_target(const RobotModel &robot, JointMap state, const Trajectory &trajectory,
+                            const std::map<std::string, Transform> &targets) {
+  const auto start = robot.forward(state);
+  constexpr double kAllowedBacktrack = .023;  // m
+  constexpr double kRotationWeight = .08;      // m/rad
+  const auto end = seconds(trajectory.points.back().time_from_start);
+  const double lookahead = std::min(end, .85);
+  bool advances = false;
+  for (int step = 1; step <= 5; ++step) {
+    const auto sample = sample_trajectory(trajectory, lookahead * step / 5.);
+    for (size_t j = 0; j < trajectory.joint_names.size(); ++j)
+      state[trajectory.joint_names[j]] = sample.position[j];
+    const auto poses = robot.forward(state);
+    for (const auto &[tool, goal] : targets) {
+      const double initial_distance = (start.at(tool).translation() - goal.translation()).norm();
+      const double distance = (poses.at(tool).translation() - goal.translation()).norm();
+      if (distance > initial_distance + kAllowedBacktrack) return false;
+      const double gain = initial_distance - distance +
+          kRotationWeight * (rotation_distance(start.at(tool), goal) -
+                             rotation_distance(poses.at(tool), goal));
+      if (step == 5 && gain > .001) advances = true;
+    }
+  }
+  return advances;
+}
+}  // namespace
+
 // 按控制周期读取目标并推进 MPC。取消或超时后停止下发。
-void PlanningNode::follow_mpc(
+std::shared_ptr<interfaces::action::FollowMpc::Result> PlanningNode::follow_mpc(
     std::shared_ptr<rclcpp_action::ServerGoalHandle<interfaces::action::FollowMpc>> handle,
     Clock::time_point started) {
   struct RestoreMode {
@@ -68,6 +175,22 @@ void PlanningNode::follow_mpc(
   bool reseed_after_failure = false;
   std::vector<double> goal_joints;
   std::vector<double> last_joint_target;
+  std::optional<rclcpp::Time> brake_end;
+  bool brake_pending = false;
+  interfaces::msg::MpcTarget::SharedPtr accepted_target;
+  bool checking_direction = false;
+  bool initialize_next_seed = false;
+  double guide_scale = 0.;
+  double joint_advance = kMaxJointAdvance;
+  auto targets_differ = [&](const auto &first, const auto &second) {
+    if (!first || !second || target_group(first) != target_group(second)) return true;
+    return (first->has_left && target_changed(first->left, second->left)) ||
+           (first->has_right && target_changed(first->right, second->right));
+  };
+  auto target_superseded = [&](const auto &target) {
+    std::lock_guard<std::mutex> guard(input_mutex_);
+    return targets_differ(target, target_);
+  };
   try {
     if (execution->active()) throw std::runtime_error("execution busy");
     execution->clear();
@@ -80,7 +203,6 @@ void PlanningNode::follow_mpc(
     // Keep time scaling fixed across handoffs so derivatives stay consistent.
     const double execution_scale = velocity_scale * follow_scale;
     const bool track_joint_goal = parameter<bool>("mpc_follow_joint_goal", false);
-    constexpr double kMaxJointAdvance = .45;  // rad per prediction horizon
     RCLCPP_INFO(get_logger(),
                 "【MPC 跟随 · 开始】Action /follow_mpc ｜ 最短周期 %.0f ms ｜ 速度倍率 %.3f ｜ 模式 %s",
                 parameter<double>("mpc_control_period", .1) * 1000.,
@@ -109,6 +231,13 @@ void PlanningNode::follow_mpc(
         reseed_after_failure = false;
         goal_joints.clear();
         last_joint_target.clear();
+        brake_end.reset();
+        brake_pending = false;
+        accepted_target.reset();
+        checking_direction = false;
+        initialize_next_seed = false;
+        guide_scale = 0.;
+        joint_advance = kMaxJointAdvance;
         reset = true;
         accepted = Trajectory{};
         consumed_knots = 0;
@@ -119,9 +248,8 @@ void PlanningNode::follow_mpc(
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
         continue;
       }
-      // Wait for the accepted segment to start before scheduling another handoff.
-      // Otherwise every solve advances the origin even while the arm is still on the old prefix.
-      if (!reset && now() < accepted_origin) {
+      // 同一目标等轨迹开始后再滚动。目标大幅切换时可提前准备制动交接。
+      if (!reset && now() < accepted_origin && !targets_differ(accepted_target, target)) {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
         continue;
       }
@@ -166,8 +294,19 @@ void PlanningNode::follow_mpc(
               (pose.translation() - last->second.translation()).norm() < .005 &&
               rotation.angularDistance(Eigen::Quaterniond(last->second.linear())) < .02)
             continue;
+          if (last != logged_targets.end() &&
+              ((pose.translation() - last->second.translation()).norm() >= kTargetPositionJump ||
+               rotation_distance(pose, last->second) >= kTargetRotationJump)) {
+            brake_pending = !reset && !accepted.points.empty() && !brake_end;
+            checking_direction = true;
+            initialize_next_seed = true;
+            guide_scale = 0.;
+            joint_advance = kMaxJointAdvance;
+            RCLCPP_INFO(get_logger(), "【MPC 跟随 · 切换】重新选择交接和运动方向");
+          }
           logged_targets[tool] = pose;
           needs_goal_seed = track_joint_goal;
+          if (checking_direction) goal_joints.clear();
           RCLCPP_INFO(get_logger(),
                       "【MPC 跟随 · 目标】周期 %llu ｜ 组 %s ｜ %s @ %s ｜ xyz=(%.3f, %.3f, %.3f) m ｜ "
                       "xyzw=(%.3f, %.3f, %.3f, %.3f)",
@@ -208,21 +347,30 @@ void PlanningNode::follow_mpc(
         constexpr double kReserve = .25;
         if (!reset && !accepted.points.empty()) {
           const double elapsed = (now() - accepted_origin).seconds();
-          const int knot = std::max(
-              {1, consumed_knots, static_cast<int>(std::ceil((elapsed + kReserve) / knot_dt))});
-          handoff_time = knot * knot_dt;
+          if (brake_pending) {
+            handoff_time = std::max(.001, elapsed + kSwitchLead);
+          } else if (brake_end) {
+            handoff_time = std::max(elapsed + kReserve, (*brake_end - accepted_origin).seconds());
+          } else {
+            shift = std::max(
+                {1, consumed_knots, static_cast<int>(std::ceil((elapsed + kReserve) / knot_dt))});
+            handoff_time = shift * knot_dt;
+          }
           if (handoff_time >= seconds(accepted.points.back().time_from_start) ||
-              knot > parameter<int>("mpc_num_control_points", 6)) {
+              shift > parameter<int>("mpc_num_control_points", 6)) {
             RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
                                  "【MPC 跟随 · 续接】旧轨迹已无交接窗口，下一拍从关节反馈冷启动");
             reset = true;
+            brake_end.reset();
+            brake_pending = false;
             continue;
-          } else {
-            handoff = sample_trajectory(accepted, handoff_time);
-            shift = knot;
-            continuing = true;
           }
+          handoff = sample_trajectory(accepted, handoff_time);
+          continuing = true;
         }
+        JointMap handoff_joints = joints;
+        for (size_t j = 0; j < names.size(); ++j)
+          handoff_joints[names[j]] = handoff.position[j];
         planner->settings.mpc_posture_weight = parameter<double>("mpc_posture_weight", 5.);
         planner->settings.mpc_posture = parameter<std::string>("mpc_posture", "l");
         planner->settings.mpc_run_ik = parameter<bool>("mpc_run_ik", false);
@@ -237,41 +385,110 @@ void PlanningNode::follow_mpc(
         errors("left_arm", message.left);
         errors("right_arm", message.right);
         check();
-        // The native solver shifts its seed even when it rejects the proposal.
-        seed_shift = continuing ? shift - consumed_knots : 0;
-        start_source = continuing ? "轨迹交接" : "关节反馈";
-        std::vector<double> seed_goal;
-        if (track_joint_goal && (needs_goal_seed || (goal_joints.empty() && reseed_after_failure))) {
-          auto handoff_joints = joints;
-          for (size_t j = 0; j < names.size(); ++j)
-            handoff_joints[names[j]] = handoff.position[j];
-          const auto ik = planner->inverse_kinematics(group, handoff_joints, targets, true);
-          goal_joints = ik.success ? ik.trajectory.points.back().positions : std::vector<double>{};
+        MpcProposal proposal;
+        bool braking = false;
+        if (brake_pending && continuing &&
+            (handoff.velocity.cwiseAbs().maxCoeff() > .025 ||
+             handoff.acceleration.cwiseAbs().maxCoeff() > .12) &&
+            moving_away(*robot, handoff_joints, accepted, handoff_time, targets)) {
+          // 优先下发通过当前动态和碰撞检查的最短制动段。
+          for (const double stop_time : {.30, .36, .40, .45, .50, .60, .70, .95}) {
+            auto trajectory = stop_trajectory(names, handoff, stop_time);
+            try {
+              planner->validate(group, joints, trajectory);
+            } catch (const std::runtime_error &error) {
+              proposal.message = error.what();
+              continue;
+            }
+            append_hold(trajectory, 1.25);
+            proposal.success = true;
+            proposal.message = "MPC target switch braking";
+            proposal.trajectory = std::move(trajectory);
+            braking = true;
+            break;
+          }
+          if (!braking)
+            throw std::runtime_error("MPC target switch could not brake: " + proposal.message);
+        } else {
+          if (brake_pending && continuing) {
+            // 本拍未制动，预留正常求解时间，并用新交接状态规划。
+            handoff_time += kReserve - kSwitchLead;
+            if (handoff_time >= seconds(accepted.points.back().time_from_start)) {
+              reset = true;
+              brake_pending = false;
+              continue;
+            }
+            handoff = sample_trajectory(accepted, handoff_time);
+            for (size_t j = 0; j < names.size(); ++j)
+              handoff_joints[names[j]] = handoff.position[j];
+          }
+          const bool force_seed = initialize_next_seed || brake_end || brake_pending;
+          brake_pending = false;
+          seed_shift = continuing && !force_seed ? shift - consumed_knots : 0;
+          start_source = continuing ? "轨迹交接" : "关节反馈";
+          const auto handoff_poses = checking_direction ? robot->forward(handoff_joints)
+                                                       : std::map<std::string, Transform>{};
+          if (checking_direction &&
+              std::all_of(targets.begin(), targets.end(), [&](const auto &item) {
+                const auto &pose = handoff_poses.at(item.first);
+                return (pose.translation() - item.second.translation()).norm() < .035 &&
+                       rotation_distance(pose, item.second) < .18;
+              })) {
+            checking_direction = false;
+            guide_scale = 0.;
+            goal_joints.clear();
+            needs_goal_seed = track_joint_goal;
+          }
+
+          const bool guided = checking_direction && guide_scale > 0.;
+          const auto solve_targets = guided ? intermediate_targets(handoff_poses, targets, guide_scale)
+                                            : targets;
+          if (track_joint_goal && (needs_goal_seed || guided ||
+                                   (goal_joints.empty() && reseed_after_failure))) {
+            const auto ik = planner->inverse_kinematics(group, handoff_joints, solve_targets, true,
+                                                        checking_direction);
+            goal_joints = ik.success ? ik.trajectory.points.back().positions : std::vector<double>{};
+          }
+          std::vector<double> seed_goal;
+          if (!goal_joints.empty()) {
+            const Eigen::Map<const Eigen::VectorXd> goal_q(goal_joints.data(), goal_joints.size());
+            const Eigen::VectorXd delta = goal_q - handoff.position;
+            const double fraction =
+                joint_advance / std::max(joint_advance, delta.cwiseAbs().maxCoeff());
+            const Eigen::VectorXd endpoint = handoff.position + fraction * delta;
+            seed_goal.assign(endpoint.data(), endpoint.data() + endpoint.size());
+          }
+          const bool joint_goal = !seed_goal.empty();
+          const bool initialize_seed = reset || force_seed || last_joint_target != seed_goal;
+          proposal = planner->mpc_step(group, joints, solve_targets, handoff,
+                                       initialize_seed ? 0 : seed_shift,
+                                       initialize_seed, execution_scale, seed_goal, joint_goal);
+          last_joint_target = std::move(seed_goal);
+          initialize_next_seed = false;
+          needs_goal_seed = false;
+          reseed_after_failure = track_joint_goal && !proposal.success;
+          consumed_knots = shift;
+          const bool wrong_direction = checking_direction && proposal.success &&
+              !advances_toward_target(*robot, handoff_joints, proposal.trajectory, targets);
+          if (wrong_direction) {
+            proposal.success = false;
+            proposal.message = "MPC retarget: predicted motion moves away or makes no progress";
+          }
+          if (checking_direction && !proposal.success) {
+            if (wrong_direction || guided) {
+              guide_scale = guided && guide_scale > .26 ? guide_scale * .5 : 1.;
+              if (guided && guide_scale == 1.) guide_scale = 0.;
+              needs_goal_seed = track_joint_goal;
+            }
+            joint_advance = joint_advance > .19 ? joint_advance * .67 : kMaxJointAdvance;
+            initialize_next_seed = true;
+          }
         }
-        // Give the joint-space horizon a reachable endpoint along the IK direction.
-        // The full MPC collision and dynamic-limit checks still apply to each candidate.
-        if (!goal_joints.empty()) {
-          const Eigen::Map<const Eigen::VectorXd> goal_q(goal_joints.data(), goal_joints.size());
-          const Eigen::VectorXd delta = goal_q - handoff.position;
-          const double fraction =
-              kMaxJointAdvance / std::max(kMaxJointAdvance, delta.cwiseAbs().maxCoeff());
-          const Eigen::VectorXd endpoint = handoff.position + fraction * delta;
-          seed_goal.assign(endpoint.data(), endpoint.data() + endpoint.size());
-        }
-        const bool joint_goal = !seed_goal.empty();
-        const bool change_mode_or_goal = last_joint_target != seed_goal;
-        const bool initialize_seed = reset || change_mode_or_goal;
-        const auto proposal = planner->mpc_step(group, joints, targets, handoff,
-                                                initialize_seed ? 0 : seed_shift,
-                                                initialize_seed, execution_scale, seed_goal, joint_goal);
-        last_joint_target = std::move(seed_goal);
-        needs_goal_seed = false;
-        reseed_after_failure = track_joint_goal && !proposal.success;
-        consumed_knots = shift;
         check();
-        {
-          std::lock_guard<std::mutex> guard(input_mutex_);
-          if (target_group(target_) != group) continue;
+        if (target_superseded(target)) {
+          initialize_next_seed = true;
+          RCLCPP_DEBUG(get_logger(), "【MPC 跟随 · 切换】丢弃已变更目标的求解结果");
+          continue;
         }
         message.message = proposal.message;
         message.solve_time = proposal.elapsed_ms / 1000.;
@@ -284,6 +501,10 @@ void PlanningNode::follow_mpc(
           const auto origin = continuing ? accepted_origin + rclcpp::Duration(duration(handoff_time))
                                          : now() + rclcpp::Duration(duration(.2));
           const auto submit_started = Clock::now();
+          if (target_superseded(target)) {
+            initialize_next_seed = true;
+            continue;
+          }
           lead_ms = (origin - now()).seconds() * 1000.;
           const bool within_window = origin >= now() + rclcpp::Duration(duration(.05));
           if (!within_window || !execution->submit_mpc(group, trajectory, origin, stopped, continuing)) {
@@ -299,11 +520,28 @@ void PlanningNode::follow_mpc(
             trajectory.header.stamp = origin;
             message.header.stamp = origin;
             message.success = true;
-            planner->accept_mpc(group);
+            if (braking) {
+              brake_end = origin + rclcpp::Duration(trajectory.points[1].time_from_start);
+              brake_pending = false;
+              initialize_next_seed = true;
+              RCLCPP_INFO(get_logger(), "【MPC 跟随 · 切换】已提交减速段 ｜ %.0f ms",
+                          seconds(trajectory.points[1].time_from_start) * 1000.);
+            } else {
+              planner->accept_mpc(group);
+              brake_end.reset();
+              knot_dt = proposal.knot_dt;
+              if (checking_direction) {
+                // 新方向已通过检查。下一拍回到最终目标，避免每拍都重算局部路点。
+                if (guide_scale > 0.) needs_goal_seed = track_joint_goal;
+                checking_direction = false;
+                guide_scale = 0.;
+                joint_advance = kMaxJointAdvance;
+              }
+            }
             accepted = trajectory;
+            accepted_target = target;
             accepted_origin = origin;
             consumed_knots = 0;
-            knot_dt = proposal.knot_dt;
             reset = false;
             if (target->has_left)
               message.left.trajectory =
@@ -312,7 +550,7 @@ void PlanningNode::follow_mpc(
               message.right.trajectory =
                   select_joints(trajectory, robot->profile.groups.at("right_arm"));
             const auto position = goal->position_tolerance, orientation = goal->orientation_tolerance;
-            bool reached = position > 0;
+            bool reached = !braking && position > 0;
             for (const auto *side : {&message.left, &message.right})
               if (side->target_valid)
                 reached = reached && side->position_error <= position &&
@@ -391,12 +629,7 @@ void PlanningNode::follow_mpc(
               "【MPC 跟随 · 结束】组 %s ｜ 可用 %llu / 未通过 %llu ｜ 总耗时 %.1f ms ｜ %s",
               group.empty() ? "-" : group.c_str(), static_cast<unsigned long long>(submitted),
               static_cast<unsigned long long>(rejected), elapsed_ms(started), result->message.c_str());
-  if (!rclcpp::ok()) return;
-  if (handle->is_canceling())
-    handle->canceled(result);
-  else if (result->success)
-    handle->succeed(result);
-  else
-    handle->abort(result);
+  if (!rclcpp::ok()) return nullptr;
+  return result;
 }
 }  // namespace curobo_ros_cpp

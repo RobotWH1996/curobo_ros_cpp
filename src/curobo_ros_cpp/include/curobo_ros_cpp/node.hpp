@@ -14,6 +14,8 @@
 #include <curobo_ros_interfaces/srv/plan_pose_goal.hpp>
 #include <moveit_msgs/msg/display_trajectory.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
+#include <condition_variable>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -69,6 +71,9 @@ class PlanningNode : public rclcpp::Node {
   explicit PlanningNode(const rclcpp::NodeOptions &options = rclcpp::NodeOptions());
   // 通知工作线程停止，取消当前控制器目标，然后等待线程退出。
   ~PlanningNode();
+  // 执行器开始运转后调用。debug 下先切单臂控制器并连上轨迹服务，再写「初始化已完成」。
+  // 必须与 spin 并行，服务回复才能回来。deploy 不下发时只补上完成日志。
+  void prewarm_execution();
   // 读取 ROS 参数。声明加了锁，工作线程里重复调用不会互相抢声明。
   // YAML 里写成整数的浮点参数会转成 double，避免类型不匹配直接抛异常。
   template <class Value>
@@ -89,10 +94,10 @@ class PlanningNode : public rclcpp::Node {
   // 对其他帧查询最新 TF，超时或位姿无效时抛异常。
   Transform in_base(const geometry_msgs::msg::PoseStamped &pose);
   // 读取最新点云，变换到基座系后按关节快照过滤，并更新规划场景。
-  // required 启用抓放的点云年龄和可用性检查。可选点云缺失时清除点云障碍，
-  // 更新异常时按配置向上报告或记录告警。相同输入可复用已处理的点云。
+  // check_receive_age 启用 OPT 抓放的接收年龄检查；是否允许无点云由点云模式决定。
+  // 可选点云不可用时清除点云障碍。相同输入可复用已处理的点云。
   PreparedCloud update_world(const std::string &group, const JointMap &state,
-                             bool required = false);
+                             bool check_receive_age = false);
   // 把本阶段的工具目标画到 /curobo/goal_waypoints。
   void publish_goals(const std::string &stage, const std::map<std::string, Transform> &goals);
   // 发布规划轨迹，按配置生成 RViz 显示路径和末端折线。start 提供未规划关节的起始值。
@@ -124,6 +129,7 @@ class PlanningNode : public rclcpp::Node {
   std::mutex parameter_mutex_;             // 保护参数的延迟声明
 
  private:
+  enum class PointCloudMode { Off, Optional, Required };
   // 处理关节路点规划服务。根据执行配置发布或提交验收后的轨迹。
   void plan_joint(const std::shared_ptr<interfaces::srv::PlanJointGoal::Request> request,
                   std::shared_ptr<interfaces::srv::PlanJointGoal::Response> response);
@@ -136,14 +142,22 @@ class PlanningNode : public rclcpp::Node {
   // 注册 Action server。接受目标后由 worker_ 按整任务预算执行并统一捕获异常。
   template <class Action>
   void add_action(const std::string &name);
-  // 运行抓取、放置或组合任务，把 TaskResult 转换成对应 Action 的终态与结果。
+  // 运行抓取、放置或组合任务，返回结果。调用方在放开规划锁之后再结束 Action。
   template <class Action>
-  void run_action(std::shared_ptr<rclcpp_action::ServerGoalHandle<Action>> handle,
-                  double timeout, Clock::time_point started);
-  // 推进跟随循环，校验输入年龄、求解并交接轨迹，结束时设置 Action 终态。
-  void follow_mpc(
+  std::shared_ptr<typename Action::Result> run_action(
+      std::shared_ptr<rclcpp_action::ServerGoalHandle<Action>> handle, double timeout,
+      Clock::time_point started);
+  // 推进跟随循环，校验输入年龄、求解并交接轨迹。返回结果，不在这里结束 Action。
+  std::shared_ptr<interfaces::action::FollowMpc::Result> follow_mpc(
       std::shared_ptr<rclcpp_action::ServerGoalHandle<interfaces::action::FollowMpc>> handle,
       Clock::time_point started);
+  // 把 Action 终态交给执行器线程发布，避免工作线程占用动作服务器锁。
+  template <class Action>
+  void complete_action(const std::shared_ptr<rclcpp_action::ServerGoalHandle<Action>> &handle,
+                       const std::shared_ptr<typename Action::Result> &result);
+
+  void run_action_worker();
+  void publish_action_completion();
 
   tf2_ros::Buffer tf_;  // 点云与工具目标的 TF 查询缓存
   tf2_ros::TransformListener listener_;  // 接收动态和静态 TF，填充 tf_
@@ -160,6 +174,7 @@ class PlanningNode : public rclcpp::Node {
   // 本体过滤的输入、被删点和环境点，仅在观察或启用过滤时创建。
   std::map<std::string, rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr>
       self_filter_pubs_;
+  PointCloudMode pointcloud_mode_ = PointCloudMode::Optional;  // 启动时确定订阅和失败策略
   PointCloudSettings cloud_settings_;    // 裁剪范围、过滤模式、采样密度及点数上限
   PreparedCloud cached_cloud_;             // 上一帧已经写进求解器的点云
   std::string cached_group_;               // 生成 cached_cloud_ 时的规划组
@@ -189,7 +204,13 @@ class PlanningNode : public rclcpp::Node {
   rclcpp::CallbackGroup::SharedPtr callbacks_;  // 可重入，让反馈订阅不被规划堵住
   std::atomic_bool busy_{false};                // 已有动作在执行
   std::atomic_bool shutdown_{false};            // 析构开始，工作线程应当退出
-  std::mutex workers_mutex_;                    // 保护 worker_ 的创建和汇合
-  std::thread worker_;                          // 当前动作的执行线程
+  rclcpp::CallbackGroup::SharedPtr action_callbacks_;
+  rclcpp::TimerBase::SharedPtr action_completion_timer_;
+  std::mutex workers_mutex_;                    // 保护待执行任务和待发布结果
+  std::condition_variable worker_ready_;
+  std::function<void()> pending_action_;
+  std::function<void()> pending_completion_;
+  std::thread worker_;                          // 常驻动作工作线程
+  Clock::time_point startup_time_{Clock::now()};  // 构造开始，完成日志含控制器预热
 };
 }  // namespace curobo_ros_cpp

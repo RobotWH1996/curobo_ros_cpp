@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <numeric>
 #include <set>
+#include <utility>
 
 namespace curobo_ros_cpp {
 namespace {
@@ -263,12 +264,56 @@ void validate_dynamics(const Trajectory &tr, const std::vector<std::string> &arm
   for (size_t i = 0; i < count; ++i) times.insert(end * i / (count - 1));
   for (const double time : times) {
     const auto value = sample_trajectory(tr, time);
-    for (size_t i = 0; i < selected.size(); ++i)
-      if (std::abs(value.velocity[selected[i]]) > limits.velocity[i] * 1.015 + 1e-5 ||
-          std::abs(value.acceleration[selected[i]]) > limits.acceleration[i] * 1.015 + 1e-5 ||
-          std::abs(value.jerk[selected[i]]) > limits.jerk[i] * 1.015 + 1e-5)
-        throw std::runtime_error("merged trajectory exceeds dynamic limits");
+    for (size_t i = 0; i < selected.size(); ++i) {
+      const auto j = selected[i];
+      const auto verify = [&](const char *quantity, double measured, double limit) {
+        if (std::abs(measured) > limit * 1.015 + 1e-5)
+          throw std::runtime_error(std::string("trajectory ") + quantity + " limit exceeded " +
+                                   arm[i] + " | time=" + std::to_string(time) +
+                                   " s | value=" + std::to_string(measured) +
+                                   " | absolute_limit=" + std::to_string(limit));
+      };
+      verify("velocity", value.velocity[j], limits.velocity[i]);
+      verify("acceleration", value.acceleration[j], limits.acceleration[i]);
+      verify("jerk", value.jerk[j], limits.jerk[i]);
+    }
   }
+}
+
+namespace {
+std::pair<double, size_t> retiming_peak(const Trajectory &trajectory,
+                                        const std::vector<size_t> &selected,
+                                        const DynamicLimits &limits) {
+  double worst_ratio = 1.;
+  size_t worst_index = 0;
+  for (size_t i = 0; i + 1 < trajectory.points.size(); ++i)
+    for (int sample = 0; sample < 9; ++sample) {
+      const double t = seconds(trajectory.points[i].time_from_start) +
+                       (seconds(trajectory.points[i + 1].time_from_start) -
+                        seconds(trajectory.points[i].time_from_start)) *
+                           sample / 8.;
+      const auto value = sample_trajectory(trajectory, t);
+      for (size_t j = 0; j < selected.size(); ++j) {
+        const auto k = selected[j];
+        const double ratio =
+            std::max({std::abs(value.velocity[k]) / limits.velocity[j],
+                      std::sqrt(std::abs(value.acceleration[k]) / limits.acceleration[j]),
+                      std::cbrt(std::abs(value.jerk[k]) / limits.jerk[j])});
+        if (ratio > 1.005 && ratio * 1.02 > worst_ratio) {
+          worst_ratio = ratio * 1.02;
+          worst_index = i;
+        }
+      }
+    }
+  return {worst_ratio, worst_index};
+}
+}  // namespace
+
+bool trajectory_needs_retiming(const Trajectory &trajectory,
+                               const std::vector<std::string> &arm,
+                               const DynamicLimits &limits) {
+  check_time(trajectory);
+  return retiming_peak(trajectory, columns(trajectory, arm), limits).first > 1.001;
 }
 
 // 合并连续路段，并记下每段在总时间轴上的边界。
@@ -415,27 +460,7 @@ BlendedTrajectory blend_trajectories(const std::vector<Trajectory> &segments,
                                  velocity * warp[2] / std::pow(warp[1], 3));
       entry.time_from_start = duration(warp[0]);
     }
-    double worst_ratio = 1.;
-    size_t worst_index = 0;
-    for (size_t i = 0; i + 1 < result.points.size(); ++i)
-      for (int sample = 0; sample < 9; ++sample) {
-        const double t = seconds(result.points[i].time_from_start) +
-                         (seconds(result.points[i + 1].time_from_start) -
-                          seconds(result.points[i].time_from_start)) *
-                             sample / 8.;
-        const auto value = sample_trajectory(result, t);
-        for (size_t j = 0; j < selected.size(); ++j) {
-          const auto k = selected[j];
-          const double ratio =
-              std::max({std::abs(value.velocity[k]) / limits.velocity[j],
-                        std::sqrt(std::abs(value.acceleration[k]) / limits.acceleration[j]),
-                        std::cbrt(std::abs(value.jerk[k]) / limits.jerk[j])});
-          if (ratio > 1.005 && ratio * 1.02 > worst_ratio) {
-            worst_ratio = ratio * 1.02;
-            worst_index = i;
-          }
-        }
-      }
+    const auto [worst_ratio, worst_index] = retiming_peak(result, selected, limits);
     if (worst_ratio <= 1.001) break;
     if (iteration == 23) throw std::runtime_error("local retiming failed dynamic limits");
     const double left = seconds(base.points[worst_index].time_from_start),

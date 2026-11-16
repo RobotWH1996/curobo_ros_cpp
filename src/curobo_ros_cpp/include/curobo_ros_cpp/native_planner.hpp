@@ -220,6 +220,9 @@ class NativePlanner {
   PlanResult solve(Group &group, const JointMap &state,
                    const std::vector<std::vector<float>> &goals, int attempts, bool pose,
                    bool allow_graph = true);
+  // 失败时读取 IK 候选误差及碰撞代价。各项最小值独立统计。
+  std::string ik_failure_detail(const Group &group, size_t candidates,
+                                bool collision_checked) const;
   // 从 GPU 轨迹缓冲读回 ROS 轨迹。scaled 为真时按 velocity_scale 拉长时间。
   Trajectory output(Group &group, bool scaled);
   // 一批关节样本的 GPU 碰撞和限位检查，全部通过才返回真。

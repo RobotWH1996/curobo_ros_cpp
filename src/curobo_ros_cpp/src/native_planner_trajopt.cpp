@@ -124,8 +124,8 @@ PlanResult NativePlanner::solve(Group &group, const JointMap &state,
       result.timing.ik_ms += elapsed_ms(before);
       valid_goals.clear();
       int ik_passed = 0;
-      std::string first_collision;
       const auto check_started = Clock::now();
+      std::string first_collision;
       for (int seed = 0; seed < group.ik_seeds; ++seed)
         if (flags[seed]) {
           ++ik_passed;
@@ -135,11 +135,11 @@ PlanResult NativePlanner::solve(Group &group, const JointMap &state,
             q.push_back(solutions[seed * group.dof + j]);
             full[group.names[j]] = q.back();
           }
-          const auto collision = robot_.check(full, group.name, true, false, payload_);
-          if (!collision)
+          if (const auto hit = robot_.check(full, group.name, true, false, payload_)) {
+            if (first_collision.empty()) first_collision = hit->first + " 与 " + hit->second;
+          } else {
             valid_goals.push_back(std::move(q));
-          else if (first_collision.empty())
-            first_collision = collision->first + " 与 " + collision->second;
+          }
         }
       result.timing.check_ms += elapsed_ms(check_started);
       RCLCPP_DEBUG(logger, "【OPT 逆解】%s尝试了 %d 个逆解初值，求得 %d 个候选，其中 %zu 个通过了终点碰撞检查。",
@@ -149,30 +149,16 @@ PlanResult NativePlanner::solve(Group &group, const JointMap &state,
           reject("已算出目标关节角，但所有候选都在目标处发生碰撞。第一处碰撞为 " +
                  first_collision + "。");
         } else {
-          const auto position = group.ik_position_error.host(group.ik_seeds);
-          const auto orientation = group.ik_orientation_error.host(group.ik_seeds);
-          const auto collision = group.ik_collision.host(group.ik_seeds);
-          int best = 0;
-          double score = std::numeric_limits<double>::infinity();
-          for (int seed = 0; seed < group.ik_seeds; ++seed) {
-            const double candidate = position[seed] / settings.position_tolerance +
-                                     orientation[seed] / settings.orientation_tolerance;
-            if (std::isfinite(candidate) && candidate < score) {
-              score = candidate;
-              best = seed;
-            }
-          }
-          RCLCPP_DEBUG(logger,
-                       "【OPT 逆解】最佳候选的位置误差为 %.6f 米，允许 %.6f 米。姿态误差为 %.6f 弧度，"
-                       "允许 %.6f 弧度。碰撞代价为 %.6f。",
-                       position[best], settings.position_tolerance, orientation[best],
-                       settings.orientation_tolerance, collision[best]);
+          RCLCPP_DEBUG(logger, "【OPT 逆解】%s", ik_failure_detail(group, group.ik_seeds, true).c_str());
           reject("逆运动学未找到满足目标位姿和约束的关节角。");
         }
         continue;
       }
     }
-    if (valid_goals.empty()) continue;
+    if (valid_goals.empty()) {
+      reject("请求没有提供关节目标。");
+      continue;
+    }
     std::vector<float> packed;
     for (int seed = 0; seed < group.seeds; ++seed) {
       const auto &q = valid_goals[seed % valid_goals.size()];
@@ -271,7 +257,16 @@ PlanResult NativePlanner::plan_joint(const std::string &name, const JointMap &st
   JointMap final = state;
   std::vector<float> goal;
   for (size_t i = 0; i < target.size(); ++i) {
-    if (!std::isfinite(target[i])) throw std::invalid_argument("nonfinite joint goal");
+    if (!std::isfinite(target[i]))
+      throw std::invalid_argument("nonfinite joint goal " + group.names[i]);
+    if (target[i] < group.lower[i] - 1e-6 || target[i] > group.upper[i] + 1e-6) {
+      PlanResult failure;
+      failure.message = "目标关节 " + group.names[i] + " 超限，实际角度 " +
+                        std::to_string(target[i]) + " 弧度，允许范围为 " +
+                        std::to_string(group.lower[i]) + " 至 " +
+                        std::to_string(group.upper[i]) + " 弧度。";
+      return failure;
+    }
     final[group.names[i]] = target[i];
     goal.push_back(target[i]);
   }
@@ -316,9 +311,13 @@ PlanResult NativePlanner::plan_pose_waypoints(
   std::vector<float> positions, quaternions;
   JointMap seed_state = state;
   std::vector<double> endpoint;
-  for (const auto &waypoint : targets) {
+  for (size_t index = 0; index < targets.size(); ++index) {
+    const auto &waypoint = targets[index];
     auto ik = inverse_kinematics(name, seed_state, waypoint, true);
-    if (!ik.success) return ik;
+    if (!ik.success) {
+      ik.message = "Cartesian waypoint " + std::to_string(index + 1) + " | " + ik.message;
+      return ik;
+    }
     endpoint = ik.trajectory.points.back().positions;
     for (int j = 0; j < group.dof; ++j) seed_state[group.names[j]] = endpoint[j];
     for (const auto &tool : group.tool_names) {
@@ -369,7 +368,8 @@ PlanResult NativePlanner::plan_pose_waypoints(
   result.timing.trajopt_ms = elapsed_ms(started);
   result.timing.attempts = 1;
   if (!group.success.host(1).front()) {
-    result.message = "unified Cartesian waypoint optimization failed";
+    result.message = "TrajOpt rejected unified Cartesian route with " +
+                     std::to_string(targets.size()) + " waypoints";
     return result;
   }
   result.trajectory = output(group, true);
@@ -377,8 +377,10 @@ PlanResult NativePlanner::plan_pose_waypoints(
   const double total = seconds(result.trajectory.points.back().time_from_start);
   const int count = std::max(2, static_cast<int>(std::ceil(total / .005)) + 1);
   int previous = 0;
-  for (const auto &waypoint : targets) {
+  for (size_t index = 0; index < targets.size(); ++index) {
+    const auto &waypoint = targets[index];
     bool reached = false;
+    std::string first_collision;
     for (int i = previous; i < count; ++i) {
       const auto sample = sample_trajectory(result.trajectory, total * i / (count - 1));
       JointMap values = state;
@@ -392,14 +394,19 @@ PlanResult NativePlanner::plan_pose_waypoints(
                 Eigen::Quaterniond(actual.at(tool.first).linear())
                         .angularDistance(Eigen::Quaterniond(tool.second.linear())) <=
                     settings.orientation_tolerance;
-      if (close && !robot_.check(values, name, true, false, payload_)) {
-        reached = true;
-        previous = i;
-        break;
+      if (!close) continue;
+      if (const auto hit = robot_.check(values, name, true, false, payload_)) {
+        if (first_collision.empty()) first_collision = hit->message();
+        continue;
       }
+      reached = true;
+      previous = i;
+      break;
     }
     if (!reached) {
-      result.message = "Cartesian waypoint FCL or pose tolerance check failed";
+      result.message = "Cartesian waypoint " + std::to_string(index + 1) +
+                       (first_collision.empty() ? " outside pose tolerance"
+                                                : " rejected by FCL: " + first_collision);
       return result;
     }
   }
@@ -459,13 +466,20 @@ void NativePlanner::validate(const std::string &name, const JointMap &state,
       const float lower = group.lower[j];
       const float upper = group.upper[j];
       if (!std::isfinite(position) || position < lower - 1e-6 || position > upper + 1e-6)
-        throw std::runtime_error("merged joint position limit violation");
+        throw std::runtime_error("joint position limit violation " + group.names[j] +
+                                 " | time=" + std::to_string(end * i / (count - 1)) +
+                                 " s | value=" + std::to_string(position) +
+                                 " | allowed=[" + std::to_string(lower) +
+                                 ", " + std::to_string(upper) + "]");
       row.push_back(position);
     }
     samples.push_back(std::move(row));
     if (samples.size() == static_cast<size_t>(group.capacity) || i == count - 1) {
       if (collision && !gpu_valid(group, samples))
-        throw std::runtime_error("merged GPU collision or joint-limit validation failed");
+        throw std::runtime_error(
+            "GPU collision or joint-limit validation failed | interval=[" +
+            std::to_string(end * (i + 1 - samples.size()) / (count - 1)) + ", " +
+            std::to_string(end * i / (count - 1)) + "] s");
       samples.clear();
     }
   }

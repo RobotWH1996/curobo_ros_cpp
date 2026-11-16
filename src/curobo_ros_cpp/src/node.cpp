@@ -717,11 +717,17 @@ void PlanningNode::plan_joint(
     }
     if (parts.empty()) throw std::runtime_error("empty waypoints");
     phase_started = Clock::now();
-    auto trajectory =
-        blend_trajectories(parts, robot->profile.groups.at(request->group_name),
-                           planner->dynamic_limits(request->group_name),
-                           std::vector<bool>(parts.size(), false))
-            .trajectory;
+    const auto &joints = robot->profile.groups.at(request->group_name);
+    const auto limits = planner->dynamic_limits(request->group_name);
+    const bool use_single_segment =
+        parts.size() == 1 && !trajectory_needs_retiming(parts.front(), joints, limits);
+    if (parts.size() == 1 && !use_single_segment)
+      RCLCPP_DEBUG(get_logger(), "【OPT · 拼接】单路点轨迹需要重定时");
+    auto trajectory = use_single_segment
+                          ? std::move(parts.front())
+                          : blend_trajectories(parts, joints, limits,
+                                               std::vector<bool>(parts.size(), false))
+                                .trajectory;
     const double blend_ms = elapsed_ms(phase_started);
     phase_started = Clock::now();
     planner->validate(request->group_name, initial, trajectory);

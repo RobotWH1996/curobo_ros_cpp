@@ -2,6 +2,9 @@
 // 计算工具位姿与雅可比，构造工具目标并求逆解。
 #include "curobo_ros_cpp/detail/native_planner_group.hpp"
 #include <algorithm>
+#include <iomanip>
+#include <limits>
+#include <sstream>
 
 namespace curobo_ros_cpp {
 // 用该组运动学求工具位姿，不经过 FCL。
@@ -89,6 +92,31 @@ void NativePlanner::fill_targets(Group &group, const JointMap &state,
   group.planner->set_tool_upright(weights, signs);
 }
 
+std::string NativePlanner::ik_failure_detail(const Group &group, size_t candidates,
+                                             bool collision_checked) const {
+  const auto append_minimum = [](std::ostream &out, const std::vector<float> &values,
+                                 const char *label, double scale) {
+    double minimum = std::numeric_limits<double>::infinity();
+    for (float value : values)
+      if (std::isfinite(value) && value >= 0.) minimum = std::min(minimum, double(value));
+    out << ", " << label << '=';
+    if (std::isfinite(minimum))
+      out << minimum * scale;
+    else
+      out << "unavailable";
+  };
+
+  std::ostringstream out;
+  out << std::fixed << std::setprecision(3)
+      << "IK: 0/" << candidates << " candidates passed";
+  append_minimum(out, group.ik_position_error.host(candidates), "min_position_error_mm", 1000.);
+  append_minimum(out, group.ik_orientation_error.host(candidates), "min_orientation_error_deg",
+                 180. / std::acos(-1.));
+  if (collision_checked)
+    append_minimum(out, group.ik_collision.host(candidates), "min_collision_cost", 1.);
+  return out.str();
+}
+
 // 求一帧逆解。碰撞开关只影响这一次调用。
 PlanResult NativePlanner::inverse_kinematics(const std::string &name, const JointMap &state,
                                              const std::map<std::string, Transform> &targets,
@@ -161,10 +189,17 @@ PlanResult NativePlanner::inverse_kinematics(const std::string &name, const Join
     std::stable_sort(candidates.begin(), candidates.end(),
                      [&](int a, int b) { return distance(a) < distance(b); });
   }
+  int fcl_rejections = 0;
+  std::string first_collision;
   for (const int seed : candidates) {
     JointMap full = state;
     for (int j = 0; j < group.dof; ++j) full[group.names[j]] = solutions[seed * group.dof + j];
-    if (collision && robot_.check(full, name, true, false, payload_)) continue;
+    if (collision) {
+      if (const auto hit = robot_.check(full, name, true, false, payload_)) {
+        if (fcl_rejections++ == 0) first_collision = hit->message();
+        continue;
+      }
+    }
     trajectory_msgs::msg::JointTrajectoryPoint point;
     for (int j = 0; j < group.dof; ++j)
       point.positions.push_back(solutions[seed * group.dof + j]);
@@ -173,7 +208,11 @@ PlanResult NativePlanner::inverse_kinematics(const std::string &name, const Join
     result.message = "IK success";
     break;
   }
-  if (!result.success) result.message = "IK failed reachability, collision or pose tolerance";
+  if (!result.success)
+    result.message = fcl_rejections > 0
+                         ? "FCL rejected all " + std::to_string(fcl_rejections) +
+                               " successful IK candidates. First collision: " + first_collision
+                         : ik_failure_detail(group, request.num_solutions, collision);
   return result;
 }
 }  // namespace curobo_ros_cpp

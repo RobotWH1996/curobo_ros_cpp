@@ -54,6 +54,10 @@ struct BlendedTrajectory {
 BlendedTrajectory blend_trajectories(const std::vector<Trajectory> &segments,
                                      const std::vector<std::string> &arm_joints,
                                      const DynamicLimits &limits, const std::vector<bool> &contact);
+// 使用重定时的采样规则，判断一段轨迹是否需要调整时间。
+bool trajectory_needs_retiming(const Trajectory &trajectory,
+                               const std::vector<std::string> &arm_joints,
+                               const DynamicLimits &limits);
 // 按 step 秒采样并检查 arm_joints 的动态上限。轨迹布局、时间或任一动态限位违规时抛异常。
 void validate_dynamics(const Trajectory &trajectory, const std::vector<std::string> &arm_joints,
                        const DynamicLimits &limits, double step = .005);

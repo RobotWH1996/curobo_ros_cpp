@@ -661,12 +661,12 @@ void PlanningNode::plan_joint(
   std::unique_lock<std::mutex> lock(operation, std::try_to_lock);
   if (!lock.owns_lock() || busy_) {
     response->message = "planner busy";
-    RCLCPP_WARN(get_logger(), "【任务 · 关节规划】未开始 ｜ 错误：planner busy");
+    RCLCPP_WARN(get_logger(), "【任务】规划器忙，本次关节规划未开始。");
     return;
   }
   const auto started = Clock::now();
   const auto arm = arm_text(request->group_name);
-  RCLCPP_INFO(get_logger(), "──────── 任务开始 · 关节规划 · %s ────────", arm.c_str());
+  RCLCPP_INFO(get_logger(), "【任务】%s关节规划开始。", arm.c_str());
   try {
     if (execution->active()) throw std::runtime_error("execution busy");
     execution->clear();
@@ -702,13 +702,12 @@ void PlanningNode::plan_joint(
     execution->submit(request->group_name, trajectory, [] { return false; });
     response->success = true;
     response->message = "planning success";
-    RCLCPP_INFO(get_logger(), "【任务】成功 ｜ 耗时 %.1f 毫秒", elapsed_ms(started));
-    RCLCPP_INFO(get_logger(), "──────── 任务结束 · 关节规划 · 成功 ────────");
+    RCLCPP_INFO(get_logger(), "【任务】%s关节规划成功，用时 %.1f 毫秒。", arm.c_str(),
+                elapsed_ms(started));
   } catch (const std::exception &error) {
     response->message = error.what();
-    RCLCPP_ERROR(get_logger(), "【任务】失败 ｜ 耗时 %.1f 毫秒 ｜ 错误：%s", elapsed_ms(started),
-                 error.what());
-    RCLCPP_INFO(get_logger(), "──────── 任务结束 · 关节规划 · 失败 ────────");
+    RCLCPP_ERROR(get_logger(), "【任务】%s关节规划失败，用时 %.1f 毫秒。%s", arm.c_str(),
+                 elapsed_ms(started), error.what());
   }
 }
 // 逐个笛卡尔路点规划。段与段无法连续通过时改成一次多路点求解。
@@ -717,12 +716,12 @@ void PlanningNode::plan_pose(const std::shared_ptr<interfaces::srv::PlanPoseGoal
   std::unique_lock<std::mutex> lock(operation, std::try_to_lock);
   if (!lock.owns_lock() || busy_) {
     response->message = "planner busy";
-    RCLCPP_WARN(get_logger(), "【任务 · 位姿规划】未开始 ｜ 错误：planner busy");
+    RCLCPP_WARN(get_logger(), "【任务】规划器忙，本次位姿规划未开始。");
     return;
   }
   const auto started = Clock::now();
   const auto arm = arm_text(request->group_name);
-  RCLCPP_INFO(get_logger(), "──────── 任务开始 · 位姿规划 · %s ────────", arm.c_str());
+  RCLCPP_INFO(get_logger(), "【任务】%s位姿规划开始。", arm.c_str());
   try {
     if (execution->active()) throw std::runtime_error("execution busy");
     execution->clear();
@@ -787,13 +786,12 @@ void PlanningNode::plan_pose(const std::shared_ptr<interfaces::srv::PlanPoseGoal
     execution->submit(request->group_name, trajectory, [] { return false; });
     response->success = true;
     response->message = "planning success";
-    RCLCPP_INFO(get_logger(), "【任务】成功 ｜ 耗时 %.1f 毫秒", elapsed_ms(started));
-    RCLCPP_INFO(get_logger(), "──────── 任务结束 · 位姿规划 · 成功 ────────");
+    RCLCPP_INFO(get_logger(), "【任务】%s位姿规划成功，用时 %.1f 毫秒。", arm.c_str(),
+                elapsed_ms(started));
   } catch (const std::exception &error) {
     response->message = error.what();
-    RCLCPP_ERROR(get_logger(), "【任务】失败 ｜ 耗时 %.1f 毫秒 ｜ 错误：%s", elapsed_ms(started),
-                 error.what());
-    RCLCPP_INFO(get_logger(), "──────── 任务结束 · 位姿规划 · 失败 ────────");
+    RCLCPP_ERROR(get_logger(), "【任务】%s位姿规划失败，用时 %.1f 毫秒。%s", arm.c_str(),
+                 elapsed_ms(started), error.what());
   }
 }
 // 只返回逆解关节角，不生成轨迹，也不下发控制器。

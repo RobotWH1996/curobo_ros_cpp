@@ -125,7 +125,7 @@ ros2 launch curobo_ros_cpp curobo_motion_planning_deploy.launch.py mode:=deploy
 
 ## 一次抓取怎么规划
 
-位姿目标默认最多 3 次。第 1 次不开图搜索。
+位姿目标默认最多尝试 3 次。第 1 次只做轨迹优化。默认配置 `rrt` 在第 2、3 次允许 RRT 给轨迹优化提供路径。仍然失败且有通过前置检查的关节目标时，再试一次 PRM，并验收生成的轨迹。`prm` 配置在直接轨迹优化尝试用完后走 PRM。
 
 ```text
 预抓取 / 结束段（OPT）

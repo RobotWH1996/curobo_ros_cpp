@@ -7,8 +7,28 @@
 #include <queue>
 #include <random>
 #include <rclcpp/rclcpp.hpp>
+#include <utility>
 
 namespace curobo_ros_cpp {
+namespace {
+std::string rrt_failure(const curobo::robot::RrtDiagnostics &stats) {
+  if (stats.requested_pairs == 0) return "RRT 没有可检查的起点和目标，未开始搜索。";
+  if (stats.valid_pairs == 0) {
+    const bool start_rejected = stats.invalid_starts == stats.requested_pairs;
+    const bool goal_rejected = stats.invalid_goals == stats.requested_pairs;
+    if (start_rejected && goal_rejected)
+      return "RRT 起点和目标检查均失败，未开始搜索。";
+    if (start_rejected) return "RRT 起点检查失败，未开始搜索。";
+    if (goal_rejected) return "RRT 目标检查失败，未开始搜索。";
+    return "RRT 没有找到一组同时通过检查的起点和目标，未开始搜索。";
+  }
+  if (stats.paths_found > 0) return "RRT 找到了路径，但后续优化未能生成可执行轨迹。";
+  const auto iterations = "RRT 搜索了 " + std::to_string(stats.iterations) + " 轮";
+  return iterations + (stats.trees_connected ? "，找到了连接，但路径未通过检查。"
+                                             : "，没能找到从起点到目标的路径。");
+}
+}  // namespace
+
 // 把产物里的原始上限乘上速度比例。速度、加速度、加加速度分别乘一次、两次、三次。
 DynamicLimits NativePlanner::dynamic_limits(const std::string &group) {
   auto limits = get(group).limits;
@@ -63,7 +83,7 @@ Trajectory NativePlanner::output(Group &group, bool scaled) {
   return result;
 }
 
-// 先轨迹优化，失败再按配置走 RRT 或 PRM。
+// 先尝试轨迹优化。允许图搜索时，RRT 失败后还可以用 PRM。
 PlanResult NativePlanner::solve(Group &group, const JointMap &state,
                                 const std::vector<std::vector<float>> &goals, int attempts,
                                 bool pose, bool allow_graph) {
@@ -71,13 +91,15 @@ PlanResult NativePlanner::solve(Group &group, const JointMap &state,
   const auto current = positions(group, state);
   group.start.upload(current);
   std::vector<float> prm_goal;
+  int total_rrt_calls = 0;
   const auto logger = rclcpp::get_logger("curobo_motion_planning_node");
-  std::vector<std::string> failures;
+  std::string last_failure = "未能生成可执行轨迹。";
   for (int attempt = 0; attempt < attempts; ++attempt) {
-    auto reject = [&](const std::string &reason) {
-      failures.push_back("[" + std::to_string(attempt + 1) + "] " + reason);
-      RCLCPP_WARN(logger, "【规划尝试】group=%s ｜ %d/%d ｜ %s", group.name.c_str(),
-                  attempt + 1, attempts, reason.c_str());
+    auto reject = [&](std::string reason) {
+      last_failure = std::move(reason);
+      RCLCPP_DEBUG(logger, "【OPT 规划】%s的%s规划第 %d 次尝试失败，共允许尝试 %d 次。%s",
+                   group.name.c_str(), pose ? "位姿" : "关节", attempt + 1, attempts,
+                   last_failure.c_str());
     };
     result.timing.attempts = attempt + 1;
     std::vector<std::vector<float>> valid_goals = goals;
@@ -117,16 +139,15 @@ PlanResult NativePlanner::solve(Group &group, const JointMap &state,
           if (!collision)
             valid_goals.push_back(std::move(q));
           else if (first_collision.empty())
-            first_collision = collision->message();
+            first_collision = collision->first + " 与 " + collision->second;
         }
       result.timing.check_ms += elapsed_ms(check_started);
-      RCLCPP_INFO(logger, "【IK 候选】group=%s ｜ 尝试 %d/%d ｜ IK通过 %d/%d ｜ "
-                          "FCL剔除 %zu ｜ 可用 %zu",
-                  group.name.c_str(), attempt + 1, attempts, ik_passed, group.ik_seeds,
-                  static_cast<size_t>(ik_passed) - valid_goals.size(), valid_goals.size());
+      RCLCPP_DEBUG(logger, "【OPT 逆解】%s尝试了 %d 个逆解初值，求得 %d 个候选，其中 %zu 个通过了终点碰撞检查。",
+                   group.name.c_str(), group.ik_seeds, ik_passed, valid_goals.size());
       if (valid_goals.empty()) {
         if (ik_passed) {
-          reject("IK有解，但FCL终点碰撞剔除全部候选；首个碰撞=" + first_collision);
+          reject("已算出目标关节角，但所有候选都在目标处发生碰撞。第一处碰撞为 " +
+                 first_collision + "。");
         } else {
           const auto position = group.ik_position_error.host(group.ik_seeds);
           const auto orientation = group.ik_orientation_error.host(group.ik_seeds);
@@ -141,12 +162,12 @@ PlanResult NativePlanner::solve(Group &group, const JointMap &state,
               best = seed;
             }
           }
-          reject("IK无通过候选（不可直接判定机械不可达）；最佳位姿种子=" +
-                 std::to_string(best) + " position_error_m=" + std::to_string(position[best]) +
-                 " limit_m=" + std::to_string(settings.position_tolerance) +
-                 " orientation_error_rad=" + std::to_string(orientation[best]) +
-                 " limit_rad=" + std::to_string(settings.orientation_tolerance) +
-                 " collision_cost=" + std::to_string(collision[best]));
+          RCLCPP_DEBUG(logger,
+                       "【OPT 逆解】最佳候选的位置误差为 %.6f 米，允许 %.6f 米。姿态误差为 %.6f 弧度，"
+                       "允许 %.6f 弧度。碰撞代价为 %.6f。",
+                       position[best], settings.position_tolerance, orientation[best],
+                       settings.orientation_tolerance, collision[best]);
+          reject("逆运动学未找到满足目标位姿和约束的关节角。");
         }
         continue;
       }
@@ -182,18 +203,19 @@ PlanResult NativePlanner::solve(Group &group, const JointMap &state,
     group.planner->plan(request);
     const bool success = group.success.host(1).front() != 0;
     const double total = elapsed_ms(before);
-    result.timing.graph_ms += group.planner->last_rrt_time() * 1000;
-    result.timing.trajopt_ms += std::max(0., total - group.planner->last_rrt_time() * 1000);
+    const int rrt_calls = group.planner->last_rrt_calls();
+    total_rrt_calls += rrt_calls;
+    const double rrt_ms = group.planner->last_rrt_time() * 1000.;
+    result.timing.graph_ms += rrt_ms;
+    result.timing.trajopt_ms += std::max(0., total - rrt_ms);
     if (!success) {
-      reject("IK/目标候选有效，但轨迹求解器成功标志=0；cost=" +
-             std::to_string(group.cost.host(1).front()) + " collision_cost=" +
-             std::to_string(group.collision.host(1).front()) + " RRT允许=" +
-             std::to_string(request.allow_rrt) + " RRT使用=" +
-             std::to_string(group.used_rrt.host(1).front()) + " RRT迭代=" +
-             std::to_string(group.rrt_iterations.host(1).front()) +
-             " solve_ms=" + std::to_string(total));
-      if (allow_graph && settings.graph == "prm" && prm_goal.empty())
-        prm_goal = valid_goals.front();
+      if (rrt_calls > 0)
+        reject(rrt_failure(group.planner->last_rrt_diagnostics()));
+      else
+        reject("直接优化未能生成可执行轨迹，求解器未提供失败原因。");
+      RCLCPP_DEBUG(logger, "【OPT 规划】第 %d 次求解共耗时 %.1f 毫秒，其中 RRT 用时 %.1f 毫秒。",
+                   attempt + 1, total, rrt_ms);
+      if (allow_graph && prm_goal.empty()) prm_goal = valid_goals.front();
       continue;
     }
     result.trajectory = output(group, true);
@@ -202,18 +224,41 @@ PlanResult NativePlanner::solve(Group &group, const JointMap &state,
       endpoint[group.names[j]] = result.trajectory.points.back().positions[j];
     const auto check = robot_.check(endpoint, group.name, true, false, payload_);
     if (check) {
-      reject("求解器成功，但FCL终点验收碰撞：" + check->message());
+      reject(std::string(rrt_calls > 0 ? "RRT 找到了轨迹" : "直接优化找到了轨迹") +
+             "，但在终点发现 " + check->first + " 与 " + check->second + " 发生碰撞。");
       continue;
     }
     result.success = true;
     result.message = "planning success";
     return result;
   }
-  if (allow_graph && settings.graph == "prm" && !prm_goal.empty())
-    return plan_prm(group, state, prm_goal);
-  result.message = "planning failed after " + std::to_string(attempts) + " attempts";
-  for (const auto &failure : failures) result.message += "; " + failure;
-  return result;
+  if (!allow_graph) {
+    result.message = last_failure;
+    return result;
+  }
+  result.message = "轨迹规划共尝试 " + std::to_string(result.timing.attempts) + " 次。"
+                   "最后一次尝试的结果是" + last_failure;
+  if (prm_goal.empty() ||
+      (settings.graph != "prm" && total_rrt_calls == 0))
+    return result;
+
+  RCLCPP_INFO(logger, "【OPT 回退】%s规划改用 PRM 搜索路径。%s",
+              pose ? "位姿" : "关节", last_failure.c_str());
+  const auto before_prm = Clock::now();
+  PlanResult fallback;
+  try {
+    fallback = plan_prm(group, state, prm_goal);
+  } catch (const std::runtime_error &error) {
+    fallback.message = std::string("PRM 规划遇到异常。") + error.what();
+  }
+  const double fallback_ms = elapsed_ms(before_prm);
+  result.timing.graph_ms += fallback_ms;
+  fallback.timing = result.timing;
+  if (fallback.success)
+    RCLCPP_INFO(logger, "【OPT 回退】PRM 找到了可执行轨迹，用时 %.1f 毫秒。", fallback_ms);
+  else
+    RCLCPP_DEBUG(logger, "【OPT 回退】PRM 用时 %.1f 毫秒。", fallback_ms);
+  return fallback;
 }
 // 关节目标直接优化，不经过逆解。
 PlanResult NativePlanner::plan_joint(const std::string &name, const JointMap &state,
@@ -231,7 +276,7 @@ PlanResult NativePlanner::plan_joint(const std::string &name, const JointMap &st
   PlanResult result;
   const auto check = robot_.check(final, name, true, false, payload_);
   if (check) {
-    result.message = "FCL endpoint collision " + check->message();
+    result.message = "到达目标时，" + check->first + " 会与 " + check->second + " 发生碰撞。";
     return result;
   }
   std::map<std::string, Transform> target_poses;
@@ -247,10 +292,10 @@ PlanResult NativePlanner::plan_pose(const std::string &name, const JointMap &sta
   for (const auto &[tool, target] : targets) {
     const Eigen::Quaterniond q(target.linear());
     const auto &p = target.translation();
-    RCLCPP_INFO(rclcpp::get_logger("curobo_motion_planning_node"),
-                "【规划目标】group=%s tool=%s ｜ 基座系 position_m=[%.6f, %.6f, %.6f] "
-                "orientation_xyzw=[%.6f, %.6f, %.6f, %.6f]",
-                name.c_str(), tool.c_str(), p.x(), p.y(), p.z(), q.x(), q.y(), q.z(), q.w());
+    RCLCPP_DEBUG(rclcpp::get_logger("curobo_motion_planning_node"),
+                 "【OPT 目标】%s的末端 %s 相对基座的目标坐标为 %.6f、%.6f、%.6f 米。"
+                 "目标姿态的四元数按 x、y、z、w 顺序为 %.6f、%.6f、%.6f、%.6f。",
+                 name.c_str(), tool.c_str(), p.x(), p.y(), p.z(), q.x(), q.y(), q.z(), q.w());
   }
   synchronize(name, state);
   auto &group = get(name);
@@ -465,12 +510,36 @@ void NativePlanner::warmup(const std::string &name, int iterations) {
 // 优化失败后的 PRM 关节路径。RRT 走求解器内部，不进这个函数。
 PlanResult NativePlanner::plan_prm(Group &group, const JointMap &state,
                                    const std::vector<float> &goal) {
-  // The CPU roadmap uses the same GPU collision model and dense edge checks.
-  const auto started = Clock::now();
+  // 起点与终点先验收，端点无效时无需生成路网。
   const auto start = positions(group, state);
+  PlanResult result;
+  const auto endpoint_failure = [&](const std::vector<float> &position) -> std::string {
+    // Keep the GPU acceptance criterion, then explain a rejection using the exported bounds.
+    if (gpu_valid(group, {position})) return {};
+    const float tolerance = group.planner->config().trajectory_optimization.constraint_tolerance;
+    for (int j = 0; j < group.dof; ++j) {
+      const float value = position[j];
+      const auto &joint = group.names[j];
+      if (!std::isfinite(value)) return "关节 " + joint + " 角度无效";
+      if (value < group.lower[j] - tolerance || value > group.upper[j] + tolerance) {
+        return "关节 " + joint + " 超限，实际角度 " + std::to_string(value) +
+               " 弧度，允许范围为 " + std::to_string(group.lower[j]) + " 至 " +
+               std::to_string(group.upper[j]) + " 弧度";
+      }
+    }
+    return "关节角都在允许范围内，但 GPU 检查失败。可能发生了碰撞，也可能是数值异常";
+  };
+  for (const auto &[label, position] : {std::pair{"起点", &start}, std::pair{"目标", &goal}}) {
+    const auto failure = endpoint_failure(*position);
+    if (!failure.empty()) {
+      result.message = std::string("PRM ") + label + "检查失败。" + failure + "。";
+      return result;
+    }
+  }
+  constexpr int random_samples = 180;
   std::vector<std::vector<float>> nodes{start, goal};
   std::mt19937 random(137);
-  for (int i = 0; i < 180; ++i) {
+  for (int i = 0; i < random_samples; ++i) {
     std::vector<float> q;
     for (const auto &name : group.names) {
       const auto bounds = robot_.limits.at(name);
@@ -478,14 +547,9 @@ PlanResult NativePlanner::plan_prm(Group &group, const JointMap &state,
     }
     nodes.push_back(std::move(q));
   }
-  std::vector<std::vector<float>> valid;
-  for (const auto &q : nodes)
-    if (gpu_valid(group, {q})) valid.push_back(q);
-  PlanResult result;
-  if (valid.size() < 2 || valid[0] != start || valid[1] != goal) {
-    result.message = "PRM endpoint collision";
-    return result;
-  }
+  std::vector<std::vector<float>> valid{start, goal};
+  for (size_t i = 2; i < nodes.size(); ++i)
+    if (gpu_valid(group, {nodes[i]})) valid.push_back(std::move(nodes[i]));
   nodes = std::move(valid);
   const auto distance = [](const auto &a, const auto &b) {
     double value = 0.;
@@ -498,6 +562,8 @@ PlanResult NativePlanner::plan_prm(Group &group, const JointMap &state,
       queue;
   costs[0] = 0.;
   queue.emplace(0., 0);
+  size_t checked_edges = 0;
+  size_t blocked_edges = 0;
   while (!queue.empty()) {
     auto [cost, node] = queue.top();
     queue.pop();
@@ -519,15 +585,22 @@ PlanResult NativePlanner::plan_prm(Group &group, const JointMap &state,
                       static_cast<float>(i) / (count - 1) * (nodes[next][j] - nodes[node][j]));
         edge.push_back(std::move(q));
       }
-      if (gpu_valid(group, edge)) {
-        costs[next] = cost + length;
-        parents[next] = node;
-        queue.emplace(costs[next], next);
+      ++checked_edges;
+      if (!gpu_valid(group, edge)) {
+        ++blocked_edges;
+        continue;
       }
+      costs[next] = cost + length;
+      parents[next] = node;
+      queue.emplace(costs[next], next);
     }
   }
   if (parents[1] < 0) {
-    result.message = "PRM search failed";
+    const auto logger = rclcpp::get_logger("curobo_motion_planning_node");
+    RCLCPP_DEBUG(logger, "【OPT 回退】PRM 采样了 %d 个关节姿态，其中 %zu 个通过检查。"
+                         "尝试连接了 %zu 次，其中 %zu 次未通过检查。",
+                 random_samples, nodes.size() - 2, checked_edges, blocked_edges);
+    result.message = "PRM 没能找到从起点到目标的可行路径。";
     return result;
   }
   std::vector<std::vector<float>> path;
@@ -536,20 +609,35 @@ PlanResult NativePlanner::plan_prm(Group &group, const JointMap &state,
   JointMap current = state;
   for (size_t i = 1; i < path.size(); ++i) {
     auto part = solve(group, current, {path[i]}, 1, false, false);
-    if (!part.success) throw std::runtime_error("PRM path refinement failed");
+    if (!part.success) {
+      result.message = "PRM 找到了由 " + std::to_string(path.size() - 1) +
+                       " 段组成的路径，但第 " + std::to_string(i) +
+                       " 段优化失败。" + part.message;
+      return result;
+    }
     for (int j = 0; j < group.dof; ++j)
       current[group.names[j]] = part.trajectory.points.back().positions[j];
     segments.push_back(std::move(part.trajectory));
   }
-  result.trajectory = segments.size() == 1
-                          ? segments.front()
-                          : blend_trajectories(segments, group.names, dynamic_limits(group.name),
-                                               std::vector<bool>(segments.size(), false))
-                                .trajectory;
-  validate(group.name, state, result.trajectory);
+  try {
+    result.trajectory = segments.size() == 1
+                            ? segments.front()
+                            : blend_trajectories(segments, group.names, dynamic_limits(group.name),
+                                                 std::vector<bool>(segments.size(), false))
+                                  .trajectory;
+  } catch (const std::runtime_error &error) {
+    result.message = std::string("PRM 找到了路径，但没能把各段轨迹拼接起来。") + error.what();
+    return result;
+  }
+  try {
+    validate(group.name, state, result.trajectory);
+  } catch (const std::runtime_error &error) {
+    result.message = std::string("PRM 拼接后的整条轨迹未通过检查。") + error.what();
+    result.trajectory = Trajectory{};
+    return result;
+  }
   result.success = true;
-  result.message = "PRM planning success";
-  result.timing.graph_ms = elapsed_ms(started);
+  result.message = "PRM 回退成功，轨迹已通过验收";
   return result;
 }
 }  // namespace curobo_ros_cpp

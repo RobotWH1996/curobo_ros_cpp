@@ -3,18 +3,21 @@ curobo_motion_planning_node:
   ros__parameters:
     # --- 机器人 / TrajOpt ---
     robot: lycus.yml                    # cuRobo 机器人 YAML，当前为 lycus.yml
-    scene_model: ""                     # 静态场景 YAML；空则无 cuboid/mesh 障碍（点云仍可单独开）
+    scene_model: ""                     # 静态障碍 YAML。空表示没有盒子和网格；点云另由 pointcloud_mode 决定
     warmup_iterations: 1                # TrajOpt CUDA graph warmup 次数；0 则启动快、第一次规划慢
     trajopt_prewarm_groups: [left_arm]   # 优先预热的 OPT 规划组；其他组首次请求时完成 CUDA 初始化
     pick_place_ik_prewarm: true         # Action 就绪前预热插补 IK，不需要点云或关节反馈，不下发命令
     pick_place_ik_prewarm_modes: [left_arm] # 优先准备常用臂，其他臂首次抓放时初始化
     pick_place_ik_prewarm_samples: [33, 65] # 常用批次数；65/129 等规格首次使用时初始化
     use_cuda_graph: true                # 是否捕获 CUDA graph；关则调试方便、稳态更慢
-    interpolation_dt: 0.02              # 规划轨迹插值步长 (s)
+    interpolation_dt: 0.02              # 规划结果相邻点的时间间隔，秒。想要点更密就减小
     trajopt_num_seeds: 2                # 并行种子。关节目标各种子相同，1 最快；位姿目标失败多了再调回 4
-    trajopt_finetune_attempts: 1        # 首解后再压时间的轮数。0 只求可行（最快），3 是 cuRobo 原默认（4 轮 L-BFGS）
+    trajopt_finetune_attempts: 1        # 先求出一条能走的轨迹后，再尝试缩短时间的次数。0 只求能走
     trajopt_num_iters: 50               # 每轮 L-BFGS 步数，必须是 25 的倍数。障碍里失败再调回 100
-    trajopt_graph_planner: rrt          # OPT 图搜索后端：rrt（GPU 双向 RRT）或 prm
+    # 直接轨迹优化失败后，选择优先使用的图搜索算法。
+    # rrt：从第 2 次尝试起允许 RRT 回退。若尝试用完且仍有候选关节目标，再试一次 PRM。
+    # prm：直接轨迹优化的尝试用完后，使用 PRM 回退。
+    trajopt_graph_planner: rrt
     trajopt_interpolation_steps: 2      # OPT 内部 B 样条采样密度，1–32；原默认 4，输出间隔由 interpolation_dt 控制
     position_tolerance: 0.005           # 笛卡尔位置成功阈值 (m)，也用于中间笛卡尔路点验收
     orientation_tolerance: 0.05         # 笛卡尔姿态成功阈值 (rad)，也用于中间笛卡尔路点验收
@@ -38,11 +41,11 @@ curobo_motion_planning_node:
     # 统一从 joint_states_topic 读取本体和夹爪初始状态；不创建夹爪专用命令/反馈话题。
     pick_place_timeout: 180.0           # Action.timeout=0 时的整任务超时，含执行等待 (s)
     gripper_wait_time: 0.0             # 闭合/释放完成后的额外稳定等待，秒；0 不额外等待
-    keep_tool_z_vertical: true         # OPT 中间姿态偏好工具Z轴竖直；false不增加该软约束
-    pick_place_joint_state_max_age: 1.0 # 离线规划起点反馈最大年龄，秒
-    pick_place_cloud_max_age: 2.0       # 离线规划初始点云最大年龄，秒
-    pick_place_path_tolerance: 0.01     # 接近/抬升/撤退直线允许偏差，米
-    pick_place_max_placed_objects: 16   # 本次离线任务已放置物体容量
+    keep_tool_z_vertical: true         # true：路点之间尽量让工具 Z 轴竖直。false：不加这个偏好
+    pick_place_joint_state_max_age: 1.0 # 抓放开始时，关节反馈超过这么久就失败，秒
+    pick_place_cloud_max_age: 2.0       # 抓放开始时点云的最大年龄，秒。required 下超时则这次失败；optional 下改成不用这帧点云
+    pick_place_path_tolerance: 0.01     # 接近、抬升、撤退的直线最多偏这么远，米
+    pick_place_max_placed_objects: 16   # 一次抓放里最多记住多少个已经放下的物体
 
     # --- 可视化（部署关）---
     visualize_trajectory: false         # false：不发 /display_planned_path、TrajOpt 绿线和 MPC 预览
@@ -51,40 +54,40 @@ curobo_motion_planning_node:
     visualize_goal_waypoints: false     # false：不发笛卡尔和关节角的 /curobo/goal_waypoints
 
     # --- 点云碰撞 ---
-    pointcloud_mode: "optional"         # off 不订阅；optional 不可用时继续规划；required 拒绝
-    self_filter_mode: "apply"             # off / observe（仅可视化）/ apply（实际删点）；启动参数
-    self_filter_padding: 0.05           # mesh表面向外距离，m；可能误删贴近本体的障碍
-    self_filter_max_processing_ms: 300.0 # 单帧几何过滤预算，ms；超时整帧保留，非硬实时限制
+    pointcloud_mode: "optional"         # off 不订阅点云。optional：有可用点云就用，否则这次不加点云障碍。required：没有可用点云则这次规划失败
+    self_filter_mode: "apply"             # off 不区分本体。observe 只画出被判成本体的点，碰撞仍保留它们。apply 才从碰撞里删掉。改完要重启
+    self_filter_padding: 0.05           # 本体表面再向外这么远都当成身体，米。太大容易把贴着身体的障碍一起删掉
+    self_filter_max_processing_ms: 300.0 # 一帧本体过滤最多花这么久，毫秒。超时后已确认的本体点仍删除，没查完的点留在障碍里
     pointcloud_topic: /all_points       # 点云话题
-    pointcloud_collision: mesh         # TrajOpt 点云碰撞：mesh 三角网格，voxel 距离场。MPC 仍用网格
+    pointcloud_collision: mesh         # 抓放和路点规划怎么用点云：mesh 是三角网格，voxel 是距离场。跟随始终用网格
     pointcloud_voxel_dims: [2.0, 2.0, 2.0]      # voxel 时盒子边长 (m)，base_link。mesh 时忽略
     pointcloud_voxel_center: [0.2, 0.0, 1.0]    # voxel 时盒子中心 (m)。盒子外的点当作没有障碍
     pointcloud_pitch: 0.02              # mesh 的体素边长，也是 voxel 格子边长 (m)
     pointcloud_max_points: 40000        # 滤波/下采样后最多保留点数
-    pointcloud_min_range: 0.2           # 距离滤波近端 (m)，仅 filter_pointcloud:=true
-    pointcloud_max_range: 3.0           # 距离滤波远端 (m)，仅 filter_pointcloud:=true
-    filter_pointcloud: false            # true：距离滤波 + 体素下采样
-    # 变到 base_link 后只留手臂够得到的盒子。躯干锁 0：肩高 1.24 m、臂长 0.87 m，外加 0.18 m。
+    pointcloud_min_range: 0.2           # 离相机近于该值的点丢掉，米。filter_pointcloud 为 false 时不使用
+    pointcloud_max_range: 3.0           # 离相机远于该值的点丢掉，米。filter_pointcloud 为 false 时不使用
+    filter_pointcloud: false            # true 才按上面两个距离删点。体素合并和边界裁剪始终都会做
+    # 变到 base_link 后，盒子外的点不进碰撞。范围按肩高 1.24 米、臂长 0.87 米，再向外扩 0.18 米。
     pointcloud_bounds_min: [0.00, -1.15, 0.20]   # xmin, ymin, zmin (m)
     pointcloud_bounds_max: [1.05, 1.15, 1.90]    # xmax, ymax, zmax (m)
-    pointcloud_exclude_boxes: ""        # 真机不裁固定盒子。仿真 debug 才填 bag 里的夹爪
+    pointcloud_exclude_boxes: ""        # 基座系里整块丢掉的区域。六个数一组：xmin ymin zmin xmax ymax zmax。真机留空；仿真里的固定夹爪才填到 debug.yaml
     pointcloud_parent_frame: base_link  # 点云变到此系再进规划（应与 base_frame 一致）
     pointcloud_child_frame: auto       # auto 读机器人光学系，未配置或显式留空则用消息 header.frame_id
 
     # --- MPC（/follow_mpc 期间生效）---
-    mpc_prewarm: false                   # 启动时各模式预热一次，不等点云；之后不再重建
-    mpc_prewarm_modes: [left_arm, right_arm, both_arms] # 缓存三种模式；增加显存和启动准备时间
+    mpc_prewarm: false                   # false：某只手臂第一次跟随才加载 MPC，第一拍大约多 1.5 秒。true：启动时就按下面的列表加载
+    mpc_prewarm_modes: [left_arm, right_arm, both_arms] # mpc_prewarm 为 true 时要加载的规划组。每多一组，启动更慢，也多占显存
     mpc_device: cuda:0                  # MPC 设备
-    mpc_optimization_dt: 0.14           # knot 步长。命令点间隔 0.035 s
-    mpc_num_control_points: 6           # B 样条控制点数。可填大于 5 的整数，常用 6 / 8 / 16（16 为 cuRobo 默认）。越小求解越快、向前看得越短：6 约 1.4 s，8 约 1.7 s，16 约 2.8 s。改完需重启重新预热
-    mpc_control_period: 0.10            # tick 目标 100 ms。点云那拍会到 300 ms，指令在代码里盖到 0.5 s
+    mpc_optimization_dt: 0.14           # 预测轨迹上相邻控制点的时间，秒。下发给控制器的点更密，间隔还要除以产物里的插值步数
+    mpc_num_control_points: 6           # 向前看几个控制点，必须大于 5。越少求解越快、看得越近：6 约 1.4 秒，8 约 1.7 秒，16 约 2.8 秒。改完要重启
+    mpc_control_period: 0.10            # 两拍之间至少隔这么久，秒。求解更慢时按实际耗时走，不会被压回这个值
     mpc_target_max_age: 1.0             # MPC 目标接收超时 (s)，超时停止跟随
     mpc_joint_state_max_age: 1.0        # MPC 运动组关节反馈接收超时 (s)
-    mpc_warm_start_iters: 50            # 热启动迭代，必须是 inner_iters 25 的倍数。默认 200 次求解约 150 ms
-    mpc_cold_start_iters: 100           # 第一拍迭代，同样是 25 的倍数
-    mpc_run_ik: false                   # 纯笛卡尔跟踪；开了会加关节空间吸引点，末端容易停在半路
-    mpc_posture_weight: 5.0             # 只沿末端零空间往构型目标收。0 关闭
-    mpc_posture: l                      # 构型目标：l 或 zero。运行中 ros2 param set 即可切换
+    mpc_warm_start_iters: 50            # 沿用上一拍结果时的迭代次数，必须是 25 的倍数。次数越大越慢
+    mpc_cold_start_iters: 100           # 每次跟随的第一拍，以及目标突然变化时的迭代次数，必须是 25 的倍数
+    mpc_run_ik: false                   # false：只追末端位姿。true：再把逆解当成关节吸引点，手臂可能停在半路
+    mpc_posture_weight: 5.0             # 在不改变末端目标的关节方向上，把姿态收向 mpc_posture。0 表示不收
+    mpc_posture: l                      # 要收向的姿态：l 是预设构型，zero 是各关节 0。运行中可用 ros2 param set 修改
     mpc_target_topic: /curobo/target    # 输入 MpcTarget（左右臂位姿合一条）
     mpc_plan_topic: /curobo/mpc_plan    # 输出 MpcPlan（左右轨迹 + 结果）
-    mpc_missing_target_warn_period: 2.0 # 某一侧目标缺失时的告警间隔 (s)；该臂钉在当前末端
+    mpc_missing_target_warn_period: 2.0 # 只有一只手有目标时，隔这么久告警一次，秒。缺目标的那只手保持当前末端

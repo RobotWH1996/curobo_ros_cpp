@@ -18,6 +18,16 @@ std::string group_list(const std::vector<std::string> &groups) {
   return result.empty() ? "无" : result;
 }
 
+void log_opt_result(const rclcpp::Logger &logger, size_t waypoint, size_t count,
+                    const PlanResult &result, double total_ms) {
+  const auto &timing = result.timing;
+  RCLCPP_INFO(logger,
+              "【OPT · 求解】路点 %zu/%zu ｜ %s ｜ 尝试 %d ｜ IK %.1f ms ｜ 图搜索和回退 %.1f ms ｜ "
+              "TrajOpt %.1f ms ｜ 碰撞检查 %.1f ms ｜ 本段 %.1f ms ｜ %zu 点 ｜ %s",
+              waypoint, count, result.success ? "通过" : "失败", timing.attempts,
+              timing.ik_ms, timing.graph_ms, timing.trajopt_ms, timing.check_ms, total_ms,
+              result.trajectory.points.size(), result.message.c_str());
+}
 }  // namespace
 // 按参数加载机器人和求解器。预热只覆盖配置里列出的规划组。
 PlanningNode::PlanningNode(const rclcpp::NodeOptions &options)
@@ -667,13 +677,20 @@ void PlanningNode::plan_joint(
   const auto started = Clock::now();
   const auto arm = arm_text(request->group_name);
   RCLCPP_INFO(get_logger(), "【任务】%s关节规划开始。", arm.c_str());
+  RCLCPP_DEBUG(get_logger(), "【OPT 规划】收到 %zu 个路点，图搜索配置为 %s，%s。",
+               request->waypoints.size(), planner->settings.graph.c_str(),
+               execution->enabled() ? "下发控制器" : "仅规划");
   try {
     if (execution->active()) throw std::runtime_error("execution busy");
     execution->clear();
     auto initial = state(), current = initial;
-    update_world(request->group_name, current);
+    auto phase_started = Clock::now();
+    const auto cloud = update_world(request->group_name, current);
+    RCLCPP_INFO(get_logger(), "【OPT · 场景】输入 %zu 点 ｜ 保留 %zu 点 ｜ %.1f ms",
+                cloud.raw_count, cloud.points.size(), elapsed_ms(phase_started));
     std::vector<Trajectory> parts;
     for (const auto &waypoint : request->waypoints) {
+      const size_t index = parts.size() + 1;
       auto target = current;
       const auto &group_joints = robot->profile.groups.at(request->group_name);
       if (waypoint.positions.size() != group_joints.size())
@@ -685,21 +702,39 @@ void PlanningNode::plan_joint(
         if (request->group_name == "both_arms" || tool.first == request->group_name)
           goals[tool.second] = robot->tool(target, tool.first);
       publish_goals("joint", goals);
+      std::ostringstream joint_goal;
+      for (size_t j = 0; j < group_joints.size(); ++j)
+        joint_goal << (j == 0 ? "" : ", ") << group_joints[j] << '=' << waypoint.positions[j];
+      RCLCPP_INFO(get_logger(), "【OPT · 目标】路点 %zu/%zu ｜ 关节目标 rad [%s]",
+                  index, request->waypoints.size(), joint_goal.str().c_str());
+      phase_started = Clock::now();
       auto result = planner->plan_joint(request->group_name, current, waypoint.positions);
+      log_opt_result(get_logger(), index, request->waypoints.size(), result, elapsed_ms(phase_started));
       if (!result.success) throw std::runtime_error(result.message);
       for (size_t j = 0; j < result.trajectory.joint_names.size(); ++j)
         current[result.trajectory.joint_names[j]] = result.trajectory.points.back().positions[j];
       parts.push_back(std::move(result.trajectory));
     }
     if (parts.empty()) throw std::runtime_error("empty waypoints");
+    phase_started = Clock::now();
     auto trajectory =
         blend_trajectories(parts, robot->profile.groups.at(request->group_name),
                            planner->dynamic_limits(request->group_name),
                            std::vector<bool>(parts.size(), false))
             .trajectory;
+    const double blend_ms = elapsed_ms(phase_started);
+    phase_started = Clock::now();
     planner->validate(request->group_name, initial, trajectory);
+    const double validation_ms = elapsed_ms(phase_started);
     publish(request->group_name, initial, trajectory);
+    phase_started = Clock::now();
     execution->submit(request->group_name, trajectory, [] { return false; });
+    RCLCPP_DEBUG(get_logger(),
+                 "【OPT 输出】轨迹有 %zu 个点，时长 %.3f 秒。组装用时 %.1f 毫秒，验收用时 %.1f 毫秒。"
+                 "%s，用时 %.1f 毫秒。",
+                 trajectory.points.size(), seconds(trajectory.points.back().time_from_start),
+                 blend_ms, validation_ms, execution->enabled() ? "控制器已接收" : "仅规划",
+                 elapsed_ms(phase_started));
     response->success = true;
     response->message = "planning success";
     RCLCPP_INFO(get_logger(), "【任务】%s关节规划成功，用时 %.1f 毫秒。", arm.c_str(),
@@ -722,11 +757,17 @@ void PlanningNode::plan_pose(const std::shared_ptr<interfaces::srv::PlanPoseGoal
   const auto started = Clock::now();
   const auto arm = arm_text(request->group_name);
   RCLCPP_INFO(get_logger(), "【任务】%s位姿规划开始。", arm.c_str());
+  RCLCPP_DEBUG(get_logger(), "【OPT 规划】收到 %zu 个路点，图搜索配置为 %s，%s。",
+               request->waypoints.size(), planner->settings.graph.c_str(),
+               execution->enabled() ? "下发控制器" : "仅规划");
   try {
     if (execution->active()) throw std::runtime_error("execution busy");
     execution->clear();
     auto initial = state(), current = initial;
-    update_world(request->group_name, current);
+    auto phase_started = Clock::now();
+    const auto cloud = update_world(request->group_name, current);
+    RCLCPP_INFO(get_logger(), "【OPT · 场景】输入 %zu 点 ｜ 保留 %zu 点 ｜ %.1f ms",
+                cloud.raw_count, cloud.points.size(), elapsed_ms(phase_started));
     if (request->waypoints.empty() ||
         (!request->other_waypoints.empty() &&
          request->other_waypoints.size() != request->waypoints.size()))
@@ -759,12 +800,24 @@ void PlanningNode::plan_pose(const std::shared_ptr<interfaces::srv::PlanPoseGoal
         targets[other_tool] = in_base(request->other_waypoints[i]);
       route.push_back(targets);
       publish_goals("pose", targets);
+      for (const auto &[link, pose] : targets) {
+        const Eigen::Quaterniond rotation(pose.linear());
+        RCLCPP_INFO(get_logger(),
+                    "【OPT · 目标】路点 %zu/%zu ｜ %s @ %s ｜ xyz=(%.3f, %.3f, %.3f) m ｜ "
+                    "xyzw=(%.3f, %.3f, %.3f, %.3f)",
+                    i + 1, request->waypoints.size(), link.c_str(), base.c_str(),
+                    pose.translation().x(), pose.translation().y(), pose.translation().z(),
+                    rotation.x(), rotation.y(), rotation.z(), rotation.w());
+      }
+      phase_started = Clock::now();
       auto result = planner->plan_pose(request->group_name, current, targets);
+      log_opt_result(get_logger(), i + 1, request->waypoints.size(), result, elapsed_ms(phase_started));
       if (!result.success) throw std::runtime_error(result.message);
       for (size_t j = 0; j < result.trajectory.joint_names.size(); ++j)
         current[result.trajectory.joint_names[j]] = result.trajectory.points.back().positions[j];
       parts.push_back(std::move(result.trajectory));
     }
+    phase_started = Clock::now();
     Trajectory trajectory;
     if (parts.size() == 1)
       trajectory = parts.front();
@@ -776,14 +829,27 @@ void PlanningNode::plan_pose(const std::shared_ptr<interfaces::srv::PlanPoseGoal
                          .trajectory;
       } catch (const std::runtime_error &error) {
         if (std::string(error.what()) != "via waypoint cannot be passed continuously") throw;
+        RCLCPP_WARN(get_logger(), "【OPT · 拼接】无法连续通过路点，改用联合多路点求解");
+        const auto unified_started = Clock::now();
         auto unified = planner->plan_pose_waypoints(request->group_name, initial, route);
+        log_opt_result(get_logger(), route.size(), route.size(), unified, elapsed_ms(unified_started));
         if (!unified.success) throw std::runtime_error(unified.message);
         trajectory = std::move(unified.trajectory);
       }
     }
+    const double blend_ms = elapsed_ms(phase_started);
+    phase_started = Clock::now();
     planner->validate(request->group_name, initial, trajectory);
+    const double validation_ms = elapsed_ms(phase_started);
     publish(request->group_name, initial, trajectory);
+    phase_started = Clock::now();
     execution->submit(request->group_name, trajectory, [] { return false; });
+    RCLCPP_DEBUG(get_logger(),
+                 "【OPT 输出】轨迹有 %zu 个点，时长 %.3f 秒。组装用时 %.1f 毫秒，验收用时 %.1f 毫秒。"
+                 "%s，用时 %.1f 毫秒。",
+                 trajectory.points.size(), seconds(trajectory.points.back().time_from_start),
+                 blend_ms, validation_ms, execution->enabled() ? "控制器已接收" : "仅规划",
+                 elapsed_ms(phase_started));
     response->success = true;
     response->message = "planning success";
     RCLCPP_INFO(get_logger(), "【任务】%s位姿规划成功，用时 %.1f 毫秒。", arm.c_str(),

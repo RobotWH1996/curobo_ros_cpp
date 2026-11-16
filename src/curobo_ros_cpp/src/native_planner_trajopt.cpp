@@ -242,8 +242,8 @@ PlanResult NativePlanner::solve(Group &group, const JointMap &state,
       (settings.graph != "prm" && total_rrt_calls == 0))
     return result;
 
-  RCLCPP_INFO(logger, "【OPT 回退】%s规划改用 PRM 搜索路径。%s",
-              pose ? "位姿" : "关节", last_failure.c_str());
+  RCLCPP_INFO(logger, "【OPT · 回退】%s ｜ 改用 PRM 搜索路径 ｜ %s",
+              pose ? "位姿规划" : "关节规划", last_failure.c_str());
   const auto before_prm = Clock::now();
   PlanResult fallback;
   try {
@@ -255,9 +255,11 @@ PlanResult NativePlanner::solve(Group &group, const JointMap &state,
   result.timing.graph_ms += fallback_ms;
   fallback.timing = result.timing;
   if (fallback.success)
-    RCLCPP_INFO(logger, "【OPT 回退】PRM 找到了可执行轨迹，用时 %.1f 毫秒。", fallback_ms);
+    RCLCPP_INFO(logger, "【OPT · PRM】通过 ｜ PRM 用时 %.1f ms ｜ %s",
+                fallback_ms, fallback.message.c_str());
   else
-    RCLCPP_DEBUG(logger, "【OPT 回退】PRM 用时 %.1f 毫秒。", fallback_ms);
+    RCLCPP_WARN(logger, "【OPT · PRM】失败 ｜ PRM 用时 %.1f ms ｜ %s",
+                fallback_ms, fallback.message.c_str());
   return fallback;
 }
 // 关节目标直接优化，不经过逆解。

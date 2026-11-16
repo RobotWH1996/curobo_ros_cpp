@@ -285,6 +285,7 @@ PlanningNode::PlanningNode(const rclcpp::NodeOptions &options)
   RCLCPP_INFO(get_logger(),
               "【规划节点 · 预热】OPT 初始化组 [%s] ｜ MPC 预热组 [%s] ｜ OPT 图搜索 %s",
               group_list(warm).c_str(), group_list(mpc_warm).c_str(), planner->settings.graph.c_str());
+  RCLCPP_INFO(get_logger(), "-------------初始化已完成，用时 %.1f ms--------------------------------", elapsed_ms(started));
   } catch (const std::exception &error) {
     if (step_group.empty())
       RCLCPP_FATAL(get_logger(), "【初始化 · %s】未完成 ｜ 错误：%s", step.c_str(), error.what());

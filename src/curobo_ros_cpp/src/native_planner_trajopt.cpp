@@ -409,9 +409,9 @@ void NativePlanner::validate(const std::string &name, const JointMap &state,
     std::vector<float> row;
     for (size_t j = 0; j < columns.size(); ++j) {
       const auto position = value.position[columns[j]];
-      const auto bounds = std::make_pair(group.lower[j], group.upper[j]);
-      if (!std::isfinite(position) || position < bounds.first - 1e-6 ||
-          position > bounds.second + 1e-6)
+      const float lower = group.lower[j];
+      const float upper = group.upper[j];
+      if (!std::isfinite(position) || position < lower - 1e-6 || position > upper + 1e-6)
         throw std::runtime_error("merged joint position limit violation");
       row.push_back(position);
     }

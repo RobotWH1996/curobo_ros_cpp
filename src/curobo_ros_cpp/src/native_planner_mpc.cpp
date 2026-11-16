@@ -112,9 +112,9 @@ MpcProposal NativePlanner::mpc_step(const std::string &name, const JointMap &sta
         delta *= 1. / std::max(1., delta.norm());
         const Eigen::VectorXd weights = basis.cwiseAbs().rowwise().sum();
         for (int j = 0; j < group.dof; ++j) {
-          const auto limits = std::make_pair(static_cast<double>(group.lower[j]),
-                                             static_cast<double>(group.upper[j]));
-          reference[j] = std::clamp(q[j] + delta[j], limits.first, limits.second);
+          const double lower = group.lower[j];
+          const double upper = group.upper[j];
+          reference[j] = std::clamp(q[j] + delta[j], lower, upper);
           dof_weights[j] = weights[j] / std::max(1e-6, weights.maxCoeff());
         }
         posture_weight = settings.mpc_posture_weight;

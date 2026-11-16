@@ -231,8 +231,9 @@ PlanResult NativePlanner::interpolate(const std::string &name, const JointMap &s
     JointMap full = state;
     for (int j = 0; j < group.dof; ++j) {
       full[group.names[j]] = at.position[j];
-      const auto bounds = std::make_pair(group.lower[j], group.upper[j]);
-      if (at.position[j] < bounds.first || at.position[j] > bounds.second)
+      const float lower = group.lower[j];
+      const float upper = group.upper[j];
+      if (at.position[j] < lower || at.position[j] > upper)
         throw std::runtime_error("contact joint limit violation");
     }
     const auto actual = robot_.tool(full, name);

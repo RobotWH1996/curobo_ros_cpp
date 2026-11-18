@@ -43,25 +43,40 @@ void check_time(const Trajectory &trajectory) {
     previous = time;
   }
 }
-}  // namespace
-// 在相邻两点之间按时间插值位置和各阶导数。
-// 只检查被插值的这一段，整条轨迹的时钟由调用方在入口检查一次。
-TrajectorySample sample_trajectory(const Trajectory &tr, double time) {
-  if (tr.points.size() < 2) throw std::runtime_error("trajectory requires two points");
+// 连续采样同一段时，复用多项式系数和结果缓冲区。
+class TrajectorySampler {
+ public:
+  explicit TrajectorySampler(const Trajectory &trajectory) : tr(trajectory) {
+    if (tr.points.size() < 2) throw std::runtime_error("trajectory requires two points");
+  }
+  const TrajectorySample &sample(double time);
+
+ private:
+  void load_segment(double time);
+
+  const Trajectory &tr;
+  size_t index = 0;
+  double start = 0., end = 0.;
+  Eigen::MatrixXd coefficients;
+  TrajectorySample values;
+};
+
+void TrajectorySampler::load_segment(double time) {
   auto right = std::upper_bound(
       tr.points.begin(), tr.points.end(), time,
       [](double t, const auto &entry) { return t < seconds(entry.time_from_start); });
-  size_t index = static_cast<size_t>(std::distance(tr.points.begin(), right));
+  index = static_cast<size_t>(std::distance(tr.points.begin(), right));
   index = std::clamp<size_t>(index, 1, tr.points.size() - 1) - 1;
   const auto &first = tr.points[index];
   const auto &last = tr.points[index + 1];
-  const double h = seconds(last.time_from_start) - seconds(first.time_from_start);
+  start = seconds(first.time_from_start);
+  end = seconds(last.time_from_start);
+  const double h = end - start;
   if (!(h > 0.) || first.positions.size() != tr.joint_names.size() ||
       last.positions.size() != tr.joint_names.size())
     throw std::runtime_error("invalid trajectory layout or clock at " + std::to_string(time));
-  const double u = (time - seconds(first.time_from_start)) / h;
   const auto n = tr.joint_names.size();
-  Eigen::MatrixXd coefficients = Eigen::MatrixXd::Zero(n, 6);
+  coefficients.setZero(n, 6);
   coefficients.col(0) = vector(first.positions);
   const bool have_v = first.velocities.size() == n && last.velocities.size() == n;
   const bool have_a = have_v && first.accelerations.size() == n && last.accelerations.size() == n;
@@ -84,19 +99,34 @@ TrajectorySample sample_trajectory(const Trajectory &tr, double time) {
     }
   } else
     coefficients.col(1) = vector(last.positions) - vector(first.positions);
-  std::array<Eigen::VectorXd, 4> values;
+}
+
+const TrajectorySample &TrajectorySampler::sample(double time) {
+  if (coefficients.cols() == 0 || (index > 0 && time < start) ||
+      (index + 2 < tr.points.size() && time >= end))
+    load_segment(time);
+  const double h = end - start;
+  const double u = (time - start) / h;
+  std::array<Eigen::VectorXd *, 4> derivatives{
+      &values.position, &values.velocity, &values.acceleration, &values.jerk};
   for (int derivative = 0; derivative < 4; ++derivative) {
-    values[derivative] = Eigen::VectorXd::Zero(n);
+    auto &value = *derivatives[derivative];
+    value.setZero(coefficients.rows());
     for (int power = derivative; power < 6; ++power) {
       double multiplier = 1.;
       for (int k = 0; k < derivative; ++k) multiplier *= power - k;
-      values[derivative] += multiplier * std::pow(u, power - derivative) * coefficients.col(power);
+      value += multiplier * std::pow(u, power - derivative) * coefficients.col(power);
     }
-    values[derivative] /= std::pow(h, derivative);
-    if (!values[derivative].allFinite())
+    value /= std::pow(h, derivative);
+    if (!value.allFinite())
       throw std::runtime_error("nonfinite trajectory polynomial");
   }
-  return {values[0], values[1], values[2], values[3]};
+  return values;
+}
+}  // namespace
+
+TrajectorySample sample_trajectory(const Trajectory &tr, double time) {
+  return TrajectorySampler(tr).sample(time);
 }
 // 各段关节名必须一致，时间按上一段终点顺延。
 Trajectory concatenate(const std::vector<Trajectory> &segments) {
@@ -262,8 +292,9 @@ void validate_dynamics(const Trajectory &tr, const std::vector<std::string> &arm
   for (const auto &entry : tr.points) times.insert(seconds(entry.time_from_start));
   const auto count = std::max<size_t>(2, static_cast<size_t>(std::ceil(end / step)) + 1);
   for (size_t i = 0; i < count; ++i) times.insert(end * i / (count - 1));
+  TrajectorySampler sampler(tr);
   for (const double time : times) {
-    const auto value = sample_trajectory(tr, time);
+    const auto &value = sampler.sample(time);
     for (size_t i = 0; i < selected.size(); ++i) {
       const auto j = selected[i];
       const auto verify = [&](const char *quantity, double measured, double limit) {
@@ -286,13 +317,14 @@ std::pair<double, size_t> retiming_peak(const Trajectory &trajectory,
                                         const DynamicLimits &limits) {
   double worst_ratio = 1.;
   size_t worst_index = 0;
+  TrajectorySampler sampler(trajectory);
   for (size_t i = 0; i + 1 < trajectory.points.size(); ++i)
     for (int sample = 0; sample < 9; ++sample) {
       const double t = seconds(trajectory.points[i].time_from_start) +
                        (seconds(trajectory.points[i + 1].time_from_start) -
                         seconds(trajectory.points[i].time_from_start)) *
                            sample / 8.;
-      const auto value = sample_trajectory(trajectory, t);
+      const auto &value = sampler.sample(t);
       for (size_t j = 0; j < selected.size(); ++j) {
         const auto k = selected[j];
         const double ratio =
@@ -417,8 +449,9 @@ BlendedTrajectory blend_trajectories(const std::vector<Trajectory> &segments,
   Trajectory base;
   base.joint_names = source.joint_names;
   base.header = source.header;
+  TrajectorySampler source_sampler(source);
   for (double time : source_times) {
-    auto sample = sample_trajectory(source, time);
+    auto sample = source_sampler.sample(time);
     const double mapped = map_time(time);
     for (const auto &window : windows)
       if (time >= window.left - 1e-9 && time <= window.right + 1e-9) {

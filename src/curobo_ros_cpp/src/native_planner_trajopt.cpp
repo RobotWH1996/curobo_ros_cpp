@@ -27,6 +27,47 @@ std::string rrt_failure(const curobo::robot::RrtDiagnostics &stats) {
   return iterations + (stats.trees_connected ? "，找到了连接，但路径未通过检查。"
                                              : "，没能找到从起点到目标的路径。");
 }
+
+// 每段沿 PRM 的关节空间直线运动，在路点停稳以保留折线路径。
+Trajectory time_prm_path(const std::vector<std::vector<float>> &path,
+                         const std::vector<std::string> &names,
+                         const DynamicLimits &limits, double dt) {
+  Trajectory result;
+  result.joint_names = names;
+  auto &first = result.points.emplace_back();
+  first.positions.assign(path.front().begin(), path.front().end());
+  first.velocities.resize(names.size(), 0.);
+  first.accelerations.resize(names.size(), 0.);
+  double offset = 0.;
+  for (size_t i = 1; i < path.size(); ++i) {
+    double time = dt;
+    for (size_t j = 0; j < names.size(); ++j) {
+      const double delta = std::abs(static_cast<double>(path[i][j]) - path[i - 1][j]);
+      // 五次平滑步进的归一化速度、加速度和 jerk 峰值。
+      time = std::max({time, 1.875 * delta / limits.velocity[j],
+                       std::sqrt((10. / std::sqrt(3.)) * delta / limits.acceleration[j]),
+                       std::cbrt(60. * delta / limits.jerk[j])});
+    }
+    time *= 1.02;
+    const auto count = static_cast<size_t>(std::ceil(time / dt));
+    for (size_t sample = 1; sample <= count; ++sample) {
+      const double u = static_cast<double>(sample) / count;
+      const double s = u * u * u * (10. + u * (-15. + 6. * u));
+      const double velocity = 30. * u * u * (1. - u) * (1. - u) / time;
+      const double acceleration = 60. * u * (1. - u) * (1. - 2. * u) / (time * time);
+      auto &point = result.points.emplace_back();
+      point.time_from_start = duration(offset + time * u);
+      for (size_t j = 0; j < names.size(); ++j) {
+        const double delta = static_cast<double>(path[i][j]) - path[i - 1][j];
+        point.positions.push_back(path[i - 1][j] + delta * s);
+        point.velocities.push_back(delta * velocity);
+        point.accelerations.push_back(delta * acceleration);
+      }
+    }
+    offset += time;
+  }
+  return result;
+}
 }  // namespace
 
 // 把产物里的原始上限乘上速度比例。速度、加速度、加加速度分别乘一次、两次、三次。
@@ -640,24 +681,28 @@ PlanResult NativePlanner::plan_prm(Group &group, const JointMap &state,
   for (int node = 1; node >= 0; node = parents[node]) path.insert(path.begin(), nodes[node]);
   std::vector<Trajectory> segments;
   JointMap current = state;
+  std::string opt_failure;
   for (size_t i = 1; i < path.size(); ++i) {
     auto part = solve(group, current, {path[i]}, 1, false, false);
     if (!part.success) {
-      result.message = "PRM 找到了由 " + std::to_string(path.size() - 1) +
+      opt_failure = "PRM 找到了由 " + std::to_string(path.size() - 1) +
                        " 段组成的路径，但第 " + std::to_string(i) +
                        " 段优化失败。" + part.message;
-      return result;
+      break;
     }
     for (int j = 0; j < group.dof; ++j)
       current[group.names[j]] = part.trajectory.points.back().positions[j];
     segments.push_back(std::move(part.trajectory));
   }
+  const auto limits = dynamic_limits(group.name);
   try {
-    result.trajectory = segments.size() == 1
-                            ? segments.front()
-                            : blend_trajectories(segments, group.names, dynamic_limits(group.name),
-                                                 std::vector<bool>(segments.size(), false))
-                                  .trajectory;
+    if (!opt_failure.empty())
+      result.trajectory = time_prm_path(path, group.names, limits, settings.dt);
+    else if (segments.size() == 1)
+      result.trajectory = std::move(segments.front());
+    else
+      result.trajectory = blend_trajectories(segments, group.names, limits,
+                                             std::vector<bool>(segments.size(), false)).trajectory;
   } catch (const std::runtime_error &error) {
     result.message = std::string("PRM 找到了路径，但没能把各段轨迹拼接起来。") + error.what();
     return result;
@@ -665,12 +710,16 @@ PlanResult NativePlanner::plan_prm(Group &group, const JointMap &state,
   try {
     validate(group.name, state, result.trajectory);
   } catch (const std::runtime_error &error) {
-    result.message = std::string("PRM 拼接后的整条轨迹未通过检查。") + error.what();
+    result.message = opt_failure.empty()
+                         ? std::string("PRM 拼接后的整条轨迹未通过检查。") + error.what()
+                         : opt_failure + " 按 PRM 路径定时后仍未通过整轨验收。" + error.what();
     result.trajectory = Trajectory{};
     return result;
   }
   result.success = true;
-  result.message = "PRM 回退成功，轨迹已通过验收";
+  result.message = opt_failure.empty()
+                       ? "PRM 回退成功，轨迹已通过验收"
+                       : opt_failure + " 按 PRM 路径定时后通过整轨验收，中间路点停稳。";
   return result;
 }
 }  // namespace curobo_ros_cpp

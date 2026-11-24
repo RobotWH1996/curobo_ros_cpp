@@ -43,7 +43,8 @@ curobo_motion_planning_node:
     gripper_wait_time: 0.0             # 闭合/释放完成后的额外稳定等待，秒；0 不额外等待
     keep_tool_z_vertical: true         # true：路点之间尽量让工具 Z 轴竖直。false：不加这个偏好
     pick_place_joint_state_max_age: 1.0 # 抓放开始时，关节反馈超过这么久就失败，秒
-    pick_place_cloud_max_age: 2.0       # 抓放开始时点云的最大年龄，秒。required 下超时则这次失败；optional 下改成不用这帧点云
+    pick_place_cloud_max_age: 2.0       # 点云接收与采集年龄上限（秒），适用于关节、位姿、IK、抓放和 MPC
+    joint_plan_cloud_wait_ms: 5000      # 关节规划没有合格点云时的最长等待（毫秒）
     pick_place_path_tolerance: 0.01     # 接近、抬升、撤退的直线最多偏这么远，米
     pick_place_max_placed_objects: 16   # 一次抓放里最多记住多少个已经放下的物体
 
@@ -54,10 +55,11 @@ curobo_motion_planning_node:
     visualize_goal_waypoints: false     # false：不发笛卡尔和关节角的 /curobo/goal_waypoints
 
     # --- 点云碰撞 ---
-    pointcloud_mode: "optional"         # off 不订阅点云。optional：有可用点云就用，否则这次不加点云障碍。required：没有可用点云则这次规划失败
+    pointcloud_mode: "optional"         # off 不订阅点云。optional：位姿和 IK 在尚未收到点云时可用静态场景。required：要求有效点云
     self_filter_mode: "apply"             # off 不区分本体。observe 只画出被判成本体的点，碰撞仍保留它们。apply 才从碰撞里删掉。改完要重启
-    self_filter_padding: 0.05           # 本体表面再向外这么远都当成身体，米。太大容易把贴着身体的障碍一起删掉
-    self_filter_max_processing_ms: 300.0 # 一帧本体过滤最多花这么久，毫秒。超时后已确认的本体点仍删除，没查完的点留在障碍里
+    self_filter_geometry: "sphere"       # sphere 使用碰撞球，mesh 使用网格
+    self_filter_padding: 0.05           # 网格和碰撞球的额外外扩距离（米）
+    self_filter_max_processing_ms: 1500.0 # 一帧本体过滤最多花这么久，毫秒。超时后已确认的本体点仍删除，没查完的点留在障碍里
     pointcloud_topic: /all_points       # 点云话题
     pointcloud_collision: mesh         # 抓放和路点规划怎么用点云：mesh 是三角网格，voxel 是距离场。跟随始终用网格
     pointcloud_voxel_dims: [2.0, 2.0, 2.0]      # voxel 时盒子边长 (m)，base_link。mesh 时忽略
@@ -67,9 +69,9 @@ curobo_motion_planning_node:
     pointcloud_min_range: 0.2           # 离相机近于该值的点丢掉，米。filter_pointcloud 为 false 时不使用
     pointcloud_max_range: 3.0           # 离相机远于该值的点丢掉，米。filter_pointcloud 为 false 时不使用
     filter_pointcloud: false            # true 才按上面两个距离删点。体素合并和边界裁剪始终都会做
-    # 变到 base_link 后，盒子外的点不进碰撞。范围按肩高 1.24 米、臂长 0.87 米，再向外扩 0.18 米。
-    pointcloud_bounds_min: [0.00, -1.15, 0.20]   # xmin, ymin, zmin (m)
-    pointcloud_bounds_max: [1.05, 1.15, 1.90]    # xmax, ymax, zmax (m)
+    # 变到 base_link 后裁剪场景点云。前方和下方包含夹爪扫过的区域。
+    pointcloud_bounds_min: [0.00, -1.15, -0.10]  # xmin, ymin, zmin (m)
+    pointcloud_bounds_max: [1.30, 1.15, 1.90]    # xmax, ymax, zmax (m)
     pointcloud_exclude_boxes: ""        # 基座系里整块丢掉的区域。六个数一组：xmin ymin zmin xmax ymax zmax。真机留空；仿真里的固定夹爪才填到 debug.yaml
     pointcloud_parent_frame: base_link  # 点云变到此系再进规划（应与 base_frame 一致）
     pointcloud_child_frame: auto       # auto 读机器人光学系，未配置或显式留空则用消息 header.frame_id
@@ -79,6 +81,7 @@ curobo_motion_planning_node:
     mpc_prewarm_modes: [left_arm, right_arm, both_arms] # mpc_prewarm 为 true 时要加载的规划组。每多一组，启动更慢，也多占显存
     mpc_device: cuda:0                  # MPC 设备
     mpc_optimization_dt: 0.14           # 预测轨迹上相邻控制点的时间，秒。下发给控制器的点更密，间隔还要除以产物里的插值步数
+    mpc_collision_activation_distance: 0.005 # MPC 环境碰撞代价激活距离，米
     mpc_num_control_points: 6           # 向前看几个控制点，必须大于 5。越少求解越快、看得越近：6 约 1.4 秒，8 约 1.7 秒，16 约 2.8 秒。改完要重启
     mpc_control_period: 0.10            # 两拍之间至少隔这么久，秒。求解更慢时按实际耗时走，不会被压回这个值
     mpc_target_max_age: 1.0             # MPC 目标接收超时 (s)，超时停止跟随
@@ -92,3 +95,4 @@ curobo_motion_planning_node:
     mpc_target_topic: /curobo/target    # 输入 MpcTarget（左右臂位姿合一条）
     mpc_plan_topic: /curobo/mpc_plan    # 输出 MpcPlan（左右轨迹 + 结果）
     mpc_missing_target_warn_period: 2.0 # 只有一只手有目标时，隔这么久告警一次，秒。缺目标的那只手保持当前末端
+    waypoint_joint_tolerance: 0.1       # 保留实机配置项，当前规划节点未读取

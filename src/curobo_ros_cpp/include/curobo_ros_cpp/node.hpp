@@ -22,6 +22,7 @@
 #include <type_traits>
 #include <visualization_msgs/msg/marker_array.hpp>
 #include "curobo_ros_cpp/executor.hpp"
+#include "curobo_ros_cpp/joint_history.hpp"
 #include "curobo_ros_cpp/native_planner.hpp"
 
 // ROS 接口层。服务和动作在这里排队，真正的求解交给 NativePlanner。
@@ -93,11 +94,14 @@ class PlanningNode : public rclcpp::Node {
   // 将带坐标系的位姿转换到规划基座系。空 frame_id 按基座系解释。
   // 对其他帧查询最新 TF，超时或位姿无效时抛异常。
   Transform in_base(const geometry_msgs::msg::PoseStamped &pose);
-  // 读取最新点云，变换到基座系后按关节快照过滤，并更新规划场景。
-  // check_receive_age 启用 OPT 抓放的接收年龄检查；是否允许无点云由点云模式决定。
-  // 可选点云不可用时清除点云障碍。相同输入可复用已处理的点云。
-  PreparedCloud update_world(const std::string &group, const JointMap &state,
-                             bool check_receive_age = false);
+  // 由持有 input_mutex_ 的调用方检查最新点云。
+  bool cloud_is_fresh(double max_age_ms) const;
+  int64_t observe_input_clock();  // 调用方持有 input_mutex_
+  enum class CloudFreshness { Latest, WaitForJointPlan, WaitForPickPlace };
+  // 用采集时刻的 TF 和关节位置更新场景。等待模式优先使用已有有效点云。
+  const PreparedCloud &update_world(const std::string &group,
+                                    CloudFreshness freshness = CloudFreshness::Latest,
+                                    bool require_cloud = false);
   // 把本阶段的工具目标画到 /curobo/goal_waypoints。
   void publish_goals(const std::string &stage, const std::map<std::string, Transform> &goals);
   // 发布规划轨迹，按配置生成 RViz 显示路径和末端折线。start 提供未规划关节的起始值。
@@ -129,6 +133,10 @@ class PlanningNode : public rclcpp::Node {
   std::mutex parameter_mutex_;             // 保护参数的延迟声明
 
  private:
+  sensor_msgs::msg::PointCloud2::ConstSharedPtr select_cloud(CloudFreshness freshness,
+                                                            bool require_cloud);
+  const PreparedCloud &prepare_world(const std::string &group,
+                                     const sensor_msgs::msg::PointCloud2::ConstSharedPtr &cloud);
   enum class PointCloudMode { Off, Optional, Required };
   // 处理关节路点规划服务。根据执行配置发布或提交验收后的轨迹。
   void plan_joint(const std::shared_ptr<interfaces::srv::PlanJointGoal::Request> request,
@@ -162,8 +170,11 @@ class PlanningNode : public rclcpp::Node {
   tf2_ros::Buffer tf_;  // 点云与工具目标的 TF 查询缓存
   tf2_ros::TransformListener listener_;  // 接收动态和静态 TF，填充 tf_
   std::mutex input_mutex_;                 // 保护关节、点云、MPC 目标及其接收时间
+  std::condition_variable cloud_ready_;
   JointMap joints_;                        // 最新关节位置
   JointMap joint_velocity_;                // 最新或差分得到的关节速度
+  JointHistory joint_history_;
+  std::map<std::string, std::set<std::string>> self_filter_joints_;
   std::map<std::string, Clock::time_point> joint_received_;  // 每个关节的反馈接收时间
   double joint_stamp_ = 0.;                // 上一帧关节消息的 ROS 时间，秒
   sensor_msgs::msg::PointCloud2::SharedPtr cloud_;  // 最新点云，可为空
@@ -177,9 +188,13 @@ class PlanningNode : public rclcpp::Node {
   PointCloudMode pointcloud_mode_ = PointCloudMode::Optional;  // 启动时确定订阅和失败策略
   PointCloudSettings cloud_settings_;    // 裁剪范围、过滤模式、采样密度及点数上限
   PreparedCloud cached_cloud_;             // 上一帧已经写进求解器的点云
+  std::optional<Payload> pending_pick_;     // 单独抓取的规划结果，等待实机持物确认
+  std::optional<Payload> held_payload_;
+  std::optional<int64_t> payload_change_stamp_;
+  std::map<std::string, std::set<std::string>> payload_pose_joints_;
   std::string cached_group_;               // 生成 cached_cloud_ 时的规划组
-  const void *cached_message_ = nullptr;   // 对应的点云消息地址，用来判断是不是同一帧
-  JointMap cached_joints_;                 // 生成缓存时的关节，移动超过余量就重算
+  sensor_msgs::msg::PointCloud2::ConstSharedPtr cached_message_;
+  bool cached_aligned_ = false;            // 临时保留的未过滤点云等待历史状态后重新处理
   bool cached_payload_ = false;            // 缓存时手上是否有工件
   uint64_t cached_generation_ = 0;         // 写入缓存时的场景代数
   std::string cloud_mode_;                 // mesh 或 voxel

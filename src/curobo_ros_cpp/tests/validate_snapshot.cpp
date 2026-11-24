@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // 回放记录的关节、TF 和点云，验证规划、抓放和 MPC 接口。
 #include <tf2_ros/static_transform_broadcaster.h>
+#include <std_srvs/srv/set_bool.hpp>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -110,11 +111,19 @@ int main(int argc, char **argv) {
     tf.transform.rotation.z = q["z"].as<double>();
     broadcaster.sendTransform(tf);
     std::atomic_bool publish_joints{true};
+    std::atomic_bool inject_old_cloud{false};
     auto timer = replay->create_wall_timer(std::chrono::milliseconds(100), [&] {
       joints.header.stamp = replay->now();
       cloud.header.stamp = replay->now();
       if (publish_joints) js_pub->publish(joints);
       cloud_pub->publish(cloud);
+      if (inject_old_cloud) {
+        auto old = cloud;
+        old.header.stamp = rclcpp::Time(cloud.header.stamp) - rclcpp::Duration::from_seconds(.18);
+        old.width = old.height = old.row_step = 0;
+        old.data.clear();
+        cloud_pub->publish(old);
+      }
     });
     rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 6);
     executor.add_node(node);
@@ -122,6 +131,12 @@ int main(int argc, char **argv) {
     std::thread thread([&] { executor.spin(); });
     try {
       std::this_thread::sleep_for(std::chrono::seconds(1));
+      inject_old_cloud = true;
+      std::this_thread::sleep_for(std::chrono::milliseconds(350));
+      if (node->update_world("left_arm").raw_count != static_cast<size_t>(c["width"].as<uint32_t>()) *
+                                                       c["height"].as<uint32_t>())
+        throw std::runtime_error("late capture replaced a newer pointcloud");
+      inject_old_cloud = false;
       interfaces::msg::PickTask pick;
       read_common(pick, fixture["pick"]);
       pick.close_position = fixture["pick"]["close_position"].as<double>();
@@ -176,6 +191,19 @@ int main(int argc, char **argv) {
         std::cout << "TASK_OUTPUT_NO_WHEELS_PASS " << expected_names.size() << std::endl;
       }
 
+      auto invalid_pick = pick;
+      invalid_pick.close_position = invalid_pick.open_position;
+      const auto bad_pick_result = node->manipulate(&invalid_pick, nullptr, 180., [] { return false; },
+                                                    [](const auto &, const auto &) {});
+      if (bad_pick_result.success) throw std::runtime_error("invalid pick goal was accepted");
+      auto confirm = replay->create_client<std_srvs::srv::SetBool>("/confirm_held_object");
+      for (const bool holding : {true, false}) {
+        auto request = std::make_shared<std_srvs::srv::SetBool::Request>();
+        request->data = holding;
+        auto reply = confirm->async_send_request(request);
+        if (reply.wait_for(std::chrono::seconds(2)) != std::future_status::ready || !reply.get()->success)
+          throw std::runtime_error("invalid request lost the preceding successful pick");
+      }
       const auto both_start = node->robot->check(joint_map, "both_arms", false);
       std::cout << "BOTH_START_FCL " << (both_start ? both_start->message() : "clear") << std::endl;
       Trajectory both_hold;

@@ -179,7 +179,7 @@ void NativePlanner::rebuild_world() {
   if (faces.empty())
     robot_.clear_environment();
   else
-    robot_.set_environment(vertices, faces);
+    robot_.set_environment(std::move(vertices), std::move(faces));
 }
 // 换一帧点云。mesh 和 voxel 的差别在重建时处理。
 void NativePlanner::set_world(const std::vector<Point> &points, double pitch,

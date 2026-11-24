@@ -51,7 +51,7 @@ struct NativePlanner::Group {
       ik_solution, ik_position_error, ik_orientation_error, ik_collision;
   // IK 成功标志、轨迹种子有效标志、OPT 成功标志，以及是否实际使用 RRT。
   DeviceArray<uint8_t> ik_success, seed_valid, success, used_rrt;
-  DeviceArray<uint8_t> configuration_violations;  // PRM 各采样状态独立的校验结果
+  DeviceArray<uint8_t> configuration_feasible;
   DeviceArray<int32_t> rrt_iterations;  // 求解器写回的 RRT 搜索迭代数
   // 控制点、离散位置和各阶导数、轨迹时间步长，以及优化和碰撞代价输出。
   DeviceArray<float> knots_buffer, trajectory_position, trajectory_velocity,

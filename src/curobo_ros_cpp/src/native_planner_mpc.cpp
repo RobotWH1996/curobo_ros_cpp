@@ -162,6 +162,43 @@ MpcProposal NativePlanner::mpc_step(const std::string &name, const JointMap &sta
   }
   return result;
 }
+bool NativePlanner::validate_mpc_continuation(const std::string &name,
+                                              const Trajectory &trajectory,
+                                              double from, double until,
+                                              double velocity_scale) {
+  auto &group = get(name, true);
+  const auto ordered = select_joints(trajectory, group.names);
+  const double length = until - from;
+  constexpr double kMaxSampleDt = .004;
+  const int intervals = group.horizon - 1;
+  const int chunks = std::max(1, static_cast<int>(std::ceil(length / (intervals * kMaxSampleDt))));
+  const double dt = length / (chunks * intervals);
+  const double scale2 = velocity_scale * velocity_scale;
+  const double scale3 = scale2 * velocity_scale;
+  TrajectorySampler sampler(ordered);
+  std::vector<float> q(group.horizon * group.dof), v(q.size()), a(q.size()), j(q.size());
+  for (int chunk = 0; chunk < chunks; ++chunk) {
+    for (int sample = 0; sample < group.horizon; ++sample) {
+      const auto &point = sampler.sample(from + dt * (chunk * intervals + sample));
+      for (int joint = 0; joint < group.dof; ++joint) {
+        const int index = sample * group.dof + joint;
+        q[index] = point.position[joint];
+        v[index] = point.velocity[joint] / velocity_scale;
+        a[index] = point.acceleration[joint] / scale2;
+        j[index] = point.jerk[joint] / scale3;
+      }
+    }
+    group.validate_position.upload(q);
+    group.validate_velocity.upload(v);
+    group.validate_acceleration.upload(a);
+    group.validate_jerk.upload(j);
+    if (!group.mpc->validate_trajectory(group.validate_position.get(), group.validate_velocity.get(),
+                                        group.validate_acceleration.get(), group.validate_jerk.get(),
+                                        dt * velocity_scale))
+      return false;
+  }
+  return true;
+}
 // 本拍结果可用，下一拍从这里继续。
 void NativePlanner::accept_mpc(const std::string &group) { get(group, true).mpc->accept(); }
 // 新的跟随开始前丢掉旧的热启动。

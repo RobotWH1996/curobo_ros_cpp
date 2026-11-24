@@ -129,11 +129,30 @@ std::string Collision::message() const { return kind + " " + first + " / " + sec
 // 读 URDF、默认姿态和碰撞网格，并建好允许忽略的连杆对。
 RobotModel::RobotModel(const std::string &urdf, const std::string &robot_yaml,
                        const std::string &profile_file, const std::string &config_directory,
-                       const std::string &geometry_directory)
+                       const std::string &geometry_directory,
+                       std::optional<double> self_filter_sphere_padding)
     : profile(profile_file) {
   if (!urdf_.initFile(urdf)) throw std::runtime_error("cannot load URDF " + urdf);
   const auto kin = YAML::LoadFile(robot_yaml)["robot_cfg"]["kinematics"];
   base_ = kin["base_link"].as<std::string>();
+  if (self_filter_sphere_padding) {
+    const auto collision_spheres = kin["collision_spheres"];
+    if (!collision_spheres.IsMap())
+      throw std::runtime_error("sphere self-filter requires inline collision_spheres in " +
+                               robot_yaml);
+    const auto buffer = kin["collision_sphere_buffer"].as<double>(0.);
+    for (const auto &entry : collision_spheres) {
+      auto &spheres = self_filter_spheres_[entry.first.as<std::string>()];
+      for (const auto &sphere : entry.second) {
+        const auto center = sphere["center"];
+        const auto radius = sphere["radius"].as<double>() + buffer;
+        if (radius <= 0.) continue;
+        const auto expanded = radius + *self_filter_sphere_padding;
+        spheres.push_back({{center[0].as<double>(), center[1].as<double>(), center[2].as<double>()},
+                           expanded * expanded, radius});
+      }
+    }
+  }
   const auto names = strings(kin["cspace"]["joint_names"]);
   const auto positions = kin["cspace"]["default_joint_position"];
   for (size_t i = 0; i < names.size(); ++i) defaults[names[i]] = positions[i].as<double>();
@@ -211,23 +230,9 @@ RobotModel::RobotModel(const std::string &urdf, const std::string &robot_yaml,
     mesh_builders.push_back(std::async(std::launch::async, build_meshes));
   build_meshes();
   for (auto &builder : mesh_builders) builder.get();
-  for (const auto &mesh : meshes_) {
-    auto link = urdf_.getLink(mesh.link);
-    while (link && link->parent_joint) {
-      urdf::JointConstSharedPtr joint = link->parent_joint;
-      if (joint->type != urdf::Joint::FIXED) {
-        std::set<std::string> visited;
-        while (joint->mimic) {
-          if (!visited.insert(joint->name).second)
-            throw std::runtime_error("cyclic mimic feedback dependency");
-          joint = urdf_.getJoint(joint->mimic->joint_name);
-          if (!joint) throw std::runtime_error("missing mimic source joint");
-        }
-        required_joint_names.insert(joint->name);
-      }
-      link = urdf_.getLink(link->parent_joint->parent_link_name);
-    }
-  }
+  std::set<std::string> collision_links;
+  for (const auto &mesh : meshes_) collision_links.insert(mesh.link);
+  required_joint_names = feedback_joints(collision_links);
   auto policy =
       YAML::LoadFile((std::filesystem::path(config_directory) / profile.policy_file).string());
   std::set<std::pair<std::string, std::string>> ignored;
@@ -281,9 +286,61 @@ std::set<std::string> RobotModel::moving_links(const std::string &group) const {
       result.insert(joint->child_link_name);
   return result;
 }
+std::set<std::string> RobotModel::feedback_joints(const std::set<std::string> &links) const {
+  std::set<std::string> result, ancestors;
+  for (const auto &name : links) {
+    auto link = urdf_.getLink(name);
+    while (link && link->parent_joint && ancestors.insert(link->name).second) {
+      urdf::JointConstSharedPtr joint = link->parent_joint;
+      if (joint->type != urdf::Joint::FIXED) {
+        std::set<std::string> visited;
+        while (joint->mimic) {
+          if (!visited.insert(joint->name).second)
+            throw std::runtime_error("cyclic mimic feedback dependency");
+          joint = urdf_.getJoint(joint->mimic->joint_name);
+          if (!joint) throw std::runtime_error("missing mimic source joint");
+        }
+        result.insert(joint->name);
+      }
+      link = urdf_.getLink(link->parent_joint->parent_link_name);
+    }
+  }
+  return result;
+}
+std::set<std::string> RobotModel::self_filter_joints(const std::string &group, bool spheres,
+                                                   bool compare) const {
+  const auto moving = moving_links(group);
+  std::set<std::string> links;
+  if (!spheres || compare)
+    for (const auto &mesh : meshes_)
+      if (moving.count(mesh.link)) links.insert(mesh.link);
+  if (spheres || compare)
+    for (const auto &[link, geometry] : self_filter_spheres_)
+      if (!geometry.empty() && moving.count(link)) links.insert(link);
+  return feedback_joints(links);
+}
+std::vector<Eigen::Vector4d> RobotModel::gripper_spheres(
+    const std::string &group, const std::map<std::string, Transform> &poses) const {
+  auto links = profile.contact_links(group);
+  links.push_back(substitute(profile.gripper_base_pattern, "{side}", group.substr(0, group.find('_'))));
+  std::vector<Eigen::Vector4d> spheres;
+  for (const auto &link : links) {
+    const auto found = self_filter_spheres_.find(link);
+    if (found == self_filter_spheres_.end()) continue;
+    const auto &pose = poses.at(link);
+    for (const auto &sphere : found->second) {
+      const Eigen::Vector3d center = pose * sphere.center;
+      spheres.emplace_back(center.x(), center.y(), center.z(), sphere.physical_radius);
+    }
+  }
+  return spheres;
+}
 // 该组工具连杆的基座系位姿。
 Transform RobotModel::tool(const JointMap &state, const std::string &group) const {
   return forward(state).at(profile.tools.at(group));
+}
+std::set<std::string> RobotModel::tool_feedback_joints(const std::string &group) const {
+  return feedback_joints({profile.tools.at(group)});
 }
 // 先摆好网格，再查自碰撞、环境和携物。
 std::optional<Collision> RobotModel::check(const JointMap &state, const std::string &group,
@@ -305,6 +362,11 @@ std::optional<Collision> RobotModel::check(const JointMap &state, const std::str
     if (first.object->getAABB().overlap(second.object->getAABB()) &&
         intersects(*first.object, *second.object))
       return Collision{"self", first.link, second.link};
+  }
+  if (environment && pending_environment_) {
+    const auto &mesh = *pending_environment_;
+    environment_ = std::make_unique<fcl::CollisionObjectd>(make_model(mesh.vertices, mesh.faces));
+    pending_environment_.reset();
   }
   if (environment && environment_)
     for (const auto &mesh : meshes_)
@@ -397,20 +459,39 @@ std::vector<bool> RobotModel::self_mask(const std::vector<Point> &points, const 
   }
   return remove;
 }
-// 替换 FCL 环境网格。GPU 场景由规划器另行更新。
-void RobotModel::set_environment(const std::vector<Eigen::Vector3d> &vertices,
-                                 const std::vector<fcl::Triangle> &faces) {
+std::vector<bool> RobotModel::self_sphere_mask(const std::vector<Point> &points,
+                                               const JointMap &state,
+                                               const std::string &group) const {
+  const auto transforms = forward(state);
+  std::vector<Sphere> world_spheres;
+  for (const auto &link : moving_links(group)) {
+    const auto found = self_filter_spheres_.find(link);
+    if (found == self_filter_spheres_.end()) continue;
+    for (const auto &sphere : found->second)
+      world_spheres.push_back({transforms.at(link) * sphere.center, sphere.radius_squared,
+                               sphere.physical_radius});
+  }
+  if (world_spheres.empty()) throw std::runtime_error("no self-filter collision spheres for " + group);
+  std::vector<bool> mask(points.size());
+  for (size_t i = 0; i < points.size(); ++i) {
+    const Eigen::Vector3d point = points[i].cast<double>();
+    mask[i] = std::any_of(world_spheres.begin(), world_spheres.end(), [&](const Sphere &sphere) {
+      return (point - sphere.center).squaredNorm() < sphere.radius_squared;
+    });
+  }
+  return mask;
+}
+void RobotModel::set_environment(std::vector<Eigen::Vector3d> vertices,
+                                 std::vector<fcl::Triangle> faces) {
   std::lock_guard<std::mutex> guard(query_mutex_);
-  auto geometry = make_model(vertices, faces);
-  auto object = std::make_unique<fcl::CollisionObjectd>(geometry);
-  environment_geometry_ = std::move(geometry);
-  environment_ = std::move(object);
+  environment_.reset();
+  pending_environment_ = EnvironmentMesh{std::move(vertices), std::move(faces)};
 }
 // 去掉环境障碍，自碰撞检查仍然保留。
 void RobotModel::clear_environment() {
   std::lock_guard<std::mutex> guard(query_mutex_);
   environment_.reset();
-  environment_geometry_.reset();
+  pending_environment_.reset();
 }
 // 用关节速度上限把夹爪行程换成秒。
 double RobotModel::gripper_duration(const std::string &joint, double start, double target) const {

@@ -8,8 +8,9 @@ namespace {
 Trajectory interval(const Trajectory &trajectory, double start, double end) {
   Trajectory result;
   result.joint_names = trajectory.joint_names;
+  TrajectorySampler sampler(trajectory);
   auto add = [&](double time) {
-    auto value = sample_trajectory(trajectory, time);
+    const auto &value = sampler.sample(time);
     trajectory_msgs::msg::JointTrajectoryPoint point;
     point.time_from_start = duration(time - start);
     point.positions = {value.position.data(), value.position.data() + value.position.size()};
@@ -104,6 +105,8 @@ TaskResult PlanningNode::manipulate(
     if (execution->active()) throw std::runtime_error("execution busy");
     execution->clear();
     const std::string group = pick ? pick->group_name : place->group_name;
+    if (held_payload_ && (pick || held_payload_->group != group))
+      throw std::invalid_argument("release the confirmed held object before changing the pick arm");
     arm = arm_text(group);
     open_task();
     if (group != "left_arm" && group != "right_arm")
@@ -123,10 +126,7 @@ TaskResult PlanningNode::manipulate(
         throw std::invalid_argument("pick open and close targets coincide");
     }
     if (place) validate_gripper(place->open_position);
-    auto initial = state(true), current = initial;
     const auto names = robot->full_joint_names;
-    planner->synchronize(group, current);
-    const auto dynamic = planner->dynamic_limits(group);
     Payload object;
     object.group = group;
     auto size = [&](const geometry_msgs::msg::Vector3 &input) {
@@ -188,16 +188,23 @@ TaskResult PlanningNode::manipulate(
       separation(contact, compose(reference, place->retreat_in_target, place->in_base_frame));
       for (const auto &waypoint : place->waypoints) validate_waypoint(waypoint, false);
       validate_waypoint(place->end_pose, true);
-      if (std::abs(place->open_position - (pick ? pick->close_position : current.at(gripper))) <
-          1e-6)
-        throw std::invalid_argument("place release equals initial gripping position");
     }
+    const auto cloud = select_cloud(CloudFreshness::WaitForPickPlace, true);
+    check();
+    const auto initial = state(true);
+    auto current = initial;
+    if (place && std::abs(place->open_position - (pick ? pick->close_position : initial.at(gripper))) < 1e-6)
+      throw std::invalid_argument("place release equals initial gripping position");
+    planner->synchronize(group, current);
+    const auto dynamic = planner->dynamic_limits(group);
     if (pick) {
       const auto reference = in_base(pick->tool_pose);
       const auto grasp = compose(reference, pick->pick_pose, pick->in_base_frame);
       object.size = size(pick->object_size);
       object.in_tool = grasp.inverse() * reference;
       object.source_pose = reference;
+    } else if (held_payload_) {
+      object = *held_payload_;
     } else {
       const auto reference = in_base(place->tool_pose);
       const auto goal = compose(reference, place->place_pose, place->in_base_frame);
@@ -208,14 +215,15 @@ TaskResult PlanningNode::manipulate(
     }
     if (pick && !stop_at_pick) current[gripper] = pick->open_position;
     std::vector<std::pair<Transform, Eigen::Vector3d>> source_exclusions;
-    const auto frozen_cloud = update_world(group, initial, /*check_receive_age=*/true);
+    const auto &frozen_cloud = prepare_world(group, cloud);
     // 抬升或撤退后，用冻结点云去掉已处理物体并刷新碰撞场景。
     auto refresh_world = [&]() {
       auto points = frozen_cloud.points;
       for (const auto &exclusion : source_exclusions)
         points = exclude_box(points, exclusion.first, exclusion.second);
       const auto payload = planner->payload();
-      if (payload) points = exclude_box(points, payload->source_pose, payload->size);
+      if (payload && !held_payload_)
+        points = exclude_box(points, payload->source_pose, payload->size);
       planner->set_world(points, cloud_settings_.pitch, cloud_mode_, voxel_center_,
                          voxel_dimensions_);
     };
@@ -237,12 +245,13 @@ TaskResult PlanningNode::manipulate(
       set_stage(stage);
       const auto before = Clock::now();
       PlanResult part;
-      const auto start_pose = robot->tool(current, group);
+      const Transform start_pose = contact ? robot->tool(current, group) : Transform::Identity();
       const auto before_state = current;
       if (target) publish_goals(stage, {{tool, *target}});
       if (target)
         part = contact ? planner->interpolate(group, current, start_pose, *target)
-                       : planner->plan_pose(group, current, {{tool, *target}});
+                       : planner->plan_pose(group, current, {{tool, *target}}, 3,
+                                            /*rrt_on_first_attempt=*/stage == "prepick");
       else if (waypoint.type == "joint")
         part = planner->plan_joint(group, current, waypoint.joint_positions);
       else if (waypoint.type == "pose")
@@ -263,7 +272,7 @@ TaskResult PlanningNode::manipulate(
       for (size_t i = 0; i < names.size(); ++i) current[names[i]] = full.points.back().positions[i];
       pending.push_back(std::move(full));
       contacts.push_back(contact);
-      contact_paths.push_back({start_pose, target.value_or(robot->tool(current, group))});
+      contact_paths.push_back({start_pose, contact ? *target : Transform::Identity()});
       stage_states.push_back(before_state);
       stages.push_back(stage);
       const auto label = stage_text(stage);
@@ -279,6 +288,7 @@ TaskResult PlanningNode::manipulate(
       if (pending.empty()) return Trajectory{};
       const auto before = Clock::now();
       auto merged = blend_trajectories(pending, robot->profile.groups.at(group), dynamic, contacts);
+      const double blend_ms = elapsed_ms(before);
       const size_t deadline_index =
           std::find(contacts.begin(), contacts.end(), true) - contacts.begin();
       if (opening) {
@@ -293,10 +303,14 @@ TaskResult PlanningNode::manipulate(
         }
         opening = false;
       }
+      double validation_ms = 0., contact_fk_ms = 0.;
       for (size_t i = 0; i < pending.size(); ++i) {
+        const auto before_validation = Clock::now();
         auto slice = interval(merged.trajectory, merged.boundaries[i], merged.boundaries[i + 1]);
         planner->validate(group, stage_states[i], slice, !contacts[i]);
+        validation_ms += elapsed_ms(before_validation);
         if (contacts[i]) {
+          const auto before_fk = Clock::now();
           const auto &path = contact_paths[i];
           const Eigen::Vector3d delta = path.end.translation() - path.start.translation();
           const double length = delta.norm();
@@ -321,6 +335,7 @@ TaskResult PlanningNode::manipulate(
               throw std::runtime_error("merged contact path deviates from line");
             previous = along;
           }
+          contact_fk_ms += elapsed_ms(before_fk);
         }
       }
       result.trajectories.push_back(without_wheel_joints(merged.trajectory));
@@ -332,8 +347,10 @@ TaskResult PlanningNode::manipulate(
         shown += stage_text(stage);
       }
       result.trajectory_stages.push_back(labels);
-      RCLCPP_INFO(get_logger(), "【合并】%s ｜ points %zu ｜ 耗时 %.1f 毫秒", shown.c_str(),
-                  merged.trajectory.points.size(), elapsed_ms(before));
+      RCLCPP_INFO(get_logger(), "【合并】%s ｜ points %zu ｜ 耗时 %.1f 毫秒 ｜ 拼接重定时 %.1f "
+                  "毫秒 ｜ 分段验收 %.1f 毫秒 ｜ 接触直线验收 %.1f 毫秒",
+                  shown.c_str(), merged.trajectory.points.size(), elapsed_ms(before),
+                  blend_ms, validation_ms, contact_fk_ms);
       pending.clear();
       contacts.clear();
       contact_paths.clear();
@@ -349,6 +366,7 @@ TaskResult PlanningNode::manipulate(
       result.trajectory = concatenate(completed);
       publish(group, initial, result.trajectory, !external_stream);
       if (external_stream) send_block(false, false);
+      if (completed.size() == 1 && !stop_at_pick) pending_pick_.reset();
       execution->submit(group, result.trajectory, stopped);
       submitted = execution->enabled();
       RCLCPP_INFO(get_logger(), "【提交】第 %zu 块 ｜ 已等待 %.1f 毫秒", completed.size(),
@@ -426,6 +444,7 @@ TaskResult PlanningNode::manipulate(
       result.execution_completed = true;
     }
     result.success = true;
+    if (pick && !place && !stop_at_pick) pending_pick_ = object;
 
     result.message = "planning success";
     RCLCPP_INFO(get_logger(),

@@ -43,23 +43,11 @@ void check_time(const Trajectory &trajectory) {
     previous = time;
   }
 }
-// 连续采样同一段时，复用多项式系数和结果缓冲区。
-class TrajectorySampler {
- public:
-  explicit TrajectorySampler(const Trajectory &trajectory) : tr(trajectory) {
-    if (tr.points.size() < 2) throw std::runtime_error("trajectory requires two points");
-  }
-  const TrajectorySample &sample(double time);
+}  // namespace
 
- private:
-  void load_segment(double time);
-
-  const Trajectory &tr;
-  size_t index = 0;
-  double start = 0., end = 0.;
-  Eigen::MatrixXd coefficients;
-  TrajectorySample values;
-};
+TrajectorySampler::TrajectorySampler(const Trajectory &trajectory) : tr(trajectory) {
+  if (tr.points.size() < 2) throw std::runtime_error("trajectory requires two points");
+}
 
 void TrajectorySampler::load_segment(double time) {
   auto right = std::upper_bound(
@@ -107,6 +95,8 @@ const TrajectorySample &TrajectorySampler::sample(double time) {
     load_segment(time);
   const double h = end - start;
   const double u = (time - start) / h;
+  std::array<double, 6> powers;
+  for (int power = 0; power < 6; ++power) powers[power] = std::pow(u, power);
   std::array<Eigen::VectorXd *, 4> derivatives{
       &values.position, &values.velocity, &values.acceleration, &values.jerk};
   for (int derivative = 0; derivative < 4; ++derivative) {
@@ -115,7 +105,7 @@ const TrajectorySample &TrajectorySampler::sample(double time) {
     for (int power = derivative; power < 6; ++power) {
       double multiplier = 1.;
       for (int k = 0; k < derivative; ++k) multiplier *= power - k;
-      value += multiplier * std::pow(u, power - derivative) * coefficients.col(power);
+      value += multiplier * powers[power - derivative] * coefficients.col(power);
     }
     value /= std::pow(h, derivative);
     if (!value.allFinite())
@@ -123,8 +113,6 @@ const TrajectorySample &TrajectorySampler::sample(double time) {
   }
   return values;
 }
-}  // namespace
-
 TrajectorySample sample_trajectory(const Trajectory &tr, double time) {
   return TrajectorySampler(tr).sample(time);
 }
@@ -327,10 +315,11 @@ std::pair<double, size_t> retiming_peak(const Trajectory &trajectory,
       const auto &value = sampler.sample(t);
       for (size_t j = 0; j < selected.size(); ++j) {
         const auto k = selected[j];
-        const double ratio =
-            std::max({std::abs(value.velocity[k]) / limits.velocity[j],
-                      std::sqrt(std::abs(value.acceleration[k]) / limits.acceleration[j]),
-                      std::cbrt(std::abs(value.jerk[k]) / limits.jerk[j])});
+        const double velocity = std::abs(value.velocity[k]) / limits.velocity[j];
+        const double acceleration = std::abs(value.acceleration[k]) / limits.acceleration[j];
+        const double jerk = std::abs(value.jerk[k]) / limits.jerk[j];
+        if (velocity <= 1. && acceleration <= 1. && jerk <= 1.) continue;
+        const double ratio = std::max({velocity, std::sqrt(acceleration), std::cbrt(jerk)});
         if (ratio > 1.005 && ratio * 1.02 > worst_ratio) {
           worst_ratio = ratio * 1.02;
           worst_index = i;
@@ -373,33 +362,37 @@ BlendedTrajectory blend_trajectories(const std::vector<Trajectory> &segments,
     for (auto column : selected) squared += value.velocity[column] * value.velocity[column];
     return std::sqrt(squared);
   };
+  TrajectorySampler source_sampler(source);
   for (size_t boundary = 1; boundary + 1 < boundaries.size(); ++boundary) {
     const double center = boundaries[boundary];
-    std::vector<double> left, right;
+    std::vector<std::pair<double, double>> left, right;
     double max_left = 0., max_right = 0.;
     for (const auto &entry : source.points) {
       const double t = seconds(entry.time_from_start);
       if (t >= boundaries[boundary - 1] && t < center) {
-        left.push_back(t);
-        max_left = std::max(max_left, speed(sample_trajectory(source, t)));
+        const double at = speed(source_sampler.sample(t));
+        left.emplace_back(t, at);
+        max_left = std::max(max_left, at);
       }
       if (t > center && t <= boundaries[boundary + 1]) {
-        right.push_back(t);
-        max_right = std::max(max_right, speed(sample_trajectory(source, t)));
+        const double at = speed(source_sampler.sample(t));
+        right.emplace_back(t, at);
+        max_right = std::max(max_right, at);
       }
     }
     if (left.empty() || right.empty()) continue;
-    auto before = std::find_if(left.rbegin(), left.rend(), [&](double t) {
-      return speed(sample_trajectory(source, t)) >= std::max(.45 * max_left, 1e-5);
+    auto before = std::find_if(left.rbegin(), left.rend(), [&](const auto &sample) {
+      return sample.second >= std::max(.45 * max_left, 1e-5);
     });
-    auto after = std::find_if(right.begin(), right.end(), [&](double t) {
-      return speed(sample_trajectory(source, t)) >= std::max(.45 * max_right, 1e-5);
+    auto after = std::find_if(right.begin(), right.end(), [&](const auto &sample) {
+      return sample.second >= std::max(.45 * max_right, 1e-5);
     });
     if (before == left.rend() || after == right.end()) continue;
-    const double l = *before, r = *after;
+    const double l = before->first, r = after->first;
     if (!windows.empty() && l < windows.back().right - 1e-8) continue;
-    auto first = sample_trajectory(source, l), middle = sample_trajectory(source, center),
-         last = sample_trajectory(source, r);
+    auto first = source_sampler.sample(l);
+    auto middle = source_sampler.sample(center);
+    auto last = source_sampler.sample(r);
     Eigen::VectorXd incoming = middle.position - first.position,
                     outgoing = last.position - middle.position;
     const double dl = incoming.norm(), dr = outgoing.norm();
@@ -449,7 +442,6 @@ BlendedTrajectory blend_trajectories(const std::vector<Trajectory> &segments,
   Trajectory base;
   base.joint_names = source.joint_names;
   base.header = source.header;
-  TrajectorySampler source_sampler(source);
   for (double time : source_times) {
     auto sample = source_sampler.sample(time);
     const double mapped = map_time(time);

@@ -6,6 +6,7 @@
 #include <curobo_robot_runtime/mpc.h>
 #include <functional>
 #include <memory>
+#include <optional>
 #include "curobo_ros_cpp/pointcloud.hpp"
 #include "curobo_ros_cpp/trajectory.hpp"
 
@@ -80,6 +81,7 @@ struct PlannerSettings {
   int mpc_iterations = 50;            // MPC 热启动迭代
   int mpc_cold_iterations = 100;      // MPC 冷启动迭代
   double mpc_optimization_dt = .14;   // MPC 相邻控制点的时间间隔，秒
+  float mpc_collision_activation_distance = .005F; // MPC 环境碰撞代价的激活距离，米
   double mpc_posture_weight = 5.;     // 构型参考的权重
   std::string mpc_posture = "l";      // 机器人配置中的命名姿态，zero 表示零关节位
   bool mpc_run_ik = false;            // MPC 每拍是否先跑逆解
@@ -150,6 +152,7 @@ class NativePlanner {
   void clear_placed_objects();
   // 复制当前动态场景，供抓放操作结束后恢复。
   WorldState world_state() const;
+  const std::vector<Point> &world_points() const { return world_points_; }
   // 恢复快照里的点云和已放置物体，并重建 GPU 场景。
   void restore_world(const WorldState &state);
   // 设置或清除手上的工件。空 optional 表示已经释放。
@@ -159,11 +162,13 @@ class NativePlanner {
   // 规划到关节目标。target 按该组的活动关节顺序排列，state 提供全身起始位置。
   // attempts 是总尝试上限，结果包含轨迹、成功标志和阶段计时。
   PlanResult plan_joint(const std::string &group, const JointMap &state,
-                        const std::vector<double> &target, int attempts = 3);
+                        const std::vector<double> &target, int attempts = 3,
+                        bool mesh_along_path = false);
   // 规划到一个或多个工具位姿。targets 的键是导出的工具帧，值为基座系目标。
   // 未指定的工具用求解器当前 FK 补齐。attempts 是总尝试上限。
   PlanResult plan_pose(const std::string &group, const JointMap &state,
-                       const std::map<std::string, Transform> &targets, int attempts = 3);
+                       const std::map<std::string, Transform> &targets, int attempts = 3,
+                       bool rrt_on_first_attempt = false);
   // 按顺序将多个笛卡尔路点交给一次规划，每个路点按工具帧指定基座系位姿。
   PlanResult plan_pose_waypoints(const std::string &group, const JointMap &state,
                                  const std::vector<std::map<std::string, Transform>> &targets);
@@ -177,12 +182,14 @@ class NativePlanner {
   // 验收位置限位、关节连续性、动态限位及末端路径偏差，接触段跳过碰撞检查。
   PlanResult interpolate(const std::string &group, const JointMap &state, const Transform &start,
                          const Transform &end);
-  // 采样检查关节位置和动态限位。collision 为真时还检查 GPU 批量碰撞与 FCL 端点。
+  // 采样检查限位和 GPU 碰撞。FCL 默认检查端点，mesh_along_path 检查所有采样。
   // 接触段传 false 时跳过碰撞，任一启用的检查失败即抛异常。
   void validate(const std::string &group, const JointMap &state, const Trajectory &trajectory,
-                bool collision = true);
+                bool collision = true, std::optional<double> velocity_scale = std::nullopt,
+                bool mesh_along_path = false);
   // 返回组内关节的执行限位。速度、加速度和 jerk 分别乘速度比例的一、二、三次方。
-  DynamicLimits dynamic_limits(const std::string &group);
+  DynamicLimits dynamic_limits(const std::string &group,
+                               std::optional<double> velocity_scale = std::nullopt);
   // 计算给定关节状态下的 GPU FK，按导出的工具帧顺序返回基座系位姿。
   std::vector<Transform> forward(const std::string &group, const JointMap &state);
   // 按 tools 顺序堆叠每个工具的六行雅可比，列顺序对应该组的活动关节。
@@ -197,6 +204,9 @@ class NativePlanner {
                        const TrajectorySample &handoff, int executed_knots, bool reset,
                        double velocity_scale = 1.,
                        const std::vector<double> &cold_seed_goal = {}, bool joint_goal = false);
+  // 在当前场景下检查原轨迹的指定区间，from 和 until 使用原轨迹的时间轴。
+  bool validate_mpc_continuation(const std::string &group, const Trajectory &trajectory,
+                                 double from, double until, double velocity_scale);
   // 接受本拍 MPC 结果，下一拍从这里热启动。
   void accept_mpc(const std::string &group);
   // 丢弃所有组的 MPC 热启动状态。
@@ -218,7 +228,8 @@ class NativePlanner {
   // allow_graph 控制是否允许 RRT/PRM 回退，PRM 路径细化时关闭。
   PlanResult solve(Group &group, const JointMap &state,
                    const std::vector<std::vector<float>> &goals, int attempts, bool pose,
-                   bool allow_graph = true);
+                   bool allow_graph = true, bool rrt_on_first_attempt = false,
+                   bool mesh_along_path = false);
   // 失败时读取 IK 候选误差及碰撞代价。各项最小值独立统计。
   std::string ik_failure_detail(const Group &group, size_t candidates,
                                 bool collision_checked) const;
@@ -230,7 +241,8 @@ class NativePlanner {
   std::vector<uint8_t> configuration_violations(
       Group &group, const std::vector<std::vector<float>> &samples);
   // 轨迹优化失败时用 PRM 找一条关节路径，再交给优化器。
-  PlanResult plan_prm(Group &group, const JointMap &state, const std::vector<float> &target);
+  PlanResult plan_prm(Group &group, const JointMap &state, const std::vector<float> &target,
+                      bool mesh_along_path);
 
   RobotModel &robot_;    // 名义模型和 FCL，不拥有
   std::string artifacts_;  // AOT 产物根目录，按规划组、求解角色和控制点数索引

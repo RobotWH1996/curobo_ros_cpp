@@ -66,7 +66,8 @@ class RobotModel {
   // geometry_directory 里放碰撞网格文件。
   RobotModel(const std::string &urdf, const std::string &robot_yaml,
              const std::string &profile_file, const std::string &config_directory,
-             const std::string &geometry_directory);
+             const std::string &geometry_directory,
+             std::optional<double> self_filter_sphere_padding = std::nullopt);
   const RobotProfile profile;  // 加载后只读的机器人配置
   JointMap defaults;                              // 求解和预热使用的默认关节位置
   std::vector<std::string> full_joint_names;      // 全身独立关节，含双臂和夹爪
@@ -77,6 +78,11 @@ class RobotModel {
   std::map<std::string, Transform> forward(const JointMap &state) const;
   // 该规划组会运动的连杆。另一条手臂和躯干不算在内。
   std::set<std::string> moving_links(const std::string &group) const;
+  // Sources needed to place the moving collision geometry, including mimic sources.
+  std::set<std::string> self_filter_joints(const std::string &group, bool spheres,
+                                           bool compare) const;
+  std::vector<Eigen::Vector4d> gripper_spheres(
+      const std::string &group, const std::map<std::string, Transform> &poses) const;
   // 摆放当前连杆和携物，按规划组检查自碰撞、环境碰撞与携物碰撞。
   // contact 只影响夹爪接触连杆的环境碰撞检查，environment 控制是否查询环境网格。
   // 返回第一个碰撞对，无碰撞时返回空。
@@ -88,13 +94,16 @@ class RobotModel {
   std::vector<bool> self_mask(const std::vector<Point> &points, const JointMap &state,
                               const std::string &group, double padding, double budget_ms,
                               bool &timed_out) const;
-  // 用基座系非空三角网格替换 FCL 环境障碍，构建失败时抛异常。
-  void set_environment(const std::vector<Eigen::Vector3d> &vertices,
-                       const std::vector<fcl::Triangle> &faces);
+  std::vector<bool> self_sphere_mask(const std::vector<Point> &points, const JointMap &state,
+                                     const std::string &group) const;
+  // 保存基座系三角网格，第一次 CPU 环境碰撞查询时构建 FCL 碰撞树。
+  void set_environment(std::vector<Eigen::Vector3d> vertices,
+                       std::vector<fcl::Triangle> faces);
   // 释放 FCL 环境障碍，保留已加载的机器人连杆网格。
   void clear_environment();
   // 该规划组工具连杆在基座系的位姿。
   Transform tool(const JointMap &state, const std::string &group) const;
+  std::set<std::string> tool_feedback_joints(const std::string &group) const;
   // 用行程、关节范围和速度上限估算五次夹爪插补时长，单位秒。
   // 位置几乎相同时返回零，查不到关节或限位非法时抛异常。
   double gripper_duration(const std::string &joint, double start, double target) const;
@@ -106,9 +115,20 @@ class RobotModel {
   std::string base_;                                      // 运动学根连杆
   std::vector<urdf::JointConstSharedPtr> joints_;         // URDF 关节，含固定关节
   std::vector<MeshGeometry> meshes_;                      // 全部连杆碰撞网格
+  struct Sphere {
+    Eigen::Vector3d center;
+    double radius_squared;
+    double physical_radius;
+  };
+  std::map<std::string, std::vector<Sphere>> self_filter_spheres_;
   std::vector<std::pair<size_t, size_t>> pairs_;          // 需要互查的网格下标对
-  std::unique_ptr<fcl::CollisionObjectd> environment_;    // 当前环境障碍，可为空
-  std::shared_ptr<fcl::BVHModel<fcl::OBBRSSd>> environment_geometry_;  // 当前环境对象的几何所有权
+  struct EnvironmentMesh {
+    std::vector<Eigen::Vector3d> vertices;
+    std::vector<fcl::Triangle> faces;
+  };
+  mutable std::optional<EnvironmentMesh> pending_environment_;
+  mutable std::unique_ptr<fcl::CollisionObjectd> environment_;
+  std::set<std::string> feedback_joints(const std::set<std::string> &links) const;
   // check 会改写网格位姿。查询和环境替换共用这把锁。
   mutable std::mutex query_mutex_;
   // 读取关节位置。mimic 关节按 URDF 公式换算，并用 visited 防止循环引用。

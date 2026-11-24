@@ -18,6 +18,8 @@ struct PointCloudSettings {
   std::string self_filter_mode = "apply";      // off 不过滤，observe 只统计，apply 真正删掉本体点
   double self_filter_padding = .05;            // 本体网格向外膨胀的距离
   double self_filter_budget_ms = 300.;         // 本体过滤的时间上限，超时则保留未滤完的结果
+  bool self_filter_sphere_compare = false;
+  bool self_filter_use_spheres = false;
   std::vector<std::array<double, 6>> exclude_boxes;  // 基座系排除盒，每项是 xmin ymin zmin xmax ymax zmax
 };
 
@@ -28,7 +30,16 @@ struct PreparedCloud {
   std::vector<Point> input;           // 用于诊断的体素代表点，包含选中的本体点
   std::vector<Point> environment;     // 明确保留的环境点
   size_t raw_count = 0;               // 消息里的原始点数，裁剪之前
-  bool self_filter_timed_out = false; // 本体过滤是否因为超时提前结束
+  size_t cropped_count = 0;
+  double crop_ms = 0.;
+  double self_filter_ms = 0.;
+  double voxel_ms = 0.;
+  bool mesh_filter_timed_out = false;
+  double mesh_filter_ms = 0.;
+  double sphere_filter_ms = 0.;
+  size_t both_removed = 0;
+  std::vector<Point> mesh_only;
+  std::vector<Point> sphere_only;
 };
 
 // 解码 PointCloud2 的 float32 x/y/z，可选整数 label 用于保护标注点。to_base 为相机到基座变换。

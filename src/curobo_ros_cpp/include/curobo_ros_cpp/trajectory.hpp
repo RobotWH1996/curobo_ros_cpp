@@ -13,6 +13,22 @@ struct TrajectorySample {
   Eigen::VectorXd jerk;          // 加加速度，位置单位/秒³
 };
 
+// 顺序采样时复用当前区间的插值系数。结果引用有效到下一次 sample。
+class TrajectorySampler {
+ public:
+  explicit TrajectorySampler(const Trajectory &trajectory);
+  const TrajectorySample &sample(double time);
+
+ private:
+  void load_segment(double time);
+
+  const Trajectory &tr;
+  size_t index = 0;
+  double start = 0., end = 0.;
+  Eigen::MatrixXd coefficients;
+  TrajectorySample values;
+};
+
 // 一组关节的动态上限，顺序与 arm_joints 相同。数值来自求解器，再乘速度比例。
 struct DynamicLimits {
   Eigen::VectorXd velocity;      // 各关节速度上限的绝对值

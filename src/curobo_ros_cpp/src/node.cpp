@@ -3,6 +3,7 @@
 #include "curobo_ros_cpp/node.hpp"
 #include <ament_index_cpp/get_package_share_directory.hpp>
 #include <algorithm>
+#include <std_srvs/srv/set_bool.hpp>
 #include <cstring>
 #include <filesystem>
 #include <sstream>
@@ -83,10 +84,36 @@ PlanningNode::PlanningNode(const rclcpp::NodeOptions &options)
   const auto robot_file = parameter<std::string>("robot", "lycus.yml");
   const auto id = std::filesystem::path(robot_file).stem().string();
   const auto geometry = std::filesystem::path(artifacts) / "geometry" / id;
+  cloud_settings_.self_filter_mode = parameter<std::string>("self_filter_mode", "apply");
+  cloud_settings_.self_filter_padding = parameter<double>("self_filter_padding", .05);
+  if (!std::isfinite(cloud_settings_.self_filter_padding) || cloud_settings_.self_filter_padding < 0.)
+    throw std::invalid_argument("invalid self_filter_padding");
+  const auto filter_geometry = parameter<std::string>("self_filter_geometry", "mesh");
+  if (filter_geometry != "mesh" && filter_geometry != "sphere")
+    throw std::invalid_argument("self_filter_geometry must be mesh or sphere");
+  cloud_settings_.self_filter_use_spheres = filter_geometry == "sphere";
+  cloud_settings_.self_filter_sphere_compare = parameter<bool>("self_filter_sphere_compare", false);
+  const bool load_self_filter_spheres = pointcloud_mode_ != PointCloudMode::Off &&
+      cloud_settings_.self_filter_mode != "off" &&
+      (cloud_settings_.self_filter_use_spheres || cloud_settings_.self_filter_sphere_compare);
   const auto fcl_start = Clock::now();
   robot = std::make_unique<RobotModel>(
       (geometry / "robot.urdf").string(), (geometry / "robot.yml").string(),
-      share + "/config/robots/" + id + ".yaml", share + "/config", geometry.string());
+      share + "/config/robots/" + id + ".yaml", share + "/config", geometry.string(),
+      load_self_filter_spheres ? std::optional{cloud_settings_.self_filter_padding} : std::nullopt);
+  if (pointcloud_mode_ != PointCloudMode::Off && cloud_settings_.self_filter_mode != "off")
+    for (const auto &entry : robot->profile.groups) {
+      auto &names = self_filter_joints_[entry.first];
+      names = robot->self_filter_joints(entry.first, cloud_settings_.self_filter_use_spheres,
+                                       cloud_settings_.self_filter_sphere_compare);
+      for (const auto &name : names) joint_history_.track(name);
+    }
+  if (pointcloud_mode_ != PointCloudMode::Off)
+    for (const auto &[group, tool] : robot->profile.tools) {
+      auto &names = payload_pose_joints_[group];
+      names = robot->tool_feedback_joints(group);
+      for (const auto &name : names) joint_history_.track(name);
+    }
   RCLCPP_INFO(get_logger(), "【初始化 · 碰撞模型】完成 ｜ 网格 %zu ｜ 耗时 %.1f 毫秒",
               robot->meshes().size(), elapsed_ms(fcl_start));
   step = "规划参数";
@@ -101,6 +128,13 @@ PlanningNode::PlanningNode(const rclcpp::NodeOptions &options)
   settings.mpc_iterations = parameter<int>("mpc_warm_start_iters", 50);
   settings.mpc_cold_iterations = parameter<int>("mpc_cold_start_iters", 100);
   settings.mpc_optimization_dt = parameter<double>("mpc_optimization_dt", .14);
+  settings.mpc_collision_activation_distance =
+      static_cast<float>(parameter<double>("mpc_collision_activation_distance", .005));
+  if (!std::isfinite(settings.mpc_collision_activation_distance) ||
+      settings.mpc_collision_activation_distance <= 0.F)
+    throw std::invalid_argument("mpc_collision_activation_distance must be finite and positive");
+  RCLCPP_INFO(get_logger(), "【MPC】环境碰撞激活距离 %.3f m",
+              settings.mpc_collision_activation_distance);
   settings.graph = parameter<std::string>("trajopt_graph_planner", "rrt");
   settings.cuda_graph = parameter<bool>("use_cuda_graph", true);
   settings.vertical = parameter<bool>("keep_tool_z_vertical", true);
@@ -136,8 +170,6 @@ PlanningNode::PlanningNode(const rclcpp::NodeOptions &options)
   cloud_settings_.min_range = parameter<double>("pointcloud_min_range", .2);
   cloud_settings_.max_range = parameter<double>("pointcloud_max_range", 3.);
   cloud_settings_.max_points = parameter<int>("pointcloud_max_points", 40000);
-  cloud_settings_.self_filter_mode = parameter<std::string>("self_filter_mode", "apply");
-  cloud_settings_.self_filter_padding = parameter<double>("self_filter_padding", .05);
   cloud_settings_.self_filter_budget_ms = parameter<double>("self_filter_max_processing_ms", 300.);
   auto vector_parameter = [&](const std::string &name, const std::vector<double> &fallback) {
     auto value = parameter<std::vector<double>>(name, fallback);
@@ -151,13 +183,11 @@ PlanningNode::PlanningNode(const rclcpp::NodeOptions &options)
   cloud_mode_ = parameter<std::string>("pointcloud_collision", "mesh");
   cloud_frame_ = parameter<std::string>("pointcloud_child_frame", "auto");
   if (cloud_frame_ == "auto") cloud_frame_ = robot->profile.camera_frame;
-  if (cloud_settings_.pitch <= 0 || cloud_settings_.max_points == 0 ||
-      cloud_settings_.self_filter_padding < 0)
+  if (cloud_settings_.pitch <= 0 || cloud_settings_.max_points == 0)
     throw std::invalid_argument("invalid pointcloud settings");
   if (!std::isfinite(cloud_settings_.pitch) || !cloud_settings_.lower.allFinite() ||
       !cloud_settings_.upper.allFinite() ||
       (cloud_settings_.lower.array() >= cloud_settings_.upper.array()).any() ||
-      !std::isfinite(cloud_settings_.self_filter_padding) ||
       !std::isfinite(cloud_settings_.self_filter_budget_ms) ||
       cloud_settings_.self_filter_budget_ms <= 0.)
     throw std::invalid_argument("invalid pointcloud geometry or filtering budget");
@@ -190,12 +220,14 @@ PlanningNode::PlanningNode(const rclcpp::NodeOptions &options)
       parameter<std::string>("joint_states_topic", "/joint_states"), 10,
       [this](sensor_msgs::msg::JointState::SharedPtr message) {
         std::lock_guard<std::mutex> guard(input_mutex_);
-        const double stamp = rclcpp::Time(message->header.stamp).seconds();
-        const double dt = stamp - joint_stamp_;
+        const rclcpp::Time stamp(message->header.stamp);
+        const double dt = stamp.seconds() - joint_stamp_;
         const bool reported = message->velocity.size() == message->name.size() &&
                               std::any_of(message->velocity.begin(), message->velocity.end(),
                                           [](double value) { return std::abs(value) > 1e-4; });
         const auto received = Clock::now();
+        const bool store_history = !payload_pose_joints_.empty();
+        if (store_history) observe_input_clock();
         for (size_t i = 0; i < std::min(message->name.size(), message->position.size()); ++i) {
           const auto &name = message->name[i];
           const double position = message->position[i];
@@ -209,24 +241,39 @@ PlanningNode::PlanningNode(const rclcpp::NodeOptions &options)
             joint_velocity_[name] = 0.;
           joints_[name] = position;
           joint_received_[name] = received;
+          if (store_history) joint_history_.record(name, stamp.nanoseconds(), position);
         }
-        joint_stamp_ = stamp;
+        joint_stamp_ = stamp.seconds();
         joint_time_ = received;
+        if (store_history) cloud_ready_.notify_one();
       },
       subscription_options);
   if (pointcloud_mode_ != PointCloudMode::Off)
     cloud_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
         parameter<std::string>("pointcloud_topic", "/all_points"), rclcpp::SensorDataQoS(),
         [this](sensor_msgs::msg::PointCloud2::SharedPtr message) {
-          std::lock_guard<std::mutex> guard(input_mutex_);
-          cloud_ = message;
-          cloud_time_ = Clock::now();
+          {
+            std::lock_guard<std::mutex> guard(input_mutex_);
+            const auto &stamp = message->header.stamp;
+            const int64_t capture = stamp.sec * 1'000'000'000LL + stamp.nanosec;
+            const auto current = observe_input_clock();
+            if (capture <= 0 || capture > current) return;
+            if (payload_change_stamp_ && capture <= *payload_change_stamp_) return;
+            if (cloud_ && capture <= rclcpp::Time(cloud_->header.stamp).nanoseconds()) return;
+            cloud_ = message;
+            cloud_time_ = Clock::now();
+          }
+          cloud_ready_.notify_one();
         },
         subscription_options);
-  if (pointcloud_mode_ != PointCloudMode::Off && cloud_settings_.self_filter_mode != "off")
-    for (const auto &name : {"input", "removed", "environment"})
+  if (pointcloud_mode_ != PointCloudMode::Off && cloud_settings_.self_filter_mode != "off") {
+    std::vector<std::string> views{"input", "removed", "environment"};
+    if (cloud_settings_.self_filter_sphere_compare)
+      views.insert(views.end(), {"mesh_only", "sphere_only"});
+    for (const auto &name : views)
       self_filter_pubs_[name] = create_publisher<sensor_msgs::msg::PointCloud2>(
           std::string("/curobo/self_filter/") + name, 1);
+  }
   target_sub_ = create_subscription<interfaces::msg::MpcTarget>(
       parameter<std::string>("mpc_target_topic", "/curobo/target"), 10,
       [this](interfaces::msg::MpcTarget::SharedPtr message) {
@@ -317,6 +364,43 @@ PlanningNode::PlanningNode(const rclcpp::NodeOptions &options)
       "compute_ik",
       std::bind(&PlanningNode::compute_ik, this, std::placeholders::_1, std::placeholders::_2),
       rmw_qos_profile_services_default, callbacks_));
+  using SetBool = std_srvs::srv::SetBool;
+  services_.push_back(create_service<SetBool>(
+      "confirm_held_object",
+      [this](const std::shared_ptr<SetBool::Request> request,
+             std::shared_ptr<SetBool::Response> response) {
+        std::unique_lock<std::mutex> lock(operation, std::try_to_lock);
+        if (!lock.owns_lock() || busy_) {
+          response->message = "planner busy";
+          return;
+        }
+        if (request->data && !pending_pick_ && !held_payload_) {
+          response->message = "no successful standalone pick to confirm";
+          return;
+        }
+        const auto next = request->data ? (held_payload_ ? held_payload_ : pending_pick_)
+                                        : std::nullopt;
+        if (next.has_value() != held_payload_.has_value()) {
+          try {
+            planner->set_payload(next);
+          } catch (const std::exception &error) {
+            planner->set_payload(held_payload_);
+            response->message = error.what();
+            return;
+          }
+          held_payload_ = next;
+          {
+            std::lock_guard<std::mutex> guard(input_mutex_);
+            payload_change_stamp_ = observe_input_clock();
+          }
+          cached_aligned_ = false;
+        }
+        pending_pick_.reset();
+        response->success = true;
+        response->message = held_payload_ ? "holding " + held_payload_->group : "not holding";
+        RCLCPP_INFO(get_logger(), "【持物确认】%s", response->message.c_str());
+      },
+      rmw_qos_profile_services_default, callbacks_));
   action_callbacks_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
   action_completion_timer_ = create_wall_timer(
       std::chrono::milliseconds(5), [this] { publish_action_completion(); }, action_callbacks_);
@@ -400,131 +484,274 @@ Transform PlanningNode::in_base(const geometry_msgs::msg::PoseStamped &pose) {
                                                    tf2::durationFromSec(1.))) *
          value;
 }
-// 处理一帧点云并写入碰撞场景。可选点云不可用时保留静态障碍和物体几何。
-PreparedCloud PlanningNode::update_world(const std::string &group, const JointMap &joints,
-                                         bool check_receive_age) {
+int64_t PlanningNode::observe_input_clock() {
+  const auto current = now().nanoseconds();
+  if (joint_history_.observe_clock(current)) {
+    cloud_.reset();
+    // A payload transition from the previous clock epoch predates new-epoch captures.
+    if (payload_change_stamp_) payload_change_stamp_ = 0;
+  }
+  return current;
+}
+
+bool PlanningNode::cloud_is_fresh(double max_age_ms) const {
+  if (!cloud_ || elapsed_ms(cloud_time_) > max_age_ms) return false;
+  const auto &stamp = cloud_->header.stamp;
+  const int64_t capture = stamp.sec * 1'000'000'000LL + stamp.nanosec;
+  const auto age = now().nanoseconds() - capture;
+  return capture > 0 && age >= 0 && age <= max_age_ms * 1e6 &&
+         (!payload_change_stamp_ || capture > *payload_change_stamp_);
+}
+
+// 处理一帧点云并写入碰撞场景。场景更新失败时保留原有碰撞世界。
+const PreparedCloud &PlanningNode::update_world(const std::string &group, CloudFreshness freshness,
+                                                bool require_cloud) {
+  return prepare_world(group, select_cloud(freshness, require_cloud));
+}
+
+sensor_msgs::msg::PointCloud2::ConstSharedPtr PlanningNode::select_cloud(
+    CloudFreshness freshness, bool require_cloud) {
   if (pointcloud_mode_ == PointCloudMode::Off) return {};
-  const bool required = pointcloud_mode_ == PointCloudMode::Required;
-  try {
-    sensor_msgs::msg::PointCloud2::SharedPtr cloud;
+  const bool wait_for_fresh = freshness != CloudFreshness::Latest;
+  const double max_age_ms = parameter<double>("pick_place_cloud_max_age", 2.) * 1000.;
+  sensor_msgs::msg::PointCloud2::SharedPtr cloud;
+  if (wait_for_fresh) {
+    const int wait_limit_ms = freshness == CloudFreshness::WaitForPickPlace ? 1000
+                           : parameter<int>("joint_plan_cloud_wait_ms", 5000);
+    if (wait_limit_ms < 0)
+      throw std::invalid_argument("joint_plan_cloud_wait_ms must be nonnegative");
+    const auto wait_limit = std::chrono::milliseconds(wait_limit_ms);
+    const auto wait_started = Clock::now();
+    bool ready;
+    double age_ms = 0.;
+    double initial_receive_age_ms = -1.;
+    double initial_capture_age_ms = -1.;
+    const char *initial_rejection = nullptr;
     {
-      std::lock_guard<std::mutex> guard(input_mutex_);
-      cloud = cloud_;
-      if (check_receive_age && cloud &&
-          elapsed_ms(cloud_time_) > parameter<double>("pick_place_cloud_max_age", 2.) * 1000.)
-        throw std::runtime_error("pointcloud expired");
+      std::unique_lock<std::mutex> lock(input_mutex_);
+      const auto eligible = [&] { return cloud_is_fresh(max_age_ms); };
+      if (!eligible()) {
+        if (!cloud_) {
+          initial_rejection = "缓存为空";
+        } else {
+          const auto capture = rclcpp::Time(cloud_->header.stamp).nanoseconds();
+          initial_capture_age_ms = (now().nanoseconds() - capture) * 1e-6;
+          initial_receive_age_ms = elapsed_ms(cloud_time_);
+          if (capture <= 0 || initial_capture_age_ms < 0.)
+            initial_rejection = "采集时间戳无效";
+          else if (payload_change_stamp_ && capture <= *payload_change_stamp_)
+            initial_rejection = "采集早于持物状态更新";
+          else
+            initial_rejection = "超过点云最大年龄";
+        }
+      }
+      ready = cloud_ready_.wait_until(lock, wait_started + wait_limit, eligible);
+      if (ready) {
+        cloud = cloud_;
+        age_ms = elapsed_ms(cloud_time_);
+      }
     }
-    if (!cloud) throw std::runtime_error("no pointcloud received");
-    const bool same_cloud = cached_message_ == cloud.get() && cached_group_ == group &&
-                            cached_payload_ == planner->payload().has_value() &&
-                            cached_generation_ == planner->world_generation();
-    bool joints_close = same_cloud && cached_joints_.size() == joints.size();
-    if (joints_close)
-      for (const auto &joint : joints) {
-        const auto previous = cached_joints_.find(joint.first);
-        if (previous == cached_joints_.end() || std::abs(previous->second - joint.second) > .02) {
-          joints_close = false;
+    const double wait_ms = elapsed_ms(wait_started);
+    if (initial_rejection)
+      RCLCPP_INFO(get_logger(),
+                  "【场景 · 点云入口】%s ｜ 初始采集年龄 %.1f 毫秒 ｜ 初始接收年龄 %.1f 毫秒"
+                  " ｜ 请求前缓存年龄上限 %.1f 毫秒 ｜ 最大等待 %d 毫秒",
+                  initial_rejection, initial_capture_age_ms, initial_receive_age_ms,
+                  max_age_ms, wait_limit_ms);
+    if (!ready) {
+      RCLCPP_WARN(get_logger(), "【场景 · 点云】等待 %.1f 毫秒后仍无新鲜点云", wait_ms);
+      throw std::runtime_error("pointcloud unavailable: no recently captured frame within " +
+                               std::to_string(wait_limit_ms) + " ms");
+    }
+    const auto capture = rclcpp::Time(cloud->header.stamp).nanoseconds();
+    const double capture_age_ms = capture > 0 ? (now().nanoseconds() - capture) * 1e-6 : -1.;
+    RCLCPP_INFO(get_logger(),
+                "【场景 · 点云】等待 %.1f 毫秒 ｜ 接收年龄 %.1f 毫秒 ｜ 采集年龄 %.1f 毫秒",
+                wait_ms, age_ms, capture_age_ms);
+  } else {
+    std::lock_guard<std::mutex> guard(input_mutex_);
+    cloud = cloud_;
+    if (!cloud && !cached_message_ && !require_cloud && pointcloud_mode_ == PointCloudMode::Optional &&
+        !payload_change_stamp_) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                           "【场景】尚未收到点云，使用静态场景");
+      return {};
+    }
+    if (!cloud) throw std::runtime_error("pointcloud unavailable: no pointcloud received");
+    if (!cloud_is_fresh(max_age_ms))
+      throw std::runtime_error("pointcloud unavailable: expired or invalid capture/receive timestamp");
+  }
+  return cloud;
+}
+
+const PreparedCloud &PlanningNode::prepare_world(
+    const std::string &group, const sensor_msgs::msg::PointCloud2::ConstSharedPtr &cloud) {
+  if (!cloud) return cached_cloud_;
+  const bool same_cloud = cached_aligned_ && cached_message_ == cloud && cached_group_ == group &&
+                          cached_payload_ == planner->payload().has_value() &&
+                          cached_generation_ == planner->world_generation();
+  if (same_cloud) return cached_cloud_;
+  const auto started = Clock::now();
+  const auto capture = rclcpp::Time(cloud->header.stamp).nanoseconds();
+  Transform at = Transform::Identity();
+  const auto frame = cloud_frame_.empty() ? cloud->header.frame_id : cloud_frame_;
+  if (frame != base)
+    at = tf2::transformToEigen(
+        tf_.lookupTransform(base, frame, tf2::TimePoint(std::chrono::nanoseconds(capture)),
+                            tf2::durationFromSec(.025)));
+  const double tf_ms = elapsed_ms(started);
+  JointMap captured_payload_joints;
+  if (held_payload_) {
+    if (!capture) throw std::runtime_error("held-object filtering requires a pointcloud stamp");
+    std::string missing;
+    std::unique_lock<std::mutex> lock(input_mutex_);
+    // A new cloud can arrive just before the joint sample that completes its bracket.
+    const bool aligned = cloud_ready_.wait_for(lock, std::chrono::milliseconds(35), [&] {
+      captured_payload_joints.clear();
+      for (const auto &name : payload_pose_joints_.at(held_payload_->group)) {
+        const auto position = joint_history_.position(name, capture);
+        if (!position) {
+          missing = name;
+          return false;
+        }
+        captured_payload_joints.emplace(name, *position);
+      }
+      return true;
+    });
+    if (!aligned)
+      throw std::runtime_error("held-object pose unavailable at pointcloud timestamp: " + missing);
+  }
+  JointMap filter_joints;
+  auto settings = cloud_settings_;
+  bool filter_aligned = true;
+  if (const auto tracked = self_filter_joints_.find(group); tracked != self_filter_joints_.end()) {
+    std::string missing;
+    if (capture == 0) {
+      missing = "点云无采集时间戳";
+    } else {
+      std::lock_guard<std::mutex> guard(input_mutex_);
+      for (const auto &name : tracked->second) {
+        const auto position = joint_history_.position(name, capture);
+        if (!position) {
+          missing = name;
           break;
         }
+        filter_joints.emplace(name, *position);
       }
-    if (joints_close) return cached_cloud_;
-    const auto started = Clock::now();
-    Transform at = Transform::Identity();
-    const auto frame = cloud_frame_.empty() ? cloud->header.frame_id : cloud_frame_;
-    if (frame != base)
-      at = tf2::transformToEigen(
-          tf_.lookupTransform(base, frame, tf2::TimePointZero, tf2::durationFromSec(1.)));
-    auto prepared = prepare_cloud(*cloud, at, cloud_settings_, *robot, joints, group);
-    if (prepared.points.empty() && prepared.removed.empty())
-      throw std::runtime_error("pointcloud has no usable points inside planning bounds");
-    for (const auto &publisher : self_filter_pubs_)
-      if (publisher.second->get_subscription_count()) {
-        const auto &points = publisher.first == "input"     ? prepared.input
-                             : publisher.first == "removed" ? prepared.removed
-                                                            : prepared.environment;
-        sensor_msgs::msg::PointCloud2 message;
-        message.header = cloud->header;
-        message.header.frame_id = base;
-        message.height = 1;
-        message.width = points.size();
-        message.point_step = 12;
-        message.row_step = 12 * points.size();
-        message.is_dense = true;
-        message.data.resize(message.row_step);
-        for (int axis = 0; axis < 3; ++axis) {
-          sensor_msgs::msg::PointField field;
-          field.name = axis == 0 ? "x" : axis == 1 ? "y" : "z";
-          field.offset = axis * 4;
-          field.datatype = field.FLOAT32;
-          field.count = 1;
-          message.fields.push_back(field);
-        }
-        for (size_t i = 0; i < points.size(); ++i)
-          for (int axis = 0; axis < 3; ++axis) {
-            const float value = points[i][axis];
-            std::memcpy(message.data.data() + i * 12 + axis * 4, &value, 4);
-          }
-        publisher.second->publish(message);
-      }
-    auto points = prepared.points;
-    const auto payload = planner->payload();
-    if (payload) points = exclude_box(points, payload->source_pose, payload->size);
-    planner->set_world(points, cloud_settings_.pitch, cloud_mode_, voxel_center_,
-                       voxel_dimensions_);
-    if (parameter<bool>("visualize_mesh_obstacles", false)) {
-      visualization_msgs::msg::MarkerArray markers;
-      visualization_msgs::msg::Marker marker;
-      marker.header.frame_id = base;
-      marker.header.stamp = now();
-      marker.ns = "pointcloud";
-      marker.id = 0;
-      marker.type = marker.CUBE_LIST;
-      marker.action = marker.ADD;
-      marker.pose.orientation.w = 1.;
-      marker.scale.x = marker.scale.y = marker.scale.z = cloud_settings_.pitch;
-      marker.color.r = .7;
-      marker.color.g = .3;
-      marker.color.b = .2;
-      marker.color.a = .35;
-      for (const auto &point : points) {
-        geometry_msgs::msg::Point p;
-        p.x = point.x();
-        p.y = point.y();
-        p.z = point.z();
-        marker.points.push_back(p);
-      }
-      markers.markers.push_back(marker);
-      world_pub_->publish(markers);
     }
-    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
-                         "【场景】原始 %zu ｜ 保留 %zu ｜ 滤除本体 %zu ｜ 超时 %s ｜ 耗时 %.1f 毫秒",
-                         prepared.raw_count, points.size(), prepared.removed.size(),
-                         prepared.self_filter_timed_out ? "是" : "否", elapsed_ms(started));
-    cached_cloud_ = prepared;
-    cached_group_ = group;
-    cached_message_ = cloud.get();
-    cached_joints_ = joints;
-    cached_payload_ = planner->payload().has_value();
-    cached_generation_ = planner->world_generation();
-    return prepared;
-  } catch (const std::exception &error) {
-    if (required) throw;
-    planner->set_world({}, cloud_settings_.pitch, cloud_mode_, voxel_center_, voxel_dimensions_);
-    if (cached_message_ && parameter<bool>("visualize_mesh_obstacles", false)) {
-      visualization_msgs::msg::MarkerArray markers;
-      visualization_msgs::msg::Marker marker;
-      marker.header.frame_id = base;
-      marker.ns = "pointcloud";
-      marker.id = 0;
-      marker.action = marker.DELETE;
-      markers.markers.push_back(marker);
-      world_pub_->publish(markers);
+    if (!missing.empty()) {
+      filter_aligned = false;
+      settings.self_filter_mode = "off";
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+          "【场景 · 本体滤除】采集时刻无法对齐（%s），本帧保留所有点参与碰撞检查",
+          missing.c_str());
     }
-    cached_message_ = nullptr;
-    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-                         "【场景】本次不使用点云障碍 ｜ 原因：%s", error.what());
-    return {};
   }
+  auto prepared = prepare_cloud(*cloud, at, settings, *robot, filter_joints, group);
+  if (prepared.points.empty() && prepared.removed.empty())
+    throw std::runtime_error("pointcloud has no usable points inside planning bounds");
+  if (held_payload_) {
+    const Transform object_pose =
+        robot->tool(captured_payload_joints, held_payload_->group) * held_payload_->in_tool;
+    const auto before = prepared.points.size();
+    prepared.points = exclude_box(prepared.points, object_pose, held_payload_->size);
+    prepared.environment = settings.self_filter_mode == "observe"
+        ? exclude_box(prepared.environment, object_pose, held_payload_->size) : prepared.points;
+    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
+        "【持物滤除】%s ｜ 体素 %zu", held_payload_->group.c_str(), before - prepared.points.size());
+  }
+  for (const auto &publisher : self_filter_pubs_)
+    if (publisher.second->get_subscription_count()) {
+      const auto &points = publisher.first == "input"     ? prepared.input
+                           : publisher.first == "removed" ? prepared.removed
+                           : publisher.first == "mesh_only" ? prepared.mesh_only
+                           : publisher.first == "sphere_only" ? prepared.sphere_only
+                                                          : prepared.environment;
+      sensor_msgs::msg::PointCloud2 message;
+      message.header = cloud->header;
+      message.header.frame_id = base;
+      message.height = 1;
+      message.width = points.size();
+      message.point_step = 12;
+      message.row_step = 12 * points.size();
+      message.is_dense = true;
+      message.data.resize(message.row_step);
+      for (int axis = 0; axis < 3; ++axis) {
+        sensor_msgs::msg::PointField field;
+        field.name = axis == 0 ? "x" : axis == 1 ? "y" : "z";
+        field.offset = axis * 4;
+        field.datatype = field.FLOAT32;
+        field.count = 1;
+        message.fields.push_back(field);
+      }
+      for (size_t i = 0; i < points.size(); ++i)
+        for (int axis = 0; axis < 3; ++axis) {
+          const float value = points[i][axis];
+          std::memcpy(message.data.data() + i * 12 + axis * 4, &value, 4);
+        }
+      publisher.second->publish(message);
+    }
+  auto points = prepared.points;
+  const auto payload = planner->payload();
+  if (payload && !held_payload_) points = exclude_box(points, payload->source_pose, payload->size);
+  const auto world_started = Clock::now();
+  const auto previous_generation = planner->world_generation();
+  planner->set_world(points, cloud_settings_.pitch, cloud_mode_, voxel_center_,
+                     voxel_dimensions_);
+  const double world_ms = elapsed_ms(world_started);
+  if (parameter<bool>("visualize_mesh_obstacles", false)) {
+    visualization_msgs::msg::MarkerArray markers;
+    visualization_msgs::msg::Marker marker;
+    marker.header.frame_id = base;
+    marker.header.stamp = now();
+    marker.ns = "pointcloud";
+    marker.id = 0;
+    marker.type = marker.CUBE_LIST;
+    marker.action = marker.ADD;
+    marker.pose.orientation.w = 1.;
+    marker.scale.x = marker.scale.y = marker.scale.z = cloud_settings_.pitch;
+    marker.color.r = .7;
+    marker.color.g = .3;
+    marker.color.b = .2;
+    marker.color.a = .35;
+    for (const auto &point : points) {
+      geometry_msgs::msg::Point p;
+      p.x = point.x();
+      p.y = point.y();
+      p.z = point.z();
+      marker.points.push_back(p);
+    }
+    markers.markers.push_back(marker);
+    world_pub_->publish(markers);
+  }
+  RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), 1000,
+      "【场景】原始 %zu ｜ 裁剪后 %zu ｜ 保留 %zu ｜ 滤除本体 %zu ｜ 超时 %s ｜ "
+      "TF %.1f ｜ 解码裁剪 %.1f ｜ 本体滤除 %s %.3f ｜ 体素降采样 %.1f ｜ "
+      "环境%s %.1f ｜ 总耗时 %.1f 毫秒",
+      prepared.raw_count, prepared.cropped_count, points.size(), prepared.removed.size(),
+      !cloud_settings_.self_filter_use_spheres && prepared.mesh_filter_timed_out ? "是" : "否",
+      tf_ms, prepared.crop_ms,
+      settings.self_filter_mode == "off" ? "关闭" :
+      settings.self_filter_use_spheres ? "碰撞球" : "网格",
+      prepared.self_filter_ms, prepared.voxel_ms,
+      planner->world_generation() == previous_generation ? "复用" : "重建",
+      world_ms, elapsed_ms(started));
+  if (settings.self_filter_sphere_compare && settings.self_filter_mode != "off")
+    RCLCPP_INFO_THROTTLE(
+        get_logger(), *get_clock(), 1000,
+        "【本体滤除对照】体素化前 ｜ 网格 %.3f ms（超时 %s）｜ 碰撞球 %.3f ms ｜ "
+        "两者滤除 %zu ｜ 仅网格滤除 %zu ｜ 仅碰撞球滤除 %zu",
+        prepared.mesh_filter_ms, prepared.mesh_filter_timed_out ? "是" : "否",
+        prepared.sphere_filter_ms, prepared.both_removed, prepared.mesh_only.size(),
+        prepared.sphere_only.size());
+  cached_cloud_ = std::move(prepared);
+  cached_group_ = group;
+  cached_message_ = cloud;
+  cached_aligned_ = filter_aligned && capture != 0;
+  cached_payload_ = planner->payload().has_value();
+  cached_generation_ = planner->world_generation();
+  return cached_cloud_;
 }
 // 发布本阶段目标坐标系，便于在 RViz 里核对抓取和放置位置。
 void PlanningNode::publish_goals(const std::string &stage,
@@ -693,9 +920,9 @@ void PlanningNode::plan_joint(
   try {
     if (execution->active()) throw std::runtime_error("execution busy");
     execution->clear();
-    auto initial = state(), current = initial;
     auto phase_started = Clock::now();
-    const auto cloud = update_world(request->group_name, current);
+    const auto &cloud = update_world(request->group_name, CloudFreshness::WaitForJointPlan);
+    auto initial = state(), current = initial;
     RCLCPP_INFO(get_logger(), "【OPT · 场景】输入 %zu 点 ｜ 保留 %zu 点 ｜ %.1f ms",
                 cloud.raw_count, cloud.points.size(), elapsed_ms(phase_started));
     std::vector<Trajectory> parts;
@@ -718,7 +945,8 @@ void PlanningNode::plan_joint(
       RCLCPP_INFO(get_logger(), "【OPT · 目标】路点 %zu/%zu ｜ 关节目标 rad [%s]",
                   index, request->waypoints.size(), joint_goal.str().c_str());
       phase_started = Clock::now();
-      auto result = planner->plan_joint(request->group_name, current, waypoint.positions);
+      auto result = planner->plan_joint(request->group_name, current, waypoint.positions, 3,
+                                        /*mesh_along_path=*/request->waypoints.size() == 1);
       log_opt_result(get_logger(), index, request->waypoints.size(), result, elapsed_ms(phase_started));
       if (!result.success) throw std::runtime_error(result.message);
       for (size_t j = 0; j < result.trajectory.joint_names.size(); ++j)
@@ -732,7 +960,8 @@ void PlanningNode::plan_joint(
     auto trajectory = prepare_opt_trajectory(parts, joints, limits, get_logger());
     const double blend_ms = elapsed_ms(phase_started);
     phase_started = Clock::now();
-    planner->validate(request->group_name, initial, trajectory);
+    planner->validate(request->group_name, initial, trajectory, true, std::nullopt,
+                      /*mesh_along_path=*/true);
     const double validation_ms = elapsed_ms(phase_started);
     publish(request->group_name, initial, trajectory);
     phase_started = Clock::now();
@@ -773,7 +1002,7 @@ void PlanningNode::plan_pose(const std::shared_ptr<interfaces::srv::PlanPoseGoal
     execution->clear();
     auto initial = state(), current = initial;
     auto phase_started = Clock::now();
-    const auto cloud = update_world(request->group_name, current);
+    const auto &cloud = update_world(request->group_name);
     RCLCPP_INFO(get_logger(), "【OPT · 场景】输入 %zu 点 ｜ 保留 %zu 点 ｜ %.1f ms",
                 cloud.raw_count, cloud.points.size(), elapsed_ms(phase_started));
     if (request->waypoints.empty() ||
@@ -872,7 +1101,7 @@ void PlanningNode::compute_ik(const std::shared_ptr<interfaces::srv::ComputeIK::
   }
   try {
     auto joints = state();
-    update_world(request->group_name, joints);
+    update_world(request->group_name);
     auto result = planner->inverse_kinematics(
         request->group_name, joints,
         {{robot->profile.tools.at(request->group_name), in_base(request->pose)}});

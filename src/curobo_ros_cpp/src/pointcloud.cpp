@@ -49,6 +49,7 @@ bool protected_label(const uint8_t *data, const sensor_msgs::msg::PointField *fi
 PreparedCloud prepare_cloud(const sensor_msgs::msg::PointCloud2 &message, const Transform &to_base,
                             const PointCloudSettings &settings, const RobotModel &robot,
                             const JointMap &joints, const std::string &group) {
+  const auto started = Clock::now();
   PreparedCloud output;
   output.raw_count = static_cast<size_t>(message.width) * message.height;
   std::map<std::string, const sensor_msgs::msg::PointField *> fields;
@@ -103,10 +104,37 @@ PreparedCloud prepare_cloud(const sensor_msgs::msg::PointCloud2 &message, const 
     cropped.push_back(point);
     cropped_labels.push_back(labels[i]);
   }
-  std::vector<bool> remove(cropped.size(), false);
-  if (settings.self_filter_mode != "off")
-    remove = robot.self_mask(cropped, joints, group, settings.self_filter_padding,
-                             settings.self_filter_budget_ms, output.self_filter_timed_out);
+  output.cropped_count = cropped.size();
+  output.crop_ms = elapsed_ms(started);
+  std::vector<bool> mesh_remove, sphere_remove;
+  if (settings.self_filter_mode != "off") {
+    if (!settings.self_filter_use_spheres || settings.self_filter_sphere_compare) {
+      const auto mesh_started = Clock::now();
+      mesh_remove = robot.self_mask(cropped, joints, group, settings.self_filter_padding,
+                                    settings.self_filter_budget_ms, output.mesh_filter_timed_out);
+      output.mesh_filter_ms = elapsed_ms(mesh_started);
+    }
+    if (settings.self_filter_use_spheres || settings.self_filter_sphere_compare) {
+      const auto sphere_started = Clock::now();
+      sphere_remove = robot.self_sphere_mask(cropped, joints, group);
+      output.sphere_filter_ms = elapsed_ms(sphere_started);
+    }
+    if (settings.self_filter_sphere_compare) {
+      for (size_t i = 0; i < cropped.size(); ++i) {
+        if (cropped_labels[i]) continue;
+        if (mesh_remove[i] && sphere_remove[i]) ++output.both_removed;
+        else if (mesh_remove[i]) output.mesh_only.push_back(cropped[i]);
+        else if (sphere_remove[i]) output.sphere_only.push_back(cropped[i]);
+      }
+    }
+  }
+  output.self_filter_ms =
+      settings.self_filter_use_spheres ? output.sphere_filter_ms : output.mesh_filter_ms;
+  const auto &remove = settings.self_filter_use_spheres ? sphere_remove : mesh_remove;
+  const auto is_robot_point = [&](size_t index) {
+    return !remove.empty() && remove[index];
+  };
+  const auto voxel_started = Clock::now();
   struct Slot {
     int plain = -1;
     int marked = -1;
@@ -122,7 +150,7 @@ PreparedCloud prepare_cloud(const sensor_msgs::msg::PointCloud2 &message, const 
     if (chosen < 0) {
       chosen = static_cast<int>(selected.size());
       selected.push_back(i);
-    } else if (remove[selected[chosen]] && !remove[i]) {
+    } else if (is_robot_point(selected[chosen]) && !is_robot_point(i)) {
       // 有任意环境点就保留该体素。超时未检查的点也按环境保留。
       selected[chosen] = i;
     }
@@ -140,13 +168,14 @@ PreparedCloud prepare_cloud(const sensor_msgs::msg::PointCloud2 &message, const 
   }
   for (const auto index : selected) {
     output.input.push_back(cropped[index]);
-    if (remove[index] && !cropped_labels[index])
+    if (is_robot_point(index) && !cropped_labels[index])
       output.removed.push_back(cropped[index]);
     else
       output.environment.push_back(cropped[index]);
   }
   // 超时只是没滤完。已经判定的本体点删掉，没来得及看的点留下来，不再整帧退回未过滤点云。
   output.points = settings.self_filter_mode == "observe" ? output.input : output.environment;
+  output.voxel_ms = elapsed_ms(voxel_started);
   return output;
 }
 

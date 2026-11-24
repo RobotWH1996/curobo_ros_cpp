@@ -180,7 +180,7 @@ std::unique_ptr<NativePlanner::Group> NativePlanner::create_group(const std::str
   group->fk_quaternion.resize(group->tools * 4);
   group->fk_jacobian.resize(group->tools * 6 * group->dof);
   group->validate_position.resize(group->seeds * outputs);
-  if (!mpc_mode) group->configuration_violations.resize(group->capacity);
+  if (!mpc_mode) group->configuration_feasible.resize(group->capacity);
   group->validate_velocity.resize(group->seeds * outputs);
   group->validate_acceleration.resize(group->seeds * outputs);
   group->validate_jerk.resize(group->seeds * outputs);
@@ -191,6 +191,7 @@ std::unique_ptr<NativePlanner::Group> NativePlanner::create_group(const std::str
     curobo::robot::MpcConfig mpc;
     mpc.iterations = settings.mpc_iterations;
     mpc.trajectory_dt = settings.mpc_optimization_dt / group->interpolation_steps;
+    mpc.collision_activation_distance = settings.mpc_collision_activation_distance;
     group->mpc = std::make_unique<curobo::robot::MpcController>(*group->planner, mpc);
   }
   return group;

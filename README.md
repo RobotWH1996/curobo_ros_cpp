@@ -78,6 +78,10 @@ curobo_ros_cpp/
 
 这些接口必须在这份 fast 源码里。换提交、机器人模型、控制点数、内部插值或 `CUROBO_CUDA_ARCH` 之后，要重新导出 `artifacts`，并重新跑 `build.sh`。`CUROBO_CUDA_ARCH` 未设置时脚本使用 87。
 
+配置阶段会同时检查 fast 头文件和 `libcurobo_robot_runtime.so` 是否提供
+`plan_with_next_rrt_samples`、`classify_configurations`、`last_trajopt_graph_timing`、
+`retained_rrt_seed` 和 `update_joint_goal`。发布时，先合入提供这些接口的 fast 提交，再用同一份源码生成运行库。
+
 ## 构建
 
 编译机需要 ROS 2 Humble、Eigen、yaml-cpp、FCL、CUDA 12，以及上面的 cuRobo fast 源码和 Warp。
@@ -166,14 +170,41 @@ ros2 launch curobo_ros_cpp curobo_motion_planning_deploy.launch.py mode:=deploy
 `pointcloud_mode` 是启动参数，修改后重启节点。代码、debug 和 deploy 默认都用 `optional`。
 
 - `off` 不订阅点云，保留静态场景和机器人自碰撞检测。
-- `optional` 使用可用的点云。点云缺失、不可用或未通过抓放的接收时间检查时，告警并在没有点云障碍的场景中规划。
-- `required` 要求场景更新有可用点云，否则返回错误。MPC 跟随在本拍更新失败时跳过本拍规划。
+- `optional` 下，位姿规划和 IK 在尚未收到点云时可使用静态场景。已有点云过期或无法对齐 TF 时，返回场景错误并保留上一份碰撞世界。
+- `required` 要求所有场景更新都有可用点云。
 
-OPT 的 `/pick`、`/place`、`/pick_place` 仍使用 `pick_place_cloud_max_age`（默认 2 秒）检查点云接收时间。重放离线点云会重新计时。`pointcloud_mode` 优先于旧的 `use_pointcloud` 和 `require_pointcloud`。仅提供旧参数时，节点会转换到对应模式并提示迁移。
+点云启用时，`pick_place_cloud_max_age`（默认 2 秒）同时限制采集和接收年龄。
+关节规划已有有效帧时立即使用，缺帧时最多等待 `joint_plan_cloud_wait_ms`（默认 5000 ms）。
+抓放直接使用最新已收到且满足上述年龄上限的点云。缓存为空或过期时最多等待 1 秒，
+收到有效帧就继续规划，超时则返回场景错误。
+MPC 从第一条预测起要求点云持续更新，点云过期后退出跟随。
+`pointcloud_mode` 优先于旧的 `use_pointcloud` 和 `require_pointcloud`。仅提供旧参数时，节点会转换到对应模式并提示迁移。
 
 点云过滤由 `self_filter_mode` 控制。`off` 跳过本体判断，`observe` 生成过滤诊断，`apply` 将过滤结果用于规划。单臂组只判断运动臂的本体点。同一体素包含本体点和环境点时，优先保留环境点作为代表。
 抓放内部继续使用全模型固定关节；发往执行桥接的轨迹不携带四个轮关节。桥接不控制轮子，
 因此不再要求外部轮编码器状态，也不会用零值代替真实反馈。
+
+## 分开执行抓取、搬运和放置
+
+单独执行 `/pick` 的轨迹并确认夹爪确实抓住工件后，调用：
+
+```bash
+ros2 service call /confirm_held_object std_srvs/srv/SetBool '{data: true}'
+```
+
+随后可提交 `/plan_joint_goal`、`/plan_pose_goal`、`/follow_mpc` 或同侧 `/place`。
+节点在本次进程内保留一个已确认的工件，用点云采集时刻的关节反馈计算工件位置，
+从环境点云里扣除工件包围盒内的点。附着的负载仍参与碰撞检查。
+点云模式启用时，确认后需收到新一帧点云，且工件所在手臂的关节反馈能与该帧对齐。
+
+执行 `/place` 并确认工件已释放后，调用：
+
+```bash
+ros2 service call /confirm_held_object std_srvs/srv/SetBool '{data: false}'
+```
+
+空抓时同样用 `false` 清除待确认的抓取。桥接模式下，先等对应轨迹最终块完成，再人工确认抓取或释放。
+联合 `/pick_place` 仍在同一任务内管理工件。
 
 ## 旧任务客户端与实机部署
 

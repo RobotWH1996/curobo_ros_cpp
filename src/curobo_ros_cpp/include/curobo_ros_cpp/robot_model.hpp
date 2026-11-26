@@ -99,6 +99,10 @@ class RobotModel {
   // 保存基座系三角网格，第一次 CPU 环境碰撞查询时构建 FCL 碰撞树。
   void set_environment(std::vector<Eigen::Vector3d> vertices,
                        std::vector<fcl::Triangle> faces);
+  // 同时设置静态三角网格与点云体素中心（体素使用 FCL 动态 AABB 盒子树，建树快数十倍）。
+  void set_environment(std::vector<Eigen::Vector3d> vertices,
+                       std::vector<fcl::Triangle> faces,
+                       std::vector<Eigen::Vector3d> voxel_centers, double voxel_pitch);
   // 释放 FCL 环境障碍，保留已加载的机器人连杆网格。
   void clear_environment();
   // 该规划组工具连杆在基座系的位姿。
@@ -114,6 +118,7 @@ class RobotModel {
   urdf::Model urdf_;  // URDF 关节树与 mimic 关系
   std::string base_;                                      // 运动学根连杆
   std::vector<urdf::JointConstSharedPtr> joints_;         // URDF 关节，含固定关节
+  std::map<std::string, std::vector<urdf::JointConstSharedPtr>> tool_chains_;  // 各组根到工具的关节链
   std::vector<MeshGeometry> meshes_;                      // 全部连杆碰撞网格
   struct Sphere {
     Eigen::Vector3d center;
@@ -126,8 +131,15 @@ class RobotModel {
     std::vector<Eigen::Vector3d> vertices;
     std::vector<fcl::Triangle> faces;
   };
+  struct EnvironmentVoxels {
+    std::vector<Eigen::Vector3d> centers;
+    double pitch = 0.;
+  };
   mutable std::optional<EnvironmentMesh> pending_environment_;
   mutable std::unique_ptr<fcl::CollisionObjectd> environment_;
+  mutable std::optional<EnvironmentVoxels> pending_voxels_;
+  mutable std::vector<std::unique_ptr<fcl::CollisionObjectd>> voxel_objects_;
+  mutable std::unique_ptr<fcl::DynamicAABBTreeCollisionManagerd> voxel_manager_;
   std::set<std::string> feedback_joints(const std::set<std::string> &links) const;
   // check 会改写网格位姿。查询和环境替换共用这把锁。
   mutable std::mutex query_mutex_;

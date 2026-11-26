@@ -3,10 +3,12 @@
 #include "curobo_ros_cpp/detail/native_planner_group.hpp"
 #include <algorithm>
 #include <cmath>
+#include <iomanip>
 #include <limits>
 #include <queue>
 #include <random>
 #include <rclcpp/rclcpp.hpp>
+#include <sstream>
 #include <utility>
 
 namespace curobo_ros_cpp {
@@ -273,6 +275,39 @@ PlanResult NativePlanner::solve(Group &group, const JointMap &state,
         continue;
       }
       result.timing.check_ms += elapsed_ms(check_started);
+    } else {
+      // TrajOpt/TimeOpt only validates discrete samples at interpolation_dt (e.g. 0.02 s unscaled /
+      // 0.04 s scaled), while downstream validate() checks quintic interpolation at 0.005 s.
+      // Screen dense 0.005 s GPU samples here so inter-knot sphere grazes retry inside solve()
+      // (with RRT / fresh IK seeds) instead of failing later in arm_block().
+      const auto check_started = Clock::now();
+      const double end = seconds(candidate.points.back().time_from_start);
+      const int dense_count = std::max(2, static_cast<int>(std::ceil(end / .005)) + 1);
+      TrajectorySampler sampler(candidate);
+      std::vector<std::vector<float>> dense_batch;
+      dense_batch.reserve(std::min(dense_count, group.capacity));
+      bool dense_ok = true;
+      for (int i = 0; i < dense_count && dense_ok; ++i) {
+        const auto &value = sampler.sample(end * i / (dense_count - 1));
+        std::vector<float> row;
+        row.reserve(group.dof);
+        for (int j = 0; j < group.dof; ++j) row.push_back(static_cast<float>(value.position[j]));
+        dense_batch.push_back(std::move(row));
+        if (dense_batch.size() == static_cast<size_t>(group.capacity) || i == dense_count - 1) {
+          if (!gpu_valid(group, dense_batch)) dense_ok = false;
+          dense_batch.clear();
+        }
+      }
+      result.timing.check_ms += elapsed_ms(check_started);
+      if (!dense_ok) {
+        reject("0.005 s 稠密 GPU 验收未通过（点间插值擦碰碰撞球）。");
+        if (!skip_direct) failed_direct_goals = std::move(packed);
+        if (allow_graph && prm_goal.empty()) prm_goal = valid_goals.front();
+        RCLCPP_WARN(logger,
+                    "【OPT · 稠密 GPU】group=%s ｜ 尝试=%d ｜ 0.005s 点间采样未通过 GPU 碰撞验收，自动重试",
+                    group.name.c_str(), attempt + 1);
+        continue;
+      }
     }
     result.trajectory = std::move(candidate);
     result.success = true;
@@ -482,28 +517,16 @@ bool NativePlanner::gpu_valid(Group &group, const std::vector<std::vector<float>
   if (samples.empty()) return false;
   if (samples.size() > static_cast<size_t>(group.capacity))
     throw std::runtime_error("validation sample capacity exceeded");
-  const size_t batch = group.capacity;
-  std::vector<float> positions, zero(static_cast<size_t>(group.seeds) * batch * group.dof, 0.F);
-  positions.reserve(zero.size());
-  for (int seed = 0; seed < group.seeds; ++seed)
-    for (size_t i = 0; i < batch; ++i)
-      positions.insert(positions.end(), samples[std::min(i, samples.size() - 1)].begin(),
-                       samples[std::min(i, samples.size() - 1)].end());
+  std::vector<float> positions;
+  positions.reserve(samples.size() * group.dof);
+  for (const auto &sample : samples)
+    positions.insert(positions.end(), sample.begin(), sample.end());
   group.validate_position.upload(positions);
-  group.validate_velocity.upload(zero);
-  group.validate_acceleration.upload(zero);
-  group.validate_jerk.upload(zero);
-  curobo::robot::TrajectoryValidationRequest request;
-  request.position = group.validate_position.get();
-  request.velocity = group.validate_velocity.get();
-  request.acceleration = group.validate_acceleration.get();
-  request.jerk = group.validate_jerk.get();
-  request.num_samples = batch;
-  const auto flags = group.planner->validate(request);
-  std::vector<int32_t> values(group.seeds);
-  check_cuda(
-      cudaMemcpy(values.data(), flags, values.size() * sizeof(int32_t), cudaMemcpyDeviceToHost));
-  return std::all_of(values.begin(), values.end(), [](int32_t v) { return v == 0; });
+  group.planner->validate_configurations(group.validate_position.get(),
+                                         static_cast<int>(samples.size()),
+                                         group.configuration_feasible.get());
+  const auto violations = group.configuration_feasible.host(samples.size());
+  return std::all_of(violations.begin(), violations.end(), [](uint8_t v) { return v == 0; });
 }
 // 合并后的轨迹再查一遍限位和碰撞，接触段可以跳过环境。
 void NativePlanner::validate(const std::string &name, const JointMap &state,
@@ -558,11 +581,82 @@ void NativePlanner::validate(const std::string &name, const JointMap &state,
     }
     samples.push_back(std::move(row));
     if (samples.size() == static_cast<size_t>(group.capacity) || i == count - 1) {
-      if (collision && !gpu_valid(group, samples))
-        throw std::runtime_error(
-            "GPU collision or joint-limit validation failed | interval=[" +
-            std::to_string(end * (i + 1 - samples.size()) / (count - 1)) + ", " +
-            std::to_string(end * i / (count - 1)) + "] s");
+      if (collision && !gpu_valid(group, samples)) {
+        const auto batch_start = i + 1 - samples.size();
+        std::ostringstream detail;
+        detail << std::fixed << std::setprecision(6)
+               << "GPU collision or joint-limit validation failed | interval=["
+               << end * batch_start / (count - 1) << ", " << sample_time << "] s";
+        try {
+          // The GPU reports one flag per seed. Recheck prefixes with the same validator.
+          size_t first = 0, last = samples.size() - 1;
+          std::vector<std::vector<float>> prefix;
+          while (first < last) {
+            const size_t middle = first + (last - first) / 2;
+            prefix.assign(samples.begin(), samples.begin() + middle + 1);
+            if (gpu_valid(group, prefix)) first = middle + 1;
+            else last = middle;
+          }
+          const auto &failed = samples[first];
+          if (gpu_valid(group, {failed})) {
+            detail << " | batch rejection did not reproduce at an isolated sample";
+          } else {
+            const auto index = batch_start + first;
+            const double failed_time = end * index / (count - 1);
+            JointMap failed_state = state;
+            size_t nearest = 0;
+            float margin = std::numeric_limits<float>::infinity();
+            for (size_t j = 0; j < failed.size(); ++j) {
+              failed_state[group.names[j]] = failed[j];
+              const float gap = std::min(failed[j] - group.lower[j], group.upper[j] - failed[j]);
+              if (gap < margin) {
+                margin = gap;
+                nearest = j;
+              }
+            }
+            detail << " | sample=" << index + 1 << '/' << count << " | time=" << failed_time
+                   << " s | nearest_joint=" << group.names[nearest] << " q=" << failed[nearest]
+                   << " allowed=[" << group.lower[nearest] << ", " << group.upper[nearest]
+                   << "] | joint_margin_rad=" << margin;
+            const auto hit = robot_.check(failed_state, name, true, false, payloads_, grasp_targets);
+            detail << " | FCL_same_state=" << (hit ? hit->message() : "clear");
+            auto right_knot = std::upper_bound(
+                trajectory.points.begin(), trajectory.points.end(), failed_time,
+                [](double t, const auto &entry) { return t < seconds(entry.time_from_start); });
+            const size_t hi_knot = std::clamp<size_t>(
+                static_cast<size_t>(std::distance(trajectory.points.begin(), right_knot)),
+                1, trajectory.points.size() - 1);
+            const size_t lo_knot = hi_knot - 1;
+            auto knot_row = [&](size_t k) {
+              std::vector<float> row;
+              row.reserve(columns.size());
+              for (size_t j = 0; j < columns.size(); ++j)
+                row.push_back(static_cast<float>(trajectory.points[k].positions[columns[j]]));
+              return row;
+            };
+            const bool lo_ok = gpu_valid(group, {knot_row(lo_knot)});
+            const bool hi_ok = gpu_valid(group, {knot_row(hi_knot)});
+            detail << " | bracket_knots=[" << lo_knot << ':' << (lo_ok ? "ok" : "FAIL")
+                   << ", " << hi_knot << ':' << (hi_ok ? "ok" : "FAIL") << ']';
+            const auto &planned = sampler.sample(failed_time);
+            for (const auto &[joint, column] : gripper_columns)
+              detail << " | " << joint << " GPU_locked_m=" << state.at(joint)
+                     << " planned_m=" << planned.position[column];
+            const auto transforms = robot_.forward(failed_state);
+            for (const auto &[side, tool] : robot_.profile.tools)
+              if (name == "both_arms" || side == name)
+                detail << " | " << side << "_tcp_xyz_m=["
+                       << transforms.at(tool).translation().transpose() << ']';
+            detail << " | q_rad=[";
+            for (size_t j = 0; j < failed.size(); ++j)
+              detail << (j ? ", " : "") << failed[j];
+            detail << ']';
+          }
+        } catch (const std::exception &error) {
+          detail << " | diagnostic_error=" << error.what();
+        }
+        throw std::runtime_error(detail.str());
+      }
       samples.clear();
     }
   }

@@ -100,21 +100,37 @@ const TrajectorySample &TrajectorySampler::sample(double time) {
     load_segment(time);
   const double h = end - start;
   const double u = (time - start) / h;
-  std::array<double, 6> powers;
-  for (int power = 0; power < 6; ++power) powers[power] = std::pow(u, power);
-  std::array<Eigen::VectorXd *, 4> derivatives{
-      &values.position, &values.velocity, &values.acceleration, &values.jerk};
-  for (int derivative = 0; derivative < 4; ++derivative) {
-    auto &value = *derivatives[derivative];
-    value.setZero(coefficients.rows());
-    for (int power = derivative; power < 6; ++power) {
-      double multiplier = 1.;
-      for (int k = 0; k < derivative; ++k) multiplier *= power - k;
-      value += multiplier * powers[power - derivative] * coefficients.col(power);
-    }
-    value /= std::pow(h, derivative);
-    if (!value.allFinite())
+  const double u2 = u * u, u3 = u2 * u, u4 = u2 * u2, u5 = u4 * u;
+  const double inv_h = 1. / h, inv_h2 = inv_h * inv_h, inv_h3 = inv_h2 * inv_h;
+  const Eigen::Index rows = coefficients.rows();
+  if (values.position.size() != rows) {
+    values.position.resize(rows);
+    values.velocity.resize(rows);
+    values.acceleration.resize(rows);
+    values.jerk.resize(rows);
+  }
+  const double *c0 = coefficients.col(0).data();
+  const double *c1 = coefficients.col(1).data();
+  const double *c2 = coefficients.col(2).data();
+  const double *c3 = coefficients.col(3).data();
+  const double *c4 = coefficients.col(4).data();
+  const double *c5 = coefficients.col(5).data();
+  double *pos = values.position.data();
+  double *vel = values.velocity.data();
+  double *acc = values.acceleration.data();
+  double *jrk = values.jerk.data();
+  for (Eigen::Index r = 0; r < rows; ++r) {
+    const double a0 = c0[r], a1 = c1[r], a2 = c2[r], a3 = c3[r], a4 = c4[r], a5 = c5[r];
+    const double p = a0 + a1 * u + a2 * u2 + a3 * u3 + a4 * u4 + a5 * u5;
+    const double v = (a1 + 2. * a2 * u + 3. * a3 * u2 + 4. * a4 * u3 + 5. * a5 * u4) * inv_h;
+    const double a = (2. * a2 + 6. * a3 * u + 12. * a4 * u2 + 20. * a5 * u3) * inv_h2;
+    const double j = (6. * a3 + 24. * a4 * u + 60. * a5 * u2) * inv_h3;
+    if (!std::isfinite(p) || !std::isfinite(v) || !std::isfinite(a) || !std::isfinite(j))
       throw std::runtime_error("nonfinite trajectory polynomial");
+    pos[r] = p;
+    vel[r] = v;
+    acc[r] = a;
+    jrk[r] = j;
   }
   return values;
 }
@@ -276,21 +292,85 @@ void append_hold(Trajectory &tr, double time) {
 }
 
 namespace {
+struct JointPoly {
+  double c1, c2, c3, c4, c5;
+};
+
+void selected_segment_polys(const trajectory_msgs::msg::JointTrajectoryPoint &first,
+                            const trajectory_msgs::msg::JointTrajectoryPoint &last, double h,
+                            const std::vector<size_t> &selected, std::vector<JointPoly> &out) {
+  const auto n = first.positions.size();
+  const bool have_v = first.velocities.size() == n && last.velocities.size() == n;
+  const bool have_a = have_v && first.accelerations.size() == n && last.accelerations.size() == n;
+  out.resize(selected.size());
+  for (size_t j = 0; j < selected.size(); ++j) {
+    const size_t k = selected[j];
+    const double p0 = first.positions[k], p1 = last.positions[k];
+    double c1 = 0., c2 = 0., c3 = 0., c4 = 0., c5 = 0.;
+    if (have_v) {
+      const double v0 = first.velocities[k], v1 = last.velocities[k];
+      c1 = v0 * h;
+      if (have_a) {
+        const double a0 = first.accelerations[k], a1 = last.accelerations[k];
+        c2 = .5 * a0 * h * h;
+        const double r0 = p1 - p0 - c1 - c2;
+        const double r1 = v1 * h - c1 - 2. * c2;
+        const double r2 = a1 * h * h - 2. * c2;
+        c3 = 10. * r0 - 4. * r1 + .5 * r2;
+        c4 = -15. * r0 + 7. * r1 - r2;
+        c5 = 6. * r0 - 3. * r1 + .5 * r2;
+      } else {
+        const double delta = p1 - p0;
+        c2 = 3. * delta - (2. * v0 + v1) * h;
+        c3 = -2. * delta + (v0 + v1) * h;
+      }
+    } else {
+      c1 = p1 - p0;
+    }
+    if (!std::isfinite(p0) || !std::isfinite(c1) || !std::isfinite(c2) || !std::isfinite(c3) ||
+        !std::isfinite(c4) || !std::isfinite(c5))
+      throw std::runtime_error("nonfinite trajectory polynomial");
+    out[j] = {c1, c2, c3, c4, c5};
+  }
+}
+
 template <class Check>
 void sample_dynamics(const Trajectory &tr, const std::vector<std::string> &arm,
                      double step, Check check) {
   check_time(tr);
   const auto selected = columns(tr, arm);
   const auto end = seconds(tr.points.back().time_from_start);
-  std::set<double> times;
-  for (const auto &entry : tr.points) times.insert(seconds(entry.time_from_start));
   const auto count = std::max<size_t>(2, static_cast<size_t>(std::ceil(end / step)) + 1);
-  for (size_t i = 0; i < count; ++i) times.insert(end * i / (count - 1));
-  TrajectorySampler sampler(tr);
+  std::vector<double> times;
+  times.reserve(tr.points.size() + count);
+  for (const auto &entry : tr.points) times.push_back(seconds(entry.time_from_start));
+  for (size_t i = 0; i < count; ++i) times.push_back(end * i / (count - 1));
+  std::sort(times.begin(), times.end());
+  times.erase(std::unique(times.begin(), times.end()), times.end());
+  std::vector<JointPoly> polys;
+  size_t seg = 0;
+  const size_t last_seg = tr.points.size() - 2;
+  double seg_start = seconds(tr.points[0].time_from_start);
+  double seg_end = seconds(tr.points[1].time_from_start);
+  selected_segment_polys(tr.points[0], tr.points[1], seg_end - seg_start, selected, polys);
   for (const double time : times) {
-    const auto &value = sampler.sample(time);
-    for (size_t i = 0; i < selected.size(); ++i)
-      check(time, i, value.velocity[selected[i]], value.acceleration[selected[i]], value.jerk[selected[i]]);
+    while (seg < last_seg && time >= seg_end) {
+      ++seg;
+      seg_start = seg_end;
+      seg_end = seconds(tr.points[seg + 1].time_from_start);
+      selected_segment_polys(tr.points[seg], tr.points[seg + 1], seg_end - seg_start, selected, polys);
+    }
+    const double h = seg_end - seg_start;
+    const double inv_h = 1. / h, inv_h2 = inv_h * inv_h, inv_h3 = inv_h2 * inv_h;
+    const double u = (time - seg_start) * inv_h;
+    const double u2 = u * u, u3 = u2 * u, u4 = u2 * u2;
+    for (size_t i = 0; i < selected.size(); ++i) {
+      const auto &p = polys[i];
+      const double v = (p.c1 + 2. * p.c2 * u + 3. * p.c3 * u2 + 4. * p.c4 * u3 + 5. * p.c5 * u4) * inv_h;
+      const double a = (2. * p.c2 + 6. * p.c3 * u + 12. * p.c4 * u2 + 20. * p.c5 * u3) * inv_h2;
+      const double j = (6. * p.c3 + 24. * p.c4 * u + 60. * p.c5 * u2) * inv_h3;
+      check(time, i, v, a, j);
+    }
   }
 }
 }  // namespace
@@ -412,19 +492,27 @@ std::pair<double, size_t> retiming_peak(const Trajectory &trajectory,
                                         const DynamicLimits &limits) {
   double worst_ratio = 1.;
   size_t worst_index = 0;
-  TrajectorySampler sampler(trajectory);
-  for (size_t i = 0; i + 1 < trajectory.points.size(); ++i)
+  std::vector<JointPoly> polys;
+  for (size_t i = 0; i + 1 < trajectory.points.size(); ++i) {
+    const double t0 = seconds(trajectory.points[i].time_from_start);
+    const double t1 = seconds(trajectory.points[i + 1].time_from_start);
+    const double h = t1 - t0;
+    const double inv_h = 1. / h, inv_h2 = inv_h * inv_h, inv_h3 = inv_h2 * inv_h;
+    selected_segment_polys(trajectory.points[i], trajectory.points[i + 1], h, selected, polys);
     for (int sample = 0; sample < 9; ++sample) {
-      const double t = seconds(trajectory.points[i].time_from_start) +
-                       (seconds(trajectory.points[i + 1].time_from_start) -
-                        seconds(trajectory.points[i].time_from_start)) *
-                           sample / 8.;
-      const auto &value = sampler.sample(t);
+      const double u = sample * (1. / 8.);
+      const double u2 = u * u, u3 = u2 * u, u4 = u2 * u2;
       for (size_t j = 0; j < selected.size(); ++j) {
-        const auto k = selected[j];
-        const double velocity = std::abs(value.velocity[k]) / limits.velocity[j];
-        const double acceleration = std::abs(value.acceleration[k]) / limits.acceleration[j];
-        const double jerk = std::abs(value.jerk[k]) / limits.jerk[j];
+        const auto &p = polys[j];
+        const double velocity =
+            std::abs((p.c1 + 2. * p.c2 * u + 3. * p.c3 * u2 + 4. * p.c4 * u3 + 5. * p.c5 * u4) * inv_h) /
+            limits.velocity[j];
+        const double acceleration =
+            std::abs((2. * p.c2 + 6. * p.c3 * u + 12. * p.c4 * u2 + 20. * p.c5 * u3) * inv_h2) /
+            limits.acceleration[j];
+        const double jerk =
+            std::abs((6. * p.c3 + 24. * p.c4 * u + 60. * p.c5 * u2) * inv_h3) /
+            limits.jerk[j];
         if (velocity <= 1. && acceleration <= 1. && jerk <= 1.) continue;
         const double ratio = std::max({velocity, std::sqrt(acceleration), std::cbrt(jerk)});
         if (ratio > 1.005 && ratio * 1.02 > worst_ratio) {
@@ -433,6 +521,7 @@ std::pair<double, size_t> retiming_peak(const Trajectory &trajectory,
         }
       }
     }
+  }
   return {worst_ratio, worst_index};
 }
 }  // namespace

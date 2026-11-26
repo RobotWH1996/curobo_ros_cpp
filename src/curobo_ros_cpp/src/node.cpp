@@ -121,9 +121,11 @@ PlanningNode::PlanningNode(const rclcpp::NodeOptions &options)
   settings.seeds = parameter<int>("trajopt_num_seeds", 2);
   settings.ik_seeds = parameter<int>("ik_num_seeds", 32);
   settings.iterations = parameter<int>("trajopt_num_iters", 50);
+  settings.initial_check_interval = parameter<int>("trajopt_initial_check_interval", 25);
   settings.finetune = parameter<int>("trajopt_finetune_attempts", 0);
   settings.knots = parameter<int>("trajopt_num_control_points", 16);
   settings.interpolation_steps = parameter<int>("trajopt_interpolation_steps", 2);
+  settings.interpolation_buffer_size = parameter<int>("trajopt_interpolation_buffer_size", 512);
   settings.mpc_knots = parameter<int>("mpc_num_control_points", 6);
   settings.mpc_iterations = parameter<int>("mpc_warm_start_iters", 50);
   settings.mpc_cold_iterations = parameter<int>("mpc_cold_start_iters", 100);
@@ -245,7 +247,7 @@ PlanningNode::PlanningNode(const rclcpp::NodeOptions &options)
         }
         joint_stamp_ = stamp.seconds();
         joint_time_ = received;
-        if (store_history) cloud_ready_.notify_one();
+        if (store_history) cloud_ready_.notify_all();
       },
       subscription_options);
   if (pointcloud_mode_ != PointCloudMode::Off)
@@ -263,7 +265,7 @@ PlanningNode::PlanningNode(const rclcpp::NodeOptions &options)
             cloud_ = message;
             cloud_time_ = Clock::now();
           }
-          cloud_ready_.notify_one();
+          cloud_ready_.notify_all();
         },
         subscription_options);
   if (pointcloud_mode_ != PointCloudMode::Off && cloud_settings_.self_filter_mode != "off") {
@@ -444,6 +446,11 @@ PlanningNode::PlanningNode(const rclcpp::NodeOptions &options)
               "【规划节点 · 预热】OPT 初始化组 [%s] ｜ MPC 预热组 [%s] ｜ OPT 图搜索 %s",
               group_list(warm).c_str(), group_list(mpc_warm).c_str(), planner->settings.graph.c_str());
   worker_ = std::thread([this] { run_action_worker(); });
+  if (pointcloud_mode_ != PointCloudMode::Off && parameter<bool>("pointcloud_prewarm", true) &&
+      !warm.empty()) {
+    cloud_prewarm_group_ = warm.front();
+    cloud_prewarm_thread_ = std::thread([this] { run_cloud_prewarm(); });
+  }
   } catch (const std::exception &error) {
     if (step_group.empty())
       RCLCPP_FATAL(get_logger(), "【初始化 · %s】未完成 ｜ 错误：%s", step.c_str(), error.what());
@@ -483,8 +490,37 @@ PlanningNode::~PlanningNode() {
     shutdown_ = true;
   }
   worker_ready_.notify_one();
+  cloud_ready_.notify_all();
   execution->cancel();
+  if (cloud_prewarm_thread_.joinable()) cloud_prewarm_thread_.join();
   if (worker_.joinable()) worker_.join();
+}
+
+// 规划器空闲时后台预构建最新点云对应的碰撞世界，使正式规划请求直接命中缓存。
+void PlanningNode::run_cloud_prewarm() {
+  sensor_msgs::msg::PointCloud2::ConstSharedPtr last_done;
+  while (rclcpp::ok() && !shutdown_.load()) {
+    sensor_msgs::msg::PointCloud2::ConstSharedPtr candidate;
+    {
+      std::unique_lock<std::mutex> lock(input_mutex_);
+      cloud_ready_.wait_for(lock, std::chrono::milliseconds(100), [&] {
+        return shutdown_.load() || !rclcpp::ok() || (cloud_ && cloud_ != last_done);
+      });
+      if (shutdown_.load() || !rclcpp::ok()) break;
+      candidate = cloud_;
+    }
+    if (!candidate || candidate == last_done) continue;
+    if (busy_.load()) continue;
+    std::unique_lock<std::mutex> op(operation, std::try_to_lock);
+    if (!op.owns_lock()) continue;
+    if (busy_.load() || !held_payloads_.empty() || !planner->payloads().empty()) continue;
+    try {
+      prepare_world(cloud_prewarm_group_, candidate, /*silent=*/true);
+      if (cached_aligned_ && cached_message_ == candidate) last_done = candidate;
+    } catch (...) {
+      // TF 或点云瞬态未就绪时忽略，待下次输入或正式请求处理。
+    }
+  }
 }
 // 用最新关节反馈覆盖默认值。fresh 时检查年龄和任务关节是否齐全。
 JointMap PlanningNode::state(bool fresh) {
@@ -610,12 +646,18 @@ sensor_msgs::msg::PointCloud2::ConstSharedPtr PlanningNode::select_cloud(
 }
 
 const PreparedCloud &PlanningNode::prepare_world(
-    const std::string &group, const sensor_msgs::msg::PointCloud2::ConstSharedPtr &cloud) {
+    const std::string &group, const sensor_msgs::msg::PointCloud2::ConstSharedPtr &cloud,
+    bool silent) {
   if (!cloud) return cached_cloud_;
   const bool same_cloud = cached_aligned_ && cached_message_ == cloud && cached_group_ == group &&
                           cached_payload_ == !planner->payloads().empty() &&
                           cached_generation_ == planner->world_generation();
-  if (same_cloud) return cached_cloud_;
+  if (same_cloud) {
+    if (!silent)
+      RCLCPP_INFO(get_logger(), "【场景】缓存命中 ｜ 保留 %zu ｜ 耗时 0.0 毫秒",
+                  cached_cloud_.points.size());
+    return cached_cloud_;
+  }
   const auto started = Clock::now();
   const auto capture = rclcpp::Time(cloud->header.stamp).nanoseconds();
   Transform at = Transform::Identity();
@@ -666,6 +708,7 @@ const PreparedCloud &PlanningNode::prepare_world(
       }
     }
     if (!missing.empty()) {
+      if (silent) return cached_cloud_;
       filter_aligned = false;
       settings.self_filter_mode = "off";
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
@@ -752,19 +795,20 @@ const PreparedCloud &PlanningNode::prepare_world(
     markers.markers.push_back(marker);
     world_pub_->publish(markers);
   }
-  RCLCPP_INFO_THROTTLE(
-      get_logger(), *get_clock(), 1000,
-      "【场景】原始 %zu ｜ 裁剪后 %zu ｜ 保留 %zu ｜ 滤除本体 %zu ｜ 超时 %s ｜ "
-      "TF %.1f ｜ 解码裁剪 %.1f ｜ 本体滤除 %s %.3f ｜ 体素降采样 %.1f ｜ "
-      "环境%s %.1f ｜ 总耗时 %.1f 毫秒",
-      prepared.raw_count, prepared.cropped_count, points.size(), prepared.removed.size(),
-      !cloud_settings_.self_filter_use_spheres && prepared.mesh_filter_timed_out ? "是" : "否",
-      tf_ms, prepared.crop_ms,
-      settings.self_filter_mode == "off" ? "关闭" :
-      settings.self_filter_use_spheres ? "碰撞球" : "网格",
-      prepared.self_filter_ms, prepared.voxel_ms,
-      planner->world_generation() == previous_generation ? "复用" : "重建",
-      world_ms, elapsed_ms(started));
+  if (!silent)
+    RCLCPP_INFO_THROTTLE(
+        get_logger(), *get_clock(), 1000,
+        "【场景】原始 %zu ｜ 裁剪后 %zu ｜ 保留 %zu ｜ 滤除本体 %zu ｜ 超时 %s ｜ "
+        "TF %.1f ｜ 解码裁剪 %.1f ｜ 本体滤除 %s %.3f ｜ 体素降采样 %.1f ｜ "
+        "环境%s %.1f ｜ 总耗时 %.1f 毫秒",
+        prepared.raw_count, prepared.cropped_count, points.size(), prepared.removed.size(),
+        !cloud_settings_.self_filter_use_spheres && prepared.mesh_filter_timed_out ? "是" : "否",
+        tf_ms, prepared.crop_ms,
+        settings.self_filter_mode == "off" ? "关闭" :
+        settings.self_filter_use_spheres ? "碰撞球" : "网格",
+        prepared.self_filter_ms, prepared.voxel_ms,
+        planner->world_generation() == previous_generation ? "复用" : "重建",
+        world_ms, elapsed_ms(started));
   if (settings.self_filter_sphere_compare && settings.self_filter_mode != "off")
     RCLCPP_INFO_THROTTLE(
         get_logger(), *get_clock(), 1000,
@@ -973,8 +1017,7 @@ void PlanningNode::plan_joint(
       RCLCPP_INFO(get_logger(), "【OPT · 目标】路点 %zu/%zu ｜ 关节目标 rad [%s]",
                   index, request->waypoints.size(), joint_goal.str().c_str());
       phase_started = Clock::now();
-      auto result = planner->plan_joint(request->group_name, current, waypoint.positions, 3,
-                                        /*mesh_along_path=*/request->waypoints.size() == 1);
+      auto result = planner->plan_joint(request->group_name, current, waypoint.positions, 3);
       log_opt_result(get_logger(), index, request->waypoints.size(), result, elapsed_ms(phase_started));
       if (!result.success) throw std::runtime_error(result.message);
       for (size_t j = 0; j < result.trajectory.joint_names.size(); ++j)
@@ -988,8 +1031,7 @@ void PlanningNode::plan_joint(
     auto trajectory = prepare_opt_trajectory(parts, joints, limits, get_logger());
     const double blend_ms = elapsed_ms(phase_started);
     phase_started = Clock::now();
-    planner->validate(request->group_name, initial, trajectory, true, std::nullopt,
-                      /*mesh_along_path=*/true);
+    planner->validate(request->group_name, initial, trajectory);
     const double validation_ms = elapsed_ms(phase_started);
     publish(request->group_name, initial, trajectory);
     phase_started = Clock::now();

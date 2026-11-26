@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // 初始化 GPU 场景，加载分组产物并同步锁定关节。
 #include "curobo_ros_cpp/detail/native_planner_group.hpp"
+#include <algorithm>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 
@@ -98,12 +100,24 @@ std::unique_ptr<NativePlanner::Group> NativePlanner::create_group(const std::str
   opt.num_seeds = settings.seeds;
   opt.num_knots = knots;
   opt.max_iterations = settings.iterations;
-  opt.initial_check_interval = settings.iterations;
+  opt.initial_check_interval =
+      settings.initial_check_interval > 0
+          ? std::clamp(settings.initial_check_interval, 1, settings.iterations)
+          : settings.iterations;
   opt.finetune_attempts = settings.finetune;
   opt.position_tolerance = settings.position_tolerance;
   opt.orientation_tolerance = settings.orientation_tolerance;
   opt.execution_speed_scale = settings.velocity_scale;
   opt.interpolation_dt = settings.dt;
+  const int artifact_capacity = trajopt["interpolation_buffer_size"].as<int>();
+  if (!mpc_mode && settings.interpolation_buffer_size > 0) {
+    const double artifact_dt = trajopt["interpolation_dt"].as<double>();
+    const int artifact_min = trajopt["minimum_interpolation_buffer_size"].as<int>();
+    const int effective_min =
+        static_cast<int>(std::ceil((artifact_min - 1) * artifact_dt / settings.dt)) + 1;
+    opt.interpolation_buffer_size =
+        std::clamp(settings.interpolation_buffer_size, effective_min, artifact_capacity);
+  }
   configuration.use_cuda_graph = settings.cuda_graph;
   configuration.inverse_kinematics.num_seeds = settings.ik_seeds;
   configuration.inverse_kinematics.lm_num_seeds = settings.ik_seeds;
@@ -133,7 +147,8 @@ std::unique_ptr<NativePlanner::Group> NativePlanner::create_group(const std::str
         std::make_unique<curobo::robot::InverseKinematics>(root.string(), ik_config, nullptr);
   }
   group->horizon = group->planner->info().trajectory_steps;
-  group->capacity = trajopt["interpolation_buffer_size"].as<int>();
+  group->capacity = group->planner->info().interpolation_buffer_size;
+  if (group->capacity <= 0) group->capacity = artifact_capacity;
   // World masks preserve self-collision spheres, including the stationary arm and torso.
   std::set<int32_t> sphere_links;
   {
@@ -180,7 +195,7 @@ std::unique_ptr<NativePlanner::Group> NativePlanner::create_group(const std::str
   group->fk_quaternion.resize(group->tools * 4);
   group->fk_jacobian.resize(group->tools * 6 * group->dof);
   group->validate_position.resize(group->seeds * outputs);
-  if (!mpc_mode) group->configuration_feasible.resize(group->capacity);
+  group->configuration_feasible.resize(group->capacity);
   group->validate_velocity.resize(group->seeds * outputs);
   group->validate_acceleration.resize(group->seeds * outputs);
   group->validate_jerk.resize(group->seeds * outputs);

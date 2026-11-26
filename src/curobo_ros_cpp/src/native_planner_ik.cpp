@@ -120,7 +120,8 @@ std::string NativePlanner::ik_failure_detail(const Group &group, size_t candidat
 // 求一帧逆解。碰撞开关只影响这一次调用。
 PlanResult NativePlanner::inverse_kinematics(const std::string &name, const JointMap &state,
                                              const std::map<std::string, Transform> &targets,
-                                             bool collision, bool prefer_nearby) {
+                                             bool collision, bool prefer_nearby,
+                                             std::vector<std::vector<double>> *all_candidates) {
   synchronize(name, state);
   auto &group = get(name);
   fill_targets(group, state, targets);
@@ -203,10 +204,13 @@ PlanResult NativePlanner::inverse_kinematics(const std::string &name, const Join
     trajectory_msgs::msg::JointTrajectoryPoint point;
     for (int j = 0; j < group.dof; ++j)
       point.positions.push_back(solutions[seed * group.dof + j]);
-    result.trajectory.points.push_back(std::move(point));
-    result.success = true;
-    result.message = "IK success";
-    break;
+    if (all_candidates) all_candidates->push_back(point.positions);
+    if (!result.success) {
+      result.trajectory.points.push_back(std::move(point));
+      result.success = true;
+      result.message = "IK success";
+    }
+    if (!all_candidates) break;
   }
   if (!result.success)
     result.message = fcl_rejections > 0

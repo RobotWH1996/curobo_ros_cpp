@@ -51,6 +51,8 @@ PreparedCloud prepare_cloud(const sensor_msgs::msg::PointCloud2 &message, const 
 // 将基座系点离散为 pitch 大小的占用体素，输出占用与空体素交界处的三角面。
 // 相邻占用格共享顶点。无点时返回空网格。
 curobo::robot::Mesh voxel_mesh(const std::vector<Point> &points, double pitch);
+// 返回与 voxel_mesh 对应的去重占用体素中心，用于 FCL 盒子树碰撞检查。
+std::vector<Eigen::Vector3d> voxel_centers(const std::vector<Point> &points, double pitch);
 // 在 center 和 dimensions 指定的基座系范围构建带符号的欧氏距离场。
 // pitch 是分辨率，输出按 x、y、z 顺序展平，z 最快。占用体素为负，空场返回 5 米。
 // 栅格尺寸无效或容量超限时抛异常。

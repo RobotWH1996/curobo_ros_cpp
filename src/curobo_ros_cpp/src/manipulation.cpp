@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // 编排抓放阶段，合并并提交轨迹块，汇总规划和执行结果。
 #include <algorithm>
+#include <iomanip>
+#include <sstream>
 #include "curobo_ros_cpp/node.hpp"
 namespace curobo_ros_cpp {
 namespace {
@@ -241,30 +243,14 @@ TaskResult PlanningNode::manipulate(
       result.stage = stage;
       feedback(stage, "planning");
     };
-    // 规划一段非接触 OPT 或接触直线，先攒着，到夹爪动作再合并。
-    auto move = [&](const interfaces::msg::MotionWaypoint &waypoint, const std::string &stage,
-                    bool contact, const std::optional<Transform> &target) {
-      set_stage(stage);
-      const auto before = Clock::now();
-      PlanResult part;
-      const Transform start_pose = contact ? robot->tool(current, group) : Transform::Identity();
+    auto add_segment = [&](PlanResult part, const std::string &stage, bool contact,
+                           const Transform &start_pose, const Transform &end_pose, double wall_ms) {
       const auto before_state = current;
-      if (target) publish_goals(stage, {{tool, *target}});
-      if (target)
-        part = contact ? planner->interpolate(group, current, start_pose, *target)
-                       : planner->plan_pose(group, current, {{tool, *target}}, 3,
-                                            /*rrt_on_first_attempt=*/stage == "prepick");
-      else if (waypoint.type == "joint")
-        part = planner->plan_joint(group, current, waypoint.joint_positions);
-      else if (waypoint.type == "pose")
-        part = planner->plan_pose(group, current, {{tool, in_base(waypoint.pose)}});
-      else
-        throw std::invalid_argument("waypoint.type must be joint or pose");
       if (!part.success) {
         RCLCPP_ERROR(get_logger(),
                      "【阶段失败】group=%s stage=%s ｜ 耗时 %.1f 毫秒 ｜ ik %.1f ｜ graph %.1f ｜ "
                      "trajopt %.1f ｜ fcl %.1f ｜ attempts %d ｜ %s",
-                     group.c_str(), stage.c_str(), elapsed_ms(before), part.timing.ik_ms,
+                     group.c_str(), stage.c_str(), wall_ms, part.timing.ik_ms,
                      part.timing.graph_ms, part.timing.trajopt_ms, part.timing.check_ms,
                      part.timing.attempts, part.message.c_str());
         throw std::runtime_error(part.message);
@@ -274,72 +260,138 @@ TaskResult PlanningNode::manipulate(
       for (size_t i = 0; i < names.size(); ++i) current[names[i]] = full.points.back().positions[i];
       pending.push_back(std::move(full));
       contacts.push_back(contact);
-      contact_paths.push_back({start_pose, contact ? *target : Transform::Identity()});
+      contact_paths.push_back({start_pose, end_pose});
       stage_states.push_back(before_state);
       stages.push_back(stage);
       const auto label = stage_text(stage);
       RCLCPP_INFO(get_logger(),
                   "【阶段 · %s】耗时 %.1f 毫秒 ｜ ik %.1f 毫秒 ｜ graph %.1f 毫秒 ｜ trajopt %.1f 毫秒 ｜ "
                   "fcl %.1f 毫秒 ｜ attempts %d ｜ points %zu",
-                  label.c_str(), elapsed_ms(before), part.timing.ik_ms, part.timing.graph_ms,
+                  label.c_str(), wall_ms, part.timing.ik_ms, part.timing.graph_ms,
                   part.timing.trajopt_ms, part.timing.check_ms, part.timing.attempts,
                   part.trajectory.points.size());
+    };
+    // 规划一段非接触 OPT 或接触直线，到夹爪动作再合并。
+    auto move = [&](const interfaces::msg::MotionWaypoint &waypoint, const std::string &stage,
+                    bool contact, const std::optional<Transform> &target) {
+      set_stage(stage);
+      const auto before = Clock::now();
+      PlanResult part;
+      const Transform start_pose = contact ? robot->tool(current, group) : Transform::Identity();
+      if (target) publish_goals(stage, {{tool, *target}});
+      if (target)
+        part = contact ? planner->interpolate(group, current, start_pose, *target)
+                       : planner->plan_pose(group, current, {{tool, *target}});
+      else if (waypoint.type == "joint")
+        part = planner->plan_joint(group, current, waypoint.joint_positions);
+      else if (waypoint.type == "pose")
+        part = planner->plan_pose(group, current, {{tool, in_base(waypoint.pose)}});
+      else
+        throw std::invalid_argument("waypoint.type must be joint or pose");
+      add_segment(std::move(part), stage, contact, start_pose,
+                  contact ? *target : Transform::Identity(), elapsed_ms(before));
     };
     // 合并已经规划的手臂段，并检查接触段仍沿直线。
     auto arm_block = [&]() {
       if (pending.empty()) return Trajectory{};
       const auto before = Clock::now();
-      auto merged = blend_trajectories(pending, robot->profile.groups.at(group), dynamic, contacts);
-      const double blend_ms = elapsed_ms(before);
+      const auto &arm_joints = robot->profile.groups.at(group);
       const size_t deadline_index =
           std::find(contacts.begin(), contacts.end(), true) - contacts.begin();
-      if (opening) {
+      auto apply_opening = [&](BlendedTrajectory &candidate) {
+        if (!opening) return;
         const auto time = robot->gripper_duration(gripper, open_from, open_to);
         if (time > 0) {
-          if (time > merged.boundaries[deadline_index]) {
-            const auto extra = time - merged.boundaries[deadline_index];
-            insert_hold(merged.trajectory, 0., extra);
-            for (size_t i = 1; i < merged.boundaries.size(); ++i) merged.boundaries[i] += extra;
+          if (time > candidate.boundaries[deadline_index]) {
+            const auto extra = time - candidate.boundaries[deadline_index];
+            insert_hold(candidate.trajectory, 0., extra);
+            for (size_t i = 1; i < candidate.boundaries.size(); ++i) candidate.boundaries[i] += extra;
           }
-          overlay_gripper(merged.trajectory, gripper, open_from, open_to, time);
+          overlay_gripper(candidate.trajectory, gripper, open_from, open_to, time);
         }
-        opening = false;
-      }
+      };
+      auto verify_block = [&](const BlendedTrajectory &candidate, double &validation_ms,
+                              double &contact_fk_ms) {
+        validation_ms = 0.;
+        contact_fk_ms = 0.;
+        for (size_t i = 0; i < pending.size(); ++i) {
+          const auto before_validation = Clock::now();
+          auto slice =
+              interval(candidate.trajectory, candidate.boundaries[i], candidate.boundaries[i + 1]);
+          try {
+            planner->validate(group, stage_states[i], slice, !contacts[i]);
+          } catch (const std::exception &error) {
+            result.stage = stages[i];
+            throw std::runtime_error("拼接轨迹验收失败 | segment=" + stages[i] +
+                                     " | block_interval=[" +
+                                     std::to_string(candidate.boundaries[i]) + ", " +
+                                     std::to_string(candidate.boundaries[i + 1]) + "] s | " +
+                                     error.what());
+          }
+          validation_ms += elapsed_ms(before_validation);
+          if (contacts[i]) {
+            const auto before_fk = Clock::now();
+            const auto &path = contact_paths[i];
+            const Eigen::Vector3d delta = path.end.translation() - path.start.translation();
+            const double length = delta.norm();
+            if (length < 1e-6) throw std::runtime_error("contact segment too short");
+            const auto direction = delta / length;
+            const Eigen::Quaterniond a(path.start.linear()), b(path.end.linear());
+            double previous = -1.;
+            for (const auto &point : slice.points) {
+              JointMap joints = stage_states[i];
+              for (size_t j = 0; j < names.size(); ++j) joints[names[j]] = point.positions[j];
+              const auto at = robot->tool(joints, group);
+              const Eigen::Vector3d offset = at.translation() - path.start.translation();
+              const double along = offset.dot(direction);
+              const double lateral = planner->settings.path_tolerance > 0.
+                                         ? planner->settings.path_tolerance
+                                         : planner->settings.position_tolerance;
+              if ((offset - along * direction).norm() > lateral ||
+                  along < -.005 || along > length + .005 || along < previous - .005 ||
+                  Eigen::Quaterniond(at.linear())
+                          .angularDistance(a.slerp(std::clamp(along / length, 0., 1.), b)) >
+                      planner->settings.orientation_tolerance + .005)
+                throw std::runtime_error("merged contact path deviates from line");
+              previous = along;
+            }
+            contact_fk_ms += elapsed_ms(before_fk);
+          }
+        }
+      };
+      auto merged = blend_trajectories(pending, arm_joints, dynamic, contacts);
+      double blend_ms = elapsed_ms(before);
+      apply_opening(merged);
       double validation_ms = 0., contact_fk_ms = 0.;
-      for (size_t i = 0; i < pending.size(); ++i) {
-        const auto before_validation = Clock::now();
-        auto slice = interval(merged.trajectory, merged.boundaries[i], merged.boundaries[i + 1]);
-        planner->validate(group, stage_states[i], slice, !contacts[i]);
-        validation_ms += elapsed_ms(before_validation);
-        if (contacts[i]) {
-          const auto before_fk = Clock::now();
-          const auto &path = contact_paths[i];
-          const Eigen::Vector3d delta = path.end.translation() - path.start.translation();
-          const double length = delta.norm();
-          if (length < 1e-6) throw std::runtime_error("contact segment too short");
-          const auto direction = delta / length;
-          const Eigen::Quaterniond a(path.start.linear()), b(path.end.linear());
-          double previous = -1.;
-          for (const auto &point : slice.points) {
-            JointMap joints = stage_states[i];
-            for (size_t j = 0; j < names.size(); ++j) joints[names[j]] = point.positions[j];
-            const auto at = robot->tool(joints, group);
-            const Eigen::Vector3d offset = at.translation() - path.start.translation();
-            const double along = offset.dot(direction);
-            const double lateral = planner->settings.path_tolerance > 0.
-                                       ? planner->settings.path_tolerance
-                                       : planner->settings.position_tolerance;
-            if ((offset - along * direction).norm() > lateral ||
-                along < -.005 || along > length + .005 || along < previous - .005 ||
-                Eigen::Quaterniond(at.linear())
-                        .angularDistance(a.slerp(std::clamp(along / length, 0., 1.), b)) >
-                    planner->settings.orientation_tolerance + .005)
-              throw std::runtime_error("merged contact path deviates from line");
-            previous = along;
-          }
-          contact_fk_ms += elapsed_ms(before_fk);
+      try {
+        verify_block(merged, validation_ms, contact_fk_ms);
+      } catch (const std::exception &blend_error) {
+        if (pending.size() <= 1) throw;
+        RCLCPP_WARN(get_logger(),
+                    "【合并 · 回退】平滑拐角拼接验收未通过，改用逐段零速衔接重试：%s",
+                    blend_error.what());
+        const auto fallback_before = Clock::now();
+        std::vector<Trajectory> retimed;
+        retimed.reserve(pending.size());
+        BlendedTrajectory unblended;
+        unblended.boundaries.push_back(0.);
+        for (size_t i = 0; i < pending.size(); ++i) {
+          auto single = pending[i];
+          if (trajectory_needs_retiming(single, arm_joints, dynamic))
+            single = blend_trajectories({std::move(single)}, arm_joints, dynamic, {contacts[i]})
+                         .trajectory;
+          const double span = seconds(single.points.back().time_from_start) -
+                              seconds(single.points.front().time_from_start);
+          unblended.boundaries.push_back(seconds(duration(unblended.boundaries.back() + span)));
+          retimed.push_back(std::move(single));
         }
+        unblended.trajectory = concatenate(retimed);
+        blend_ms += elapsed_ms(fallback_before);
+        apply_opening(unblended);
+        verify_block(unblended, validation_ms, contact_fk_ms);
+        merged = std::move(unblended);
       }
+      opening = false;
       result.trajectories.push_back(without_wheel_joints(merged.trajectory));
       std::string labels, shown;
       for (const auto &stage : stages) {
@@ -407,8 +459,15 @@ TaskResult PlanningNode::manipulate(
         throw std::invalid_argument("pick approach/lift separation required");
       for (size_t i = 0; i < pick->waypoints.size(); ++i)
         move(pick->waypoints[i], "pick_via_" + std::to_string(i), false, {});
-      move(empty, "prepick", false, prepick);
-      move(empty, "pick", true, grasp);
+      set_stage("prepick");
+      publish_goals("prepick", {{tool, prepick}});
+      auto plan = planner->plan_pick_approach(group, current, prepick, grasp, check);
+      add_segment(std::move(plan.prepick), "prepick", false, Transform::Identity(), Transform::Identity(),
+                  plan.prepick_ms);
+      set_stage("pick");
+      publish_goals("pick", {{tool, grasp}});
+      add_segment(std::move(plan.descent), "pick", true, robot->tool(current, group), grasp,
+                  plan.descent_ms);
       if (!stop_at_pick) {
         close(pick->close_position, "close");
         object.source_pose = robot->tool(current, group) * object.in_tool;
@@ -690,6 +749,7 @@ TaskResult PlanningNode::move_lever(
     const auto &tool = robot->profile.tools.at(group);
 
     auto current = initial;
+    std::vector<std::string> stage_summary;
     auto append = [&](PlanResult part, bool stop_at_ends = false) {
       if (!part.success) throw std::runtime_error(part.message);
       auto trajectory = expand_trajectory(part.trajectory, names, current);
@@ -703,6 +763,12 @@ TaskResult PlanningNode::move_lever(
       if (retime_dynamics(trajectory, arm_joints, limits) > 1.)
         RCLCPP_INFO(get_logger(), "【拨杆 · 分段定时】%s %.3f s → %.3f s", result.stage.c_str(),
                     before, seconds(trajectory.points.back().time_from_start));
+      const double final_s = seconds(trajectory.points.back().time_from_start);
+      std::ostringstream note;
+      note << std::fixed << std::setprecision(3) << result.stage << "=" << final_s << "s";
+      const auto limit_pos = part.message.find("limit=");
+      if (limit_pos != std::string::npos) note << '[' << part.message.substr(limit_pos) << ']';
+      stage_summary.push_back(note.str());
       const auto &endpoint = trajectory.points.back().positions;
       for (size_t i = 0; i < names.size(); ++i) current[names[i]] = endpoint[i];
       result.trajectory_stages.push_back(result.stage);
@@ -748,6 +814,16 @@ TaskResult PlanningNode::move_lever(
     result.trajectory = concatenate(result.trajectories);
     // The approach is collision-checked above; preserve the accepted stage timings here.
     planner->validate(group, initial, result.trajectory, /*collision=*/false);
+    {
+      std::string joined;
+      for (size_t i = 0; i < stage_summary.size(); ++i) {
+        if (i) joined += " | ";
+        joined += stage_summary[i];
+      }
+      RCLCPP_INFO(get_logger(), "【%s拨杆 · 分段】%s ｜ 总时长 %.3f s",
+                  opening ? "开" : "关", joined.c_str(),
+                  seconds(result.trajectory.points.back().time_from_start));
+    }
 
     stage(action + "_ready");
     const auto latest = state(true);

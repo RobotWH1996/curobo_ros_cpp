@@ -142,6 +142,7 @@ void NativePlanner::rebuild_world() {
     scene_->add_cuboid(box);
     add_geometry(box_mesh(box));
   }
+  std::vector<Eigen::Vector3d> fcl_voxels;
   if (!world_points_.empty()) {
     curobo::robot::Mesh mesh;
     if (world_mode_ == "voxel") {
@@ -156,13 +157,13 @@ void NativePlanner::rebuild_world() {
         if ((index >= 0).all() && (index < shape).all())
           occupied.push_back(index.cast<float>().matrix());
       }
-      mesh = voxel_mesh(occupied, 1.);
-      for (auto &vertex : mesh.vertices)
-        for (int axis = 0; axis < 3; ++axis)
-          vertex[axis] = lower[axis] + vertex[axis] * world_pitch_;
-    } else
+      fcl_voxels = voxel_centers(occupied, 1.);
+      for (auto &center : fcl_voxels)
+        for (int axis = 0; axis < 3; ++axis) center[axis] = lower[axis] + center[axis] * world_pitch_;
+    } else {
       mesh = voxel_mesh(world_points_, world_pitch_);
-    add_geometry(mesh);
+      fcl_voxels = voxel_centers(world_points_, world_pitch_);
+    }
     if (world_mode_ == "voxel") {
       curobo::robot::VoxelGrid grid;
       grid.name = "environment";
@@ -176,10 +177,11 @@ void NativePlanner::rebuild_world() {
     } else
       world_ = scene_->add_mesh(mesh);
   }
-  if (faces.empty())
+  if (faces.empty() && fcl_voxels.empty())
     robot_.clear_environment();
   else
-    robot_.set_environment(std::move(vertices), std::move(faces));
+    robot_.set_environment(std::move(vertices), std::move(faces), std::move(fcl_voxels),
+                           world_pitch_);
 }
 // 换一帧点云。mesh 和 voxel 的差别在重建时处理。
 void NativePlanner::set_world(const std::vector<Point> &points, double pitch,

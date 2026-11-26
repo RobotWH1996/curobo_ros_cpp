@@ -146,7 +146,8 @@ class PlanningNode : public rclcpp::Node {
   sensor_msgs::msg::PointCloud2::ConstSharedPtr select_cloud(CloudFreshness freshness,
                                                             bool require_cloud);
   const PreparedCloud &prepare_world(const std::string &group,
-                                     const sensor_msgs::msg::PointCloud2::ConstSharedPtr &cloud);
+                                     const sensor_msgs::msg::PointCloud2::ConstSharedPtr &cloud,
+                                     bool silent = false);
   enum class PointCloudMode { Off, Optional, Required };
   // 处理关节路点规划服务。根据执行配置发布或提交验收后的轨迹。
   void plan_joint(const std::shared_ptr<interfaces::srv::PlanJointGoal::Request> request,
@@ -175,6 +176,7 @@ class PlanningNode : public rclcpp::Node {
                        const std::shared_ptr<typename Action::Result> &result);
 
   void run_action_worker();
+  void run_cloud_prewarm();
   void publish_action_completion();
 
   tf2_ros::Buffer tf_;  // 点云与工具目标的 TF 查询缓存
@@ -236,6 +238,8 @@ class PlanningNode : public rclcpp::Node {
   std::function<void()> pending_action_;
   std::function<void()> pending_completion_;
   std::thread worker_;                          // 常驻动作工作线程
+  std::string cloud_prewarm_group_;             // 点云空闲后台预热规划组
+  std::thread cloud_prewarm_thread_;            // 点云空闲后台预热线程
   Clock::time_point startup_time_{Clock::now()};  // 构造开始，完成日志含控制器预热
 };
 }  // namespace curobo_ros_cpp

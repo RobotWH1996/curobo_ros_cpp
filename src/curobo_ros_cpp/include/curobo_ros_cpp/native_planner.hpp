@@ -74,9 +74,11 @@ struct PlannerSettings {
   int seeds = 2;                      // 轨迹优化并行种子数
   int ik_seeds = 32;                  // 逆解种子数
   int iterations = 50;                // 每轮 L-BFGS 步数，须为 25 的倍数
+  int initial_check_interval = 25;    // 初始迭代中每隔多少步做一次早停校验（0 表示等于 iterations）
   int finetune = 0;                   // 求出可行解后再压缩时间的轮数
   int knots = 16;                     // OPT 控制点数，对应产物目录
   int interpolation_steps = 2;        // OPT 内部样条采样密度
+  int interpolation_buffer_size = 512; // OPT 稠密验证缓冲大小，0 使用产物默认容量
   int mpc_knots = 6;                  // MPC 控制点数
   int mpc_iterations = 50;            // MPC 热启动迭代
   int mpc_cold_iterations = 100;      // MPC 冷启动迭代
@@ -177,7 +179,16 @@ class NativePlanner {
   // prefer_nearby 在带碰撞验收时按距起点的关节距离尝试候选。
   PlanResult inverse_kinematics(const std::string &group, const JointMap &state,
                                 const std::map<std::string, Transform> &targets,
-                                bool collision = true, bool prefer_nearby = false);
+                                bool collision = true, bool prefer_nearby = false,
+                                std::vector<std::vector<double>> *all_candidates = nullptr);
+  struct PickApproach {
+    PlanResult prepick, descent;
+    double prepick_ms = 0., descent_ms = 0.;
+  };
+  // 先验收从实际预抓取终点到抓取位的连续下降，必要时选择另一套关节构型。
+  PickApproach plan_pick_approach(const std::string &group, const JointMap &state,
+                                  const Transform &prepick, const Transform &grasp,
+                                  const std::function<void()> &check);
   // 按基座系 start 和 end 生成接触段。沿直线与姿态插值求 IK，再重定时。
   // 验收位置限位、关节连续性、动态限位及末端路径偏差，接触段跳过碰撞检查。
   PlanResult interpolate(const std::string &group, const JointMap &state, const Transform &start,

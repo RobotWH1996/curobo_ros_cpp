@@ -226,6 +226,28 @@ curobo::robot::Mesh voxel_mesh(const std::vector<Point> &points, double pitch) {
   return mesh;
 }
 
+std::vector<Eigen::Vector3d> voxel_centers(const std::vector<Point> &points, double pitch) {
+  std::vector<Eigen::Vector3d> centers;
+  if (points.empty()) return centers;
+  Eigen::Vector3d origin = points.front().cast<double>();
+  for (const auto &point : points) origin = origin.cwiseMin(point.cast<double>());
+  origin.array() -= pitch;
+  Grid voxels;
+  voxels.reserve(points.size());
+  for (const auto &point : points) {
+    std::array<int64_t, 3> key;
+    for (int axis = 0; axis < 3; ++axis)
+      key[axis] = static_cast<int64_t>(std::floor((point[axis] - origin[axis]) / pitch));
+    voxels.insert(key);
+  }
+  centers.reserve(voxels.size());
+  for (const auto &key : voxels)
+    centers.emplace_back(origin.x() + (static_cast<double>(key[0]) + .5) * pitch,
+                         origin.y() + (static_cast<double>(key[1]) + .5) * pitch,
+                         origin.z() + (static_cast<double>(key[2]) + .5) * pitch);
+  return centers;
+}
+
 // 去掉工件包围盒里的点，避免把手上或已放下的物体再当成障碍。
 std::vector<Point> exclude_box(const std::vector<Point> &points, const Transform &at,
                                const Eigen::Vector3d &size) {

@@ -4,8 +4,14 @@
 #include <algorithm>
 #include <cmath>
 #include <deque>
+#include <rclcpp/rclcpp.hpp>
 
 namespace curobo_ros_cpp {
+namespace {
+struct ContactPathFailure : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
+}  // namespace
 // 每种批次数跑一次接触逆解，把对应的图先捕获好。
 void NativePlanner::warmup_interpolation(const std::string &name, const std::vector<int> &samples) {
   auto &group = get(name);
@@ -86,6 +92,87 @@ PlanResult NativePlanner::interpolate_both(const JointMap &state,
     paths.push_back(linear_contact(tool, transforms.at(tool), targets.at(tool)));
   }
   return interpolate_path("both_arms", state, paths);
+}
+
+NativePlanner::PickApproach NativePlanner::plan_pick_approach(
+    const std::string &name, const JointMap &state, const Transform &prepick, const Transform &grasp,
+    const std::function<void()> &check) {
+  const auto tool = robot_.profile.tools.at(name);
+  const auto &joints = robot_.profile.groups.at(name);
+  const std::map<std::string, Transform> targets{{tool, prepick}};
+  PickApproach result;
+  const auto prepick_started = Clock::now();
+  result.prepick = plan_pose(name, state, targets, 3, /*rrt_on_first_attempt=*/true);
+  result.prepick_ms = elapsed_ms(prepick_started);
+  if (!result.prepick.success) return result;
+
+  auto descend_from = [&](const std::vector<double> &candidate) {
+    check();
+    auto at = state;
+    for (size_t i = 0; i < joints.size(); ++i) at[joints[i]] = candidate[i];
+    const auto started = Clock::now();
+    PlanResult descent;
+    try {
+      descent = interpolate(name, at, robot_.tool(at, name), grasp);
+    } catch (const ContactPathFailure &error) {
+      descent.message = error.what();
+    }
+    result.descent_ms = elapsed_ms(started);
+    return descent;
+  };
+
+  const auto &original = result.prepick.trajectory.points.back().positions;
+  result.descent = descend_from(original);
+  if (result.descent.success) return result;
+  const double original_descent_ms = result.descent_ms;
+  const auto logger = rclcpp::get_logger("curobo_motion_planning_node");
+  RCLCPP_WARN(logger, "【抓取 · 构型选择】group=%s ｜ 原预抓取构型无法连续下降 ｜ %s",
+              name.c_str(), result.descent.message.c_str());
+
+  const auto search_started = Clock::now();
+  std::vector<std::vector<double>> candidates;
+  inverse_kinematics(name, state, targets, /*collision=*/true, /*prefer_nearby=*/true, &candidates);
+  std::vector<std::vector<double>> tried{original};
+  size_t checked = 0;
+  size_t connected = 0;
+  std::string last_approach_failure;
+  for (const auto &candidate : candidates) {
+    const bool duplicate = std::any_of(tried.begin(), tried.end(), [&](const auto &previous) {
+      for (size_t i = 0; i < candidate.size(); ++i)
+        if (std::abs(candidate[i] - previous[i]) > 1e-3) return false;
+      return true;
+    });
+    if (duplicate) continue;
+    tried.push_back(candidate);
+    ++checked;
+    auto descent = descend_from(candidate);
+    if (!descent.success) continue;
+    ++connected;
+    check();
+    auto approach = plan_joint(name, state, candidate);
+    if (!approach.success) {
+      last_approach_failure = approach.message;
+      continue;
+    }
+    // Use the cached descent only when joint planning reaches its exact start.
+    const auto &endpoint = approach.trajectory.points.back().positions;
+    if (endpoint != candidate) {
+      descent = descend_from(endpoint);
+      if (!descent.success) continue;
+    }
+    result.prepick_ms += elapsed_ms(search_started) - result.descent_ms;
+    result.prepick = std::move(approach);
+    result.descent = std::move(descent);
+    RCLCPP_INFO(logger, "【抓取 · 构型选择】group=%s ｜ 已选择可连续下降的预抓取构型 ｜ 已检查 %zu 个",
+                name.c_str(), checked);
+    return result;
+  }
+  result.prepick_ms += elapsed_ms(search_started);
+  result.descent_ms = original_descent_ms;
+  result.descent.message += " | 备选预抓取构型检查=" + std::to_string(checked) +
+                            " | 通过连续下降=" + std::to_string(connected);
+  if (!last_approach_failure.empty()) result.descent.message += " | 接近规划：" + last_approach_failure;
+  return result;
 }
 
 PlanResult NativePlanner::interpolate_arc(const std::string &name, const JointMap &state,
@@ -188,7 +275,7 @@ PlanResult NativePlanner::interpolate_path(
                                     previous.at(group.names[j])) <= .15;
       if (!valid) {
         if (alpha - previous_alpha <= 1e-4 || calls >= 2000)
-          throw std::runtime_error("contact IK continuation failed or discontinuous");
+          throw ContactPathFailure("contact IK continuation failed or discontinuous");
         pending.push_front(alpha);
         pending.push_front(.5 * (alpha + previous_alpha));
         continue;
@@ -212,23 +299,82 @@ PlanResult NativePlanner::interpolate_path(
   std::vector<Eigen::VectorXd> original(input_count, Eigen::VectorXd(group.dof));
   for (int i = 0; i < input_count; ++i)
     for (int j = 0; j < group.dof; ++j) original[i][j] = rows[i * group.dof + j];
-  auto gradient = [&](const std::vector<Eigen::VectorXd> &values) {
+
+  // Smooth high-frequency independent batch-IK jitter while pinning endpoints and
+  // verifying every interior point stays well within half the Cartesian path tolerance.
+  if (input_count >= 5) {
+    auto smoothed = original;
+    for (int pass = 0; pass < 2; ++pass) {
+      auto next = smoothed;
+      for (int i = 1; i + 1 < input_count; ++i)
+        next[i] = 0.25 * smoothed[i - 1] + 0.5 * smoothed[i] + 0.25 * smoothed[i + 1];
+      smoothed = std::move(next);
+    }
+    bool smooth_ok = true;
+    JointMap check_state = state;
+    for (int i = 1; i + 1 < input_count && smooth_ok; ++i) {
+      for (int j = 0; j < group.dof; ++j) {
+        const double qj = smoothed[i][j];
+        if (qj < group.lower[j] || qj > group.upper[j]) {
+          smooth_ok = false;
+          break;
+        }
+        check_state[group.names[j]] = qj;
+      }
+      if (!smooth_ok) break;
+      const auto actual = robot_.forward(check_state);
+      for (const auto &path : paths) {
+        const auto &pose = actual.at(path.tool);
+        const double along = path.progress(pose), alpha = along / path.length;
+        const auto projected = path.pose_at(alpha);
+        const Eigen::Quaterniond expected(path.pose_at(std::clamp(alpha, 0., 1.)).linear());
+        if ((pose.translation() - projected.translation()).norm() > 0.5 * path.tolerance ||
+            along < -.0025 || along > path.length + .0025 ||
+            Eigen::Quaterniond(pose.linear()).angularDistance(expected) >
+                0.5 * settings.orientation_tolerance + .0025) {
+          smooth_ok = false;
+          break;
+        }
+      }
+    }
+    if (smooth_ok) original = std::move(smoothed);
+  }
+
+  auto gradient = [](const std::vector<Eigen::VectorXd> &values, double step) {
     const size_t n = values.size();
     std::vector<Eigen::VectorXd> out(n);
-    out.front() = (-3 * values[0] + 4 * values[1] - values[2]) / (2 * dt);
-    out.back() = (3 * values[n - 1] - 4 * values[n - 2] + values[n - 3]) / (2 * dt);
-    for (size_t i = 1; i + 1 < n; ++i) out[i] = (values[i + 1] - values[i - 1]) / (2 * dt);
+    out.front() = (-3 * values[0] + 4 * values[1] - values[2]) / (2 * step);
+    out.back() = (3 * values[n - 1] - 4 * values[n - 2] + values[n - 3]) / (2 * step);
+    for (size_t i = 1; i + 1 < n; ++i) out[i] = (values[i + 1] - values[i - 1]) / (2 * step);
     return out;
   };
-  auto input_velocity = gradient(original);
-  for (auto &row : input_velocity)
-    for (int j = 0; j < group.dof; ++j) row[j] = static_cast<float>(row[j]);
+  auto input_tangent = gradient(original, 1.);
+
+  // Initialize unscaled duration from actual joint travel & dynamic limits rather than
+  // tying it to the spatial batch-IK sample bucket (33/65/...).
+  double base_duration = 0.04;
+  for (int j = 0; j < group.dof; ++j) {
+    double travel = 0.;
+    for (int i = 1; i < input_count; ++i)
+      travel += std::abs(original[i][j] - original[i - 1][j]);
+    if (travel <= 1e-9) continue;
+    base_duration = std::max({
+        base_duration,
+        1.875 * travel / group.limits.velocity[j],
+        std::sqrt(5.7735026919 * travel / group.limits.acceleration[j]),
+        std::cbrt(60. * travel / group.limits.jerk[j]),
+    });
+  }
+
   std::vector<Eigen::VectorXd> positions, velocities, accelerations;
-  double base_duration = (input_count - 1) * dt;
+  double sample_dt = dt;
   bool retimed = false;
-  for (int iteration = 0; iteration < 8; ++iteration) {
+  std::string bottleneck = "none";
+  int bottleneck_joint = -1;
+  for (int iteration = 0; iteration < 10; ++iteration) {
     count = std::max(17, static_cast<int>(std::ceil(base_duration / dt)) + 1);
-    if (count > 10000) throw std::runtime_error("contact retiming capacity exceeded");
+    if (count > 10000) throw ContactPathFailure("contact retiming capacity exceeded");
+    sample_dt = base_duration / (count - 1);
     positions.clear();
     positions.reserve(count);
     for (int i = 0; i < count; ++i) {
@@ -238,38 +384,56 @@ PlanResult NativePlanner::interpolate_path(
       const int left = std::clamp(static_cast<int>(std::floor(index)), 0, input_count - 2);
       const double v = index - left;
       positions.push_back((2 * v * v * v - 3 * v * v + 1) * original[left] +
-                          (v * v * v - 2 * v * v + v) * dt * input_velocity[left] +
+                          (v * v * v - 2 * v * v + v) * input_tangent[left] +
                           (-2 * v * v * v + 3 * v * v) * original[left + 1] +
-                          (v * v * v - v * v) * dt * input_velocity[left + 1]);
+                          (v * v * v - v * v) * input_tangent[left + 1]);
     }
-    velocities = gradient(positions);
+    velocities = gradient(positions, sample_dt);
     velocities.front().setZero();
     velocities.back().setZero();
-    accelerations = gradient(velocities);
+    accelerations = gradient(velocities, sample_dt);
     accelerations.front().setZero();
     accelerations.back().setZero();
-    const auto jerk = gradient(accelerations);
-    double scale = 1.;
+    const auto jerk = gradient(accelerations, sample_dt);
+    double peak = 0.;
+    bottleneck = "none";
+    bottleneck_joint = -1;
     for (int i = 0; i < count; ++i)
       for (int j = 0; j < group.dof; ++j) {
-        const double velocity_limit = group.limits.velocity[j] * speed;
-        const double acceleration_limit = group.limits.acceleration[j] * speed * speed;
-        const double jerk_limit = group.limits.jerk[j] * speed * speed * speed;
-        scale = std::max({scale, std::abs(velocities[i][j]) * speed / velocity_limit,
-                          std::sqrt(std::abs(accelerations[i][j]) * speed * speed /
-                                    acceleration_limit),
-                          std::cbrt(std::abs(jerk[i][j]) * speed * speed * speed / jerk_limit)});
+        const double v_ratio = std::abs(velocities[i][j]) / group.limits.velocity[j];
+        const double a_ratio =
+            std::sqrt(std::abs(accelerations[i][j]) / group.limits.acceleration[j]);
+        const double j_ratio = std::cbrt(std::abs(jerk[i][j]) / group.limits.jerk[j]);
+        if (v_ratio > peak) {
+          peak = v_ratio;
+          bottleneck = "vel";
+          bottleneck_joint = j;
+        }
+        if (a_ratio > peak) {
+          peak = a_ratio;
+          bottleneck = "acc";
+          bottleneck_joint = j;
+        }
+        if (j_ratio > peak) {
+          peak = j_ratio;
+          bottleneck = "jerk";
+          bottleneck_joint = j;
+        }
       }
-    if (scale <= 1.001) {
+    if (peak <= 1.001) {
+      if (iteration == 0 && peak > 1e-4 && peak < 0.97 && base_duration * peak > 0.04) {
+        base_duration = std::max(0.04, base_duration * peak * 1.02);
+        continue;
+      }
       retimed = true;
       break;
     }
-    base_duration = (count - 1) * dt * scale * 1.01;
+    base_duration = base_duration * peak * 1.015;
   }
-  if (!retimed) throw std::runtime_error("contact retiming failed dynamic limits");
+  if (!retimed) throw ContactPathFailure("contact retiming failed dynamic limits");
   for (int i = 0; i < count; ++i) {
     trajectory_msgs::msg::JointTrajectoryPoint point;
-    point.time_from_start = duration(i * dt / speed);
+    point.time_from_start = duration(i * sample_dt / speed);
     for (int j = 0; j < group.dof; ++j) {
       point.positions.push_back(static_cast<float>(positions[i][j]));
       point.velocities.push_back(static_cast<float>(velocities[i][j]) * speed);
@@ -288,7 +452,7 @@ PlanResult NativePlanner::interpolate_path(
       const float lower = group.lower[j];
       const float upper = group.upper[j];
       if (at.position[j] < lower || at.position[j] > upper)
-        throw std::runtime_error("contact joint limit violation");
+        throw ContactPathFailure("contact joint limit violation");
     }
     const auto actual = robot_.forward(full);
     for (size_t j = 0; j < paths.size(); ++j) {
@@ -300,12 +464,14 @@ PlanResult NativePlanner::interpolate_path(
       if ((pose.translation() - projected.translation()).norm() > path.tolerance || along < -.005 ||
           along > path.length + .005 || along < previous_along[j] - .005 ||
           Eigen::Quaterniond(pose.linear()).angularDistance(expected) > settings.orientation_tolerance + .005)
-        throw std::runtime_error("contact interpolated spline deviates from Cartesian path: " + path.tool);
+        throw ContactPathFailure("contact interpolated spline deviates from Cartesian path: " + path.tool);
       previous_along[j] = along;
     }
   }
   result.success = true;
   result.message = "contact IK interpolation";
+  if (bottleneck_joint >= 0 && bottleneck_joint < static_cast<int>(group.names.size()))
+    result.message += " | limit=" + bottleneck + "(" + group.names[bottleneck_joint] + ")";
   result.timing.ik_ms = elapsed_ms(before);
   return result;
 }

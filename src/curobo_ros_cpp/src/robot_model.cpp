@@ -39,6 +39,20 @@ bool intersects(fcl::CollisionObjectd &first, fcl::CollisionObjectd &second) {
   fcl::CollisionResultd result;
   return fcl::collide(&first, &second, fcl::CollisionRequestd(), result) > 0;
 }
+bool intersects_manager(fcl::CollisionObjectd &object,
+                        fcl::DynamicAABBTreeCollisionManagerd &manager) {
+  bool hit = false;
+  manager.collide(&object, &hit,
+                  [](fcl::CollisionObjectd *a, fcl::CollisionObjectd *b, void *data) -> bool {
+                    fcl::CollisionResultd result;
+                    if (fcl::collide(a, b, fcl::CollisionRequestd(), result) > 0) {
+                      *static_cast<bool *>(data) = true;
+                      return true;
+                    }
+                    return false;
+                  });
+  return hit;
+}
 bool inside_mesh(const Eigen::Vector3d &point, const MeshGeometry &mesh) {
   const Eigen::Vector3d direction =
       Eigen::Vector3d(1., .1732050807569, .2718281828459).normalized();
@@ -243,6 +257,18 @@ RobotModel::RobotModel(const std::string &urdf, const std::string &robot_yaml,
   for (size_t i = 0; i < meshes_.size(); ++i)
     for (size_t j = i + 1; j < meshes_.size(); ++j)
       if (!ignored.count(std::minmax(meshes_[i].link, meshes_[j].link))) pairs_.emplace_back(i, j);
+  for (const auto &[group_name, tool_link] : profile.tools) {
+    std::vector<urdf::JointConstSharedPtr> chain;
+    auto link = urdf_.getLink(tool_link);
+    while (link && link->name != base_ && link->parent_joint) {
+      chain.push_back(link->parent_joint);
+      link = urdf_.getLink(link->parent_joint->parent_link_name);
+    }
+    if (link && link->name == base_) {
+      std::reverse(chain.begin(), chain.end());
+      tool_chains_.emplace(group_name, std::move(chain));
+    }
+  }
 }
 
 // 解析 mimic 关节。visited 用来发现循环引用。
@@ -335,9 +361,25 @@ std::vector<Eigen::Vector4d> RobotModel::gripper_spheres(
   }
   return spheres;
 }
-// 该组工具连杆的基座系位姿。
+// 该组工具连杆的基座系位姿（仅沿目标单链计算，避免整机 map 分配）。
 Transform RobotModel::tool(const JointMap &state, const std::string &group) const {
-  return forward(state).at(profile.tools.at(group));
+  const auto found = tool_chains_.find(group);
+  if (found == tool_chains_.end()) return forward(state).at(profile.tools.at(group));
+  Transform current = Transform::Identity();
+  for (const auto &joint : found->second) {
+    auto value = urdf_origin(joint->parent_to_joint_origin_transform);
+    if (joint->type != urdf::Joint::FIXED) {
+      std::set<std::string> visited;
+      const auto q = joint_value(joint->name, state, visited);
+      const Eigen::Vector3d axis(joint->axis.x, joint->axis.y, joint->axis.z);
+      if (joint->type == urdf::Joint::PRISMATIC)
+        value.translate(axis * q);
+      else
+        value.rotate(Eigen::AngleAxisd(q, axis.normalized()));
+    }
+    current = current * value;
+  }
+  return current;
 }
 std::set<std::string> RobotModel::tool_feedback_joints(const std::string &group) const {
   return feedback_joints({profile.tools.at(group)});
@@ -365,15 +407,40 @@ std::optional<Collision> RobotModel::check(const JointMap &state, const std::str
   }
   if (environment && pending_environment_) {
     const auto &mesh = *pending_environment_;
-    environment_ = std::make_unique<fcl::CollisionObjectd>(make_model(mesh.vertices, mesh.faces));
+    if (!mesh.vertices.empty() && !mesh.faces.empty())
+      environment_ = std::make_unique<fcl::CollisionObjectd>(make_model(mesh.vertices, mesh.faces));
     pending_environment_.reset();
   }
-  if (environment && environment_)
+  if (environment && pending_voxels_) {
+    const auto &voxels = *pending_voxels_;
+    voxel_objects_.clear();
+    voxel_manager_.reset();
+    if (!voxels.centers.empty() && voxels.pitch > 0.) {
+      auto box = std::make_shared<fcl::Boxd>(voxels.pitch, voxels.pitch, voxels.pitch);
+      voxel_objects_.reserve(voxels.centers.size());
+      std::vector<fcl::CollisionObjectd *> raw;
+      raw.reserve(voxels.centers.size());
+      for (const auto &center : voxels.centers) {
+        fcl::Transform3d pose = fcl::Transform3d::Identity();
+        pose.translation() = center;
+        voxel_objects_.push_back(std::make_unique<fcl::CollisionObjectd>(box, pose));
+        raw.push_back(voxel_objects_.back().get());
+      }
+      voxel_manager_ = std::make_unique<fcl::DynamicAABBTreeCollisionManagerd>();
+      voxel_manager_->registerObjects(raw);
+      voxel_manager_->setup();
+    }
+    pending_voxels_.reset();
+  }
+  if (environment && (environment_ || voxel_manager_))
     for (const auto &mesh : meshes_)
-      if (moving.count(mesh.link) && !(contact && fingers.count(mesh.link)) &&
-          mesh.object->getAABB().overlap(environment_->getAABB()) &&
-          intersects(*mesh.object, *environment_))
-        return Collision{"environment", mesh.link, "environment"};
+      if (moving.count(mesh.link) && !(contact && fingers.count(mesh.link))) {
+        if (environment_ && mesh.object->getAABB().overlap(environment_->getAABB()) &&
+            intersects(*mesh.object, *environment_))
+          return Collision{"environment", mesh.link, "environment"};
+        if (voxel_manager_ && intersects_manager(*mesh.object, *voxel_manager_))
+          return Collision{"environment", mesh.link, "environment"};
+      }
   for (const auto &target : grasp_targets) {
     const auto jaws = profile.contact_links(target.group);
     auto shape = std::make_shared<fcl::Boxd>(target.size.x(), target.size.y(), target.size.z());
@@ -401,7 +468,9 @@ std::optional<Collision> RobotModel::check(const JointMap &state, const std::str
       if (!allowed.count(mesh.link) && (payload_moves || moving.count(mesh.link)) &&
           object->getAABB().overlap(mesh.object->getAABB()) && intersects(*object, *mesh.object))
         return Collision{"payload_self", payload.group, mesh.link};
-    if (payload_moves && environment && environment_ && intersects(*object, *environment_))
+    if (payload_moves && environment &&
+        ((environment_ && intersects(*object, *environment_)) ||
+         (voxel_manager_ && intersects_manager(*object, *voxel_manager_))))
       return Collision{"payload_environment", payload.group, "environment"};
     for (const auto &other : carried)
       if ((payload_moves || other.moves) && object->getAABB().overlap(other.object->getAABB()) &&
@@ -481,35 +550,81 @@ std::vector<bool> RobotModel::self_sphere_mask(const std::vector<Point> &points,
                                                const JointMap &state,
                                                const std::string &group) const {
   const auto transforms = forward(state);
-  std::vector<Sphere> world_spheres;
+  struct LinkSpheres {
+    Eigen::Vector3d lower = Eigen::Vector3d::Constant(1e9);
+    Eigen::Vector3d upper = Eigen::Vector3d::Constant(-1e9);
+    std::vector<Sphere> spheres;
+  };
+  std::vector<LinkSpheres> groups;
+  Eigen::Vector3d all_lower = Eigen::Vector3d::Constant(1e9);
+  Eigen::Vector3d all_upper = Eigen::Vector3d::Constant(-1e9);
+  size_t total_spheres = 0;
   for (const auto &link : moving_links(group)) {
     const auto found = self_filter_spheres_.find(link);
-    if (found == self_filter_spheres_.end()) continue;
-    for (const auto &sphere : found->second)
-      world_spheres.push_back({transforms.at(link) * sphere.center, sphere.radius_squared,
-                               sphere.physical_radius});
+    if (found == self_filter_spheres_.end() || found->second.empty()) continue;
+    const auto &pose = transforms.at(link);
+    LinkSpheres entry;
+    entry.spheres.reserve(found->second.size());
+    for (const auto &sphere : found->second) {
+      const Eigen::Vector3d center = pose * sphere.center;
+      const double radius = std::sqrt(sphere.radius_squared);
+      const Eigen::Vector3d offset(radius, radius, radius);
+      entry.lower = entry.lower.cwiseMin(center - offset);
+      entry.upper = entry.upper.cwiseMax(center + offset);
+      entry.spheres.push_back({center, sphere.radius_squared, sphere.physical_radius});
+    }
+    all_lower = all_lower.cwiseMin(entry.lower);
+    all_upper = all_upper.cwiseMax(entry.upper);
+    total_spheres += entry.spheres.size();
+    groups.push_back(std::move(entry));
   }
-  if (world_spheres.empty()) throw std::runtime_error("no self-filter collision spheres for " + group);
-  std::vector<bool> mask(points.size());
+  if (total_spheres == 0) throw std::runtime_error("no self-filter collision spheres for " + group);
+  std::vector<bool> mask(points.size(), false);
   for (size_t i = 0; i < points.size(); ++i) {
     const Eigen::Vector3d point = points[i].cast<double>();
-    mask[i] = std::any_of(world_spheres.begin(), world_spheres.end(), [&](const Sphere &sphere) {
-      return (point - sphere.center).squaredNorm() < sphere.radius_squared;
-    });
+    if ((point.array() < all_lower.array()).any() || (point.array() > all_upper.array()).any())
+      continue;
+    for (const auto &entry : groups) {
+      if ((point.array() < entry.lower.array()).any() || (point.array() > entry.upper.array()).any())
+        continue;
+      if (std::any_of(entry.spheres.begin(), entry.spheres.end(), [&](const Sphere &sphere) {
+            return (point - sphere.center).squaredNorm() < sphere.radius_squared;
+          })) {
+        mask[i] = true;
+        break;
+      }
+    }
   }
   return mask;
 }
 void RobotModel::set_environment(std::vector<Eigen::Vector3d> vertices,
                                  std::vector<fcl::Triangle> faces) {
+  set_environment(std::move(vertices), std::move(faces), {}, 0.);
+}
+void RobotModel::set_environment(std::vector<Eigen::Vector3d> vertices,
+                                 std::vector<fcl::Triangle> faces,
+                                 std::vector<Eigen::Vector3d> voxel_centers, double voxel_pitch) {
   std::lock_guard<std::mutex> guard(query_mutex_);
   environment_.reset();
-  pending_environment_ = EnvironmentMesh{std::move(vertices), std::move(faces)};
+  voxel_manager_.reset();
+  voxel_objects_.clear();
+  if (!vertices.empty() && !faces.empty())
+    pending_environment_ = EnvironmentMesh{std::move(vertices), std::move(faces)};
+  else
+    pending_environment_.reset();
+  if (!voxel_centers.empty() && voxel_pitch > 0.)
+    pending_voxels_ = EnvironmentVoxels{std::move(voxel_centers), voxel_pitch};
+  else
+    pending_voxels_.reset();
 }
 // 去掉环境障碍，自碰撞检查仍然保留。
 void RobotModel::clear_environment() {
   std::lock_guard<std::mutex> guard(query_mutex_);
   environment_.reset();
   pending_environment_.reset();
+  voxel_manager_.reset();
+  voxel_objects_.clear();
+  pending_voxels_.reset();
 }
 // 用关节速度上限把夹爪行程换成秒。
 double RobotModel::gripper_duration(const std::string &joint, double start, double target) const {

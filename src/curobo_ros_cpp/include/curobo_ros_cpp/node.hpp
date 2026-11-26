@@ -22,6 +22,7 @@
 #include <string>
 #include <thread>
 #include <type_traits>
+#include <utility>
 #include <visualization_msgs/msg/marker_array.hpp>
 #include "curobo_ros_cpp/executor.hpp"
 #include "curobo_ros_cpp/joint_history.hpp"
@@ -175,6 +176,36 @@ class PlanningNode : public rclcpp::Node {
   void complete_action(const std::shared_ptr<rclcpp_action::ServerGoalHandle<Action>> &handle,
                        const std::shared_ptr<typename Action::Result> &result);
 
+  struct ServiceLock {
+    PlanningNode *node = nullptr;
+    std::unique_lock<std::mutex> lock;
+    ServiceLock() = default;
+    ServiceLock(const ServiceLock &) = delete;
+    ServiceLock &operator=(const ServiceLock &) = delete;
+    ServiceLock(ServiceLock &&other) noexcept
+        : node(std::exchange(other.node, nullptr)), lock(std::move(other.lock)) {}
+    ServiceLock &operator=(ServiceLock &&other) noexcept {
+      if (this != &other) {
+        release();
+        node = std::exchange(other.node, nullptr);
+        lock = std::move(other.lock);
+      }
+      return *this;
+    }
+    ~ServiceLock() { release(); }
+    explicit operator bool() const { return node != nullptr; }
+    void release() {
+      if (!node) return;
+      if (lock.owns_lock()) lock.unlock();
+      node->service_busy_.store(false);
+      node->notify_prewarm();
+      node = nullptr;
+    }
+  };
+  ServiceLock try_lock_service();
+  void notify_prewarm();
+  void clear_busy();
+
   void run_action_worker();
   void run_cloud_prewarm();
   void publish_action_completion();
@@ -230,7 +261,10 @@ class PlanningNode : public rclcpp::Node {
   rclcpp::Publisher<interfaces::msg::MpcPlan>::SharedPtr mpc_pub_;
   rclcpp::CallbackGroup::SharedPtr callbacks_;  // 可重入，让反馈订阅不被规划堵住
   std::atomic_bool busy_{false};                // 已有动作在执行
+  std::atomic_bool service_busy_{false};        // 已有同步服务在执行
   std::atomic_bool shutdown_{false};            // 析构开始，工作线程应当退出
+  uint64_t prewarm_epoch_{0};                   // 触发点云后台预热的状态代次（受 input_mutex_ 保护）
+  uint64_t joint_epoch_{0};                     // 关节状态更新代次（受 input_mutex_ 保护）
   rclcpp::CallbackGroup::SharedPtr action_callbacks_;
   rclcpp::TimerBase::SharedPtr action_completion_timer_;
   std::mutex workers_mutex_;                    // 保护待执行任务和待发布结果

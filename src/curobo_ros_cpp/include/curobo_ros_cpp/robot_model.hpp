@@ -46,13 +46,19 @@ struct Collision {
   std::string message() const;
 };
 
+class MeshCollisionObject final : public fcl::CollisionObjectd {
+ public:
+  using fcl::CollisionObjectd::CollisionObjectd;
+  void set_mesh_pose(const Transform &pose);
+};
+
 // 一个连杆的碰撞网格及其包围盒。model 和 object 在加载时建好，查询时只更新位姿。
 struct MeshGeometry {
   std::string link;  // 该碰撞网格所属的 URDF 连杆
   std::vector<Eigen::Vector3d> vertices;  // 连杆局部坐标系顶点，单位米
   std::vector<fcl::Triangle> faces;  // 引用 vertices 中三个顶点的三角面
   std::shared_ptr<fcl::BVHModel<fcl::OBBRSSd>> model;  // 局部几何及包围盒层次结构
-  std::unique_ptr<fcl::CollisionObjectd> object;  // 更新到当前机器人位姿的 FCL 对象
+  std::unique_ptr<MeshCollisionObject> object;  // 更新到当前机器人位姿的 FCL 对象
   Eigen::Vector3d lower;   // 网格局部包围盒最小角
   Eigen::Vector3d upper;   // 网格局部包围盒最大角
   bool watertight = false; // 封闭网格才允许用射线判断点是否在内部
@@ -126,7 +132,13 @@ class RobotModel {
     double physical_radius;
   };
   std::map<std::string, std::vector<Sphere>> self_filter_spheres_;
-  std::vector<std::pair<size_t, size_t>> pairs_;          // 需要互查的网格下标对
+  struct CollisionGroup {
+    std::set<std::string> moving_links;
+    std::set<std::string> contact_links;
+    std::vector<size_t> moving_meshes;
+    std::vector<std::pair<size_t, size_t>> self_pairs;
+  };
+  std::map<std::string, CollisionGroup> collision_groups_;
   struct EnvironmentMesh {
     std::vector<Eigen::Vector3d> vertices;
     std::vector<fcl::Triangle> faces;

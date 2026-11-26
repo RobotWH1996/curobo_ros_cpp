@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <iomanip>
+#include <iterator>
 #include <limits>
 #include <queue>
 #include <random>
@@ -13,9 +14,20 @@
 
 namespace curobo_ros_cpp {
 namespace {
-struct MeshTrajectoryCollision : std::runtime_error {
+struct TrajectoryCandidateRejected : std::runtime_error {
   using std::runtime_error::runtime_error;
 };
+
+std::string timeopt_capacity_note(const curobo::robot::TimeOptCapacityDiagnostics &diagnostics) {
+  if (diagnostics.overflow_seeds == 0) return {};
+  std::ostringstream note;
+  note << " 附加诊断：TimeOpt 有 " << diagnostics.overflow_seeds
+       << " 个候选超过稠密缓冲容量（容量 " << diagnostics.capacity
+       << " 点，最多需要 " << diagnostics.max_required_samples
+       << " 点，最长内部时长 " << std::fixed << std::setprecision(2)
+       << diagnostics.max_duration_sec << " s）。";
+  return note.str();
+}
 
 std::string rrt_failure(const curobo::robot::RrtDiagnostics &stats) {
   if (stats.requested_pairs == 0) return "RRT 没有可检查的起点和目标，未开始搜索。";
@@ -200,6 +212,7 @@ PlanResult NativePlanner::solve(Group &group, const JointMap &state,
     request.collision_cost = group.collision.get();
     request.trajectory_dt = group.trajectory_dt.get();
     request.finetune_attempts = settings.finetune;
+    request.outer_iterations = -1;
     request.allow_rrt = allow_graph && settings.graph == "rrt" &&
                         (attempt > 0 || rrt_on_first_attempt);
     const bool skip_direct = request.allow_rrt && packed == failed_direct_goals;
@@ -208,10 +221,7 @@ PlanResult NativePlanner::solve(Group &group, const JointMap &state,
       RCLCPP_INFO(logger, "【OPT · 重试】group=%s ｜ 尝试=%d ｜ 关节候选相同，直接进入 RRT",
                   group.name.c_str(), attempt + 1);
     const auto before = Clock::now();
-    if (attempt > 0 && request.allow_rrt)
-      group.planner->plan_with_next_rrt_samples(request);
-    else
-      group.planner->plan(request);
+    group.planner->plan_optimized(request, /*reset_rrt_samples=*/attempt == 0 || !request.allow_rrt);
     const bool success = group.success.host(1).front() != 0;
     if (!success && !skip_direct) failed_direct_goals = std::move(packed);
     const double total = elapsed_ms(before);
@@ -226,11 +236,14 @@ PlanResult NativePlanner::solve(Group &group, const JointMap &state,
     const double rrt_ms = group.planner->last_rrt_time() * 1000.;
     result.timing.graph_ms += rrt_ms;
     result.timing.trajopt_ms += std::max(0., total - rrt_ms);
-    const bool retained_seed = success && group.planner->retained_rrt_seed();
-    if (!success || retained_seed) {
+    if (!success) {
+      const auto cap_note = timeopt_capacity_note(group.planner->last_timeopt_capacity_diagnostics());
+      if (!cap_note.empty())
+        RCLCPP_WARN(logger, "【OPT · 缓冲容量】group=%s ｜ 尝试=%d ｜%s",
+                    group.name.c_str(), attempt + 1, cap_note.c_str());
       if (rrt_calls > 0) {
         const auto diagnostics = group.planner->last_rrt_diagnostics();
-        reject(rrt_failure(diagnostics));
+        reject(rrt_failure(diagnostics) + cap_note);
         if (diagnostics.paths_found > 0) {
           RCLCPP_WARN(logger,
                       "【OPT · RRT → TrajOpt】失败 ｜ group=%s ｜ 尝试=%d ｜ RRT路径数=%d "
@@ -241,7 +254,7 @@ PlanResult NativePlanner::solve(Group &group, const JointMap &state,
                       group.collision.host(1).front(), rrt_ms, std::max(0., total - rrt_ms));
         }
       } else {
-        reject("直接优化未能生成可执行轨迹，求解器未提供失败原因。");
+        reject("直接优化未能生成可执行轨迹，求解器未提供失败原因。" + cap_note);
       }
       RCLCPP_DEBUG(logger, "【OPT 规划】第 %d 次求解共耗时 %.1f 毫秒，其中 RRT 用时 %.1f 毫秒。",
                    attempt + 1, total, rrt_ms);
@@ -265,12 +278,12 @@ PlanResult NativePlanner::solve(Group &group, const JointMap &state,
         candidate = blend_trajectories({std::move(candidate)}, group.names, limits, {false}).trajectory;
       try {
         validate(group.name, state, candidate, true, std::nullopt, /*mesh_along_path=*/true);
-      } catch (const MeshTrajectoryCollision &error) {
+      } catch (const TrajectoryCandidateRejected &error) {
         result.timing.check_ms += elapsed_ms(check_started);
         reject(error.what());
         if (!skip_direct) failed_direct_goals = std::move(packed);
         if (prm_goal.empty()) prm_goal = valid_goals.front();
-        RCLCPP_WARN(logger, "【OPT · 整轨 FCL】group=%s ｜ 尝试=%d ｜ %s",
+        RCLCPP_WARN(logger, "【OPT · 整轨验收】group=%s ｜ 尝试=%d ｜ %s",
                     group.name.c_str(), attempt + 1, error.what());
         continue;
       }
@@ -332,16 +345,25 @@ PlanResult NativePlanner::solve(Group &group, const JointMap &state,
     fallback = plan_prm(group, state, prm_goal, mesh_along_path);
   } catch (const std::runtime_error &error) {
     fallback.message = std::string("PRM 规划遇到异常。") + error.what();
+    fallback.timing.graph_ms = elapsed_ms(before_prm);
   }
   const double fallback_ms = elapsed_ms(before_prm);
-  result.timing.graph_ms += fallback_ms;
-  fallback.timing = result.timing;
+  const auto &timing = fallback.timing;
   if (fallback.success)
-    RCLCPP_INFO(logger, "【OPT · PRM】通过 ｜ PRM 用时 %.1f ms ｜ %s",
-                fallback_ms, fallback.message.c_str());
+    RCLCPP_INFO(logger, "【OPT · PRM】通过 ｜ PRM 用时 %.1f ms ｜ 路网 %.1f ms ｜ "
+                        "轨迹生成 %.1f ms ｜ 验收 %.1f ms ｜ %s",
+                fallback_ms, timing.graph_ms, timing.trajopt_ms, timing.check_ms,
+                fallback.message.c_str());
   else
-    RCLCPP_WARN(logger, "【OPT · PRM】失败 ｜ PRM 用时 %.1f ms ｜ %s",
-                fallback_ms, fallback.message.c_str());
+    RCLCPP_WARN(logger, "【OPT · PRM】失败 ｜ PRM 用时 %.1f ms ｜ 路网 %.1f ms ｜ "
+                        "轨迹生成 %.1f ms ｜ 验收 %.1f ms ｜ %s",
+                fallback_ms, timing.graph_ms, timing.trajopt_ms, timing.check_ms,
+                fallback.message.c_str());
+  fallback.timing.ik_ms += result.timing.ik_ms;
+  fallback.timing.graph_ms += result.timing.graph_ms;
+  fallback.timing.trajopt_ms += result.timing.trajopt_ms;
+  fallback.timing.check_ms += result.timing.check_ms;
+  fallback.timing.attempts = result.timing.attempts;
   return fallback;
 }
 // 关节目标直接优化，不经过逆解。
@@ -466,8 +488,13 @@ PlanResult NativePlanner::plan_pose_waypoints(
   result.timing.trajopt_ms = elapsed_ms(started);
   result.timing.attempts = 1;
   if (!group.success.host(1).front()) {
+    const auto cap_note = timeopt_capacity_note(group.planner->last_timeopt_capacity_diagnostics());
     result.message = "TrajOpt rejected unified Cartesian route with " +
-                     std::to_string(targets.size()) + " waypoints";
+                     std::to_string(targets.size()) + " waypoints." + cap_note;
+    if (!cap_note.empty())
+      RCLCPP_WARN(rclcpp::get_logger("curobo_ros_cpp"),
+                  "【OPT · 缓冲容量】group=%s ｜ 多路点规划失败%s", group.name.c_str(),
+                  cap_note.c_str());
     return result;
   }
   result.trajectory = output(group, true);
@@ -564,11 +591,11 @@ void NativePlanner::validate(const std::string &name, const JointMap &state,
       const float lower = group.lower[j];
       const float upper = group.upper[j];
       if (!std::isfinite(position) || position < lower - 1e-6 || position > upper + 1e-6)
-        throw std::runtime_error("joint position limit violation " + group.names[j] +
-                                 " | time=" + std::to_string(sample_time) +
-                                 " s | value=" + std::to_string(position) +
-                                 " | allowed=[" + std::to_string(lower) +
-                                 ", " + std::to_string(upper) + "]");
+        throw TrajectoryCandidateRejected("joint position limit violation " + group.names[j] +
+                                          " | time=" + std::to_string(sample_time) +
+                                          " s | value=" + std::to_string(position) +
+                                          " | allowed=[" + std::to_string(lower) +
+                                          ", " + std::to_string(upper) + "]");
       row.push_back(position);
     }
     if (collision && (mesh_along_path || i == 0 || i == count - 1)) {
@@ -576,8 +603,8 @@ void NativePlanner::validate(const std::string &name, const JointMap &state,
         mesh_state[group.names[j]] = value.position[columns[j]];
       for (const auto &[joint, column] : gripper_columns) mesh_state[joint] = value.position[column];
       if (const auto hit = robot_.check(mesh_state, name, true, false, payloads_, grasp_targets))
-        throw MeshTrajectoryCollision("FCL trajectory collision | time=" +
-                                      std::to_string(sample_time) + " s | " + hit->message());
+        throw TrajectoryCandidateRejected("FCL trajectory collision | time=" +
+                                          std::to_string(sample_time) + " s | " + hit->message());
     }
     samples.push_back(std::move(row));
     if (samples.size() == static_cast<size_t>(group.capacity) || i == count - 1) {
@@ -655,7 +682,7 @@ void NativePlanner::validate(const std::string &name, const JointMap &state,
         } catch (const std::exception &error) {
           detail << " | diagnostic_error=" << error.what();
         }
-        throw std::runtime_error(detail.str());
+        throw TrajectoryCandidateRejected(detail.str());
       }
       samples.clear();
     }
@@ -696,6 +723,7 @@ void NativePlanner::warmup(const std::string &name, int iterations) {
     request.trajectory_dt = group.trajectory_dt.get();
     request.allow_rrt = false;
     request.finetune_attempts = settings.finetune;
+    request.outer_iterations = -1;
     group.planner->plan(request);
     const auto timing = group.planner->last_trajopt_graph_timing();
     if (timing.captures > 0)
@@ -725,6 +753,7 @@ std::vector<uint8_t> NativePlanner::configuration_violations(
 PlanResult NativePlanner::plan_prm(Group &group, const JointMap &state,
                                    const std::vector<float> &goal, bool mesh_along_path) {
   // 起点与终点先验收，端点无效时无需生成路网。
+  const auto roadmap_started = Clock::now();
   const auto start = positions(group, state);
   PlanResult result;
   const auto endpoint_failure = [&](const std::vector<float> &position) -> std::string {
@@ -748,6 +777,7 @@ PlanResult NativePlanner::plan_prm(Group &group, const JointMap &state,
       const auto *label = i == 0 ? "起点" : "目标";
       result.message = std::string("PRM ") + label + "检查失败。" +
                        endpoint_failure(i == 0 ? start : goal) + "。";
+      result.timing.graph_ms = elapsed_ms(roadmap_started);
       return result;
     }
   constexpr int random_samples = 180;
@@ -779,6 +809,13 @@ PlanResult NativePlanner::plan_prm(Group &group, const JointMap &state,
   queue.emplace(0., 0);
   size_t checked_edges = 0;
   size_t blocked_edges = 0;
+  struct Edge {
+    int destination;
+    double cost;
+    size_t sample_begin;
+    size_t sample_end;
+  };
+  const size_t capacity = group.capacity;
   while (!queue.empty()) {
     auto [cost, node] = queue.top();
     queue.pop();
@@ -788,29 +825,50 @@ PlanResult NativePlanner::plan_prm(Group &group, const JointMap &state,
     for (size_t i = 0; i < nodes.size(); ++i)
       if (i != static_cast<size_t>(node)) nearest.emplace_back(distance(nodes[node], nodes[i]), i);
     std::sort(nearest.begin(), nearest.end());
+    std::vector<Edge> edges;
+    std::vector<std::vector<float>> samples;
     for (size_t k = 0; k < std::min<size_t>(16, nearest.size()); ++k) {
       const auto [length, next] = nearest[k];
-      if (cost + length >= costs[next]) continue;
+      const double new_cost = cost + length;
+      if (new_cost >= costs[next]) continue;
       const int count = std::max(2, static_cast<int>(std::ceil(length / .025)) + 1);
-      std::vector<std::vector<float>> edge;
+      const size_t begin = samples.size();
       for (int i = 0; i < count; ++i) {
         std::vector<float> q;
         for (int j = 0; j < group.dof; ++j)
           q.push_back(nodes[node][j] +
                       static_cast<float>(i) / (count - 1) * (nodes[next][j] - nodes[node][j]));
-        edge.push_back(std::move(q));
+        samples.push_back(std::move(q));
       }
+      edges.push_back({next, new_cost, begin, samples.size()});
+    }
+    std::vector<uint8_t> violations;
+    if (samples.size() <= capacity) {
+      violations = configuration_violations(group, samples);
+    } else {
+      violations.reserve(samples.size());
+      for (size_t begin = 0; begin < samples.size(); begin += capacity) {
+        const size_t end = std::min(begin + capacity, samples.size());
+        std::vector<std::vector<float>> batch(std::make_move_iterator(samples.begin() + begin),
+                                              std::make_move_iterator(samples.begin() + end));
+        const auto chunk = configuration_violations(group, batch);
+        violations.insert(violations.end(), chunk.begin(), chunk.end());
+      }
+    }
+    // 同一展开节点的候选边终点各不相同，批量检查后仍按原顺序更新路网。
+    for (const auto &edge : edges) {
       ++checked_edges;
-      const auto edge_invalid = configuration_violations(group, edge);
-      if (std::any_of(edge_invalid.begin(), edge_invalid.end(), [](uint8_t v) { return v != 0; })) {
+      if (std::any_of(violations.begin() + edge.sample_begin, violations.begin() + edge.sample_end,
+                      [](uint8_t v) { return v != 0; })) {
         ++blocked_edges;
         continue;
       }
-      costs[next] = cost + length;
-      parents[next] = node;
-      queue.emplace(costs[next], next);
+      costs[edge.destination] = edge.cost;
+      parents[edge.destination] = node;
+      queue.emplace(edge.cost, edge.destination);
     }
   }
+  result.timing.graph_ms = elapsed_ms(roadmap_started);
   if (parents[1] < 0) {
     const auto logger = rclcpp::get_logger("curobo_motion_planning_node");
     RCLCPP_DEBUG(logger, "【OPT 回退】PRM 采样了 %d 个关节姿态，其中 %zu 个通过检查。"
@@ -824,7 +882,10 @@ PlanResult NativePlanner::plan_prm(Group &group, const JointMap &state,
   std::vector<Trajectory> segments;
   JointMap current = state;
   for (size_t i = 1; i < path.size(); ++i) {
+    const auto started = Clock::now();
     auto part = solve(group, current, {path[i]}, 1, false, false);
+    result.timing.trajopt_ms += std::max(0., elapsed_ms(started) - part.timing.check_ms);
+    result.timing.check_ms += part.timing.check_ms;
     if (!part.success) {
       result.message = "PRM 找到了由 " + std::to_string(path.size() - 1) +
                        " 段组成的路径，但第 " + std::to_string(i) +
@@ -836,6 +897,7 @@ PlanResult NativePlanner::plan_prm(Group &group, const JointMap &state,
     segments.push_back(std::move(part.trajectory));
   }
   const auto limits = dynamic_limits(group.name);
+  const auto blend_started = Clock::now();
   try {
     if (segments.size() == 1)
       result.trajectory = std::move(segments.front());
@@ -843,16 +905,21 @@ PlanResult NativePlanner::plan_prm(Group &group, const JointMap &state,
       result.trajectory = blend_trajectories(segments, group.names, limits,
                                              std::vector<bool>(segments.size(), false)).trajectory;
   } catch (const std::runtime_error &error) {
+    result.timing.trajopt_ms += elapsed_ms(blend_started);
     result.message = std::string("PRM 找到了路径，但没能把各段轨迹拼接起来。") + error.what();
     return result;
   }
+  result.timing.trajopt_ms += elapsed_ms(blend_started);
+  const auto validation_started = Clock::now();
   try {
     validate(group.name, state, result.trajectory, true, std::nullopt, mesh_along_path);
   } catch (const std::runtime_error &error) {
+    result.timing.check_ms += elapsed_ms(validation_started);
     result.message = std::string("PRM 拼接后的整条轨迹未通过检查。") + error.what();
     result.trajectory = Trajectory{};
     return result;
   }
+  result.timing.check_ms += elapsed_ms(validation_started);
   result.success = true;
   result.message = "PRM 回退成功，轨迹已通过验收";
   return result;

@@ -140,6 +140,19 @@ std::vector<std::string> RobotProfile::contact_links(const std::string &group) c
 }
 std::string Collision::message() const { return kind + " " + first + " / " + second; }
 
+void MeshCollisionObject::set_mesh_pose(const Transform &pose) {
+  setTransform(pose);
+  // FCL uses an enclosing sphere for rotated objects. Transform the local box
+  // and pad it for collision tolerance before handing off to the same narrow phase.
+  const auto &local = cgeom->aabb_local;
+  const Eigen::Vector3d center = pose * local.center();
+  const Eigen::Vector3d half_size =
+      pose.linear().cwiseAbs() * ((local.max_ - local.min_) * .5);
+  constexpr double padding = 5e-6;
+  aabb.min_ = (center - half_size).array() - padding;
+  aabb.max_ = (center + half_size).array() + padding;
+}
+
 // 读 URDF、默认姿态和碰撞网格，并建好允许忽略的连杆对。
 RobotModel::RobotModel(const std::string &urdf, const std::string &robot_yaml,
                        const std::string &profile_file, const std::string &config_directory,
@@ -235,7 +248,7 @@ RobotModel::RobotModel(const std::string &urdf, const std::string &robot_yaml,
     for (size_t i = next_mesh.fetch_add(1); i < meshes_.size(); i = next_mesh.fetch_add(1)) {
       auto &mesh = meshes_[i];
       mesh.model = make_model(mesh.vertices, mesh.faces);
-      mesh.object = std::make_unique<fcl::CollisionObjectd>(mesh.model);
+      mesh.object = std::make_unique<MeshCollisionObject>(mesh.model);
     }
   };
   std::vector<std::future<void>> mesh_builders;
@@ -254,9 +267,23 @@ RobotModel::RobotModel(const std::string &urdf, const std::string &robot_yaml,
     const auto first = entry.first.as<std::string>();
     for (const auto &second : strings(entry.second)) ignored.insert(std::minmax(first, second));
   }
-  for (size_t i = 0; i < meshes_.size(); ++i)
-    for (size_t j = i + 1; j < meshes_.size(); ++j)
-      if (!ignored.count(std::minmax(meshes_[i].link, meshes_[j].link))) pairs_.emplace_back(i, j);
+  for (const auto &[group_name, names] : profile.groups) {
+    auto &group = collision_groups_[group_name];
+    const std::set<std::string> active(names.begin(), names.end());
+    for (const auto &joint : joints_)
+      if (active.count(joint->name) || group.moving_links.count(joint->parent_link_name))
+        group.moving_links.insert(joint->child_link_name);
+    const auto contacts = profile.contact_links(group_name);
+    group.contact_links.insert(contacts.begin(), contacts.end());
+    for (size_t i = 0; i < meshes_.size(); ++i) {
+      const bool moving = group.moving_links.count(meshes_[i].link);
+      if (moving) group.moving_meshes.push_back(i);
+      for (size_t j = i + 1; j < meshes_.size(); ++j)
+        if ((moving || group.moving_links.count(meshes_[j].link)) &&
+            !ignored.count(std::minmax(meshes_[i].link, meshes_[j].link)))
+          group.self_pairs.emplace_back(i, j);
+    }
+  }
   for (const auto &[group_name, tool_link] : profile.tools) {
     std::vector<urdf::JointConstSharedPtr> chain;
     auto link = urdf_.getLink(tool_link);
@@ -305,12 +332,7 @@ std::map<std::string, Transform> RobotModel::forward(const JointMap &state) cons
 }
 // 该组关节驱动到的连杆。过滤本体点云时只用这一部分。
 std::set<std::string> RobotModel::moving_links(const std::string &group) const {
-  const auto &names = profile.groups.at(group);
-  std::set<std::string> active(names.begin(), names.end()), result;
-  for (const auto &joint : joints_)
-    if (active.count(joint->name) || result.count(joint->parent_link_name))
-      result.insert(joint->child_link_name);
-  return result;
+  return collision_groups_.at(group).moving_links;
 }
 std::set<std::string> RobotModel::feedback_joints(const std::set<std::string> &links) const {
   std::set<std::string> result, ancestors;
@@ -390,17 +412,13 @@ std::optional<Collision> RobotModel::check(const JointMap &state, const std::str
                                            const Payloads &payloads, const Payloads &grasp_targets) const {
   std::lock_guard<std::mutex> guard(query_mutex_);
   const auto transforms = forward(state);
-  const auto moving = moving_links(group);
-  const auto contact_names = profile.contact_links(group);
-  const std::set<std::string> fingers(contact_names.begin(), contact_names.end());
-  for (const auto &mesh : meshes_) {
-    mesh.object->setTransform(transforms.at(mesh.link));
-    mesh.object->computeAABB();
-  }
-  for (const auto &pair : pairs_) {
+  const auto &links = collision_groups_.at(group);
+  const auto &moving = links.moving_links;
+  for (const auto &mesh : meshes_)
+    mesh.object->set_mesh_pose(transforms.at(mesh.link));
+  for (const auto &pair : links.self_pairs) {
     const auto &first = meshes_[pair.first];
     const auto &second = meshes_[pair.second];
-    if (!(moving.count(first.link) || moving.count(second.link))) continue;
     if (first.object->getAABB().overlap(second.object->getAABB()) &&
         intersects(*first.object, *second.object))
       return Collision{"self", first.link, second.link};
@@ -433,14 +451,15 @@ std::optional<Collision> RobotModel::check(const JointMap &state, const std::str
     pending_voxels_.reset();
   }
   if (environment && (environment_ || voxel_manager_))
-    for (const auto &mesh : meshes_)
-      if (moving.count(mesh.link) && !(contact && fingers.count(mesh.link))) {
-        if (environment_ && mesh.object->getAABB().overlap(environment_->getAABB()) &&
-            intersects(*mesh.object, *environment_))
-          return Collision{"environment", mesh.link, "environment"};
-        if (voxel_manager_ && intersects_manager(*mesh.object, *voxel_manager_))
-          return Collision{"environment", mesh.link, "environment"};
-      }
+    for (size_t index : links.moving_meshes) {
+      const auto &mesh = meshes_[index];
+      if (contact && links.contact_links.count(mesh.link)) continue;
+      if (environment_ && mesh.object->getAABB().overlap(environment_->getAABB()) &&
+          intersects(*mesh.object, *environment_))
+        return Collision{"environment", mesh.link, "environment"};
+      if (voxel_manager_ && intersects_manager(*mesh.object, *voxel_manager_))
+        return Collision{"environment", mesh.link, "environment"};
+    }
   for (const auto &target : grasp_targets) {
     const auto jaws = profile.contact_links(target.group);
     auto shape = std::make_shared<fcl::Boxd>(target.size.x(), target.size.y(), target.size.z());

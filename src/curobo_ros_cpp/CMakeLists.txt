@@ -30,16 +30,16 @@ check_cxx_source_compiles([=[
   #include <curobo_robot_runtime/mpc.h>
   using curobo::robot::MotionPlanner;
   using curobo::robot::MpcController;
-  auto volatile rrt = &MotionPlanner::plan_with_next_rrt_samples;
+  auto volatile optimized = &MotionPlanner::plan_optimized;
   auto volatile classify = &MotionPlanner::classify_configurations;
   auto volatile timing = &MotionPlanner::last_trajopt_graph_timing;
-  auto volatile retained = &MotionPlanner::retained_rrt_seed;
+  auto volatile cap_diag = &MotionPlanner::last_timeopt_capacity_diagnostics;
   auto volatile joint_goal = &MpcController::update_joint_goal;
-  int main() { return !rrt || !classify || !timing || !retained || !joint_goal; }
+  int main() { return !optimized || !classify || !timing || !cap_diag || !joint_goal; }
 ]=] CUROBO_RUNTIME_API_MATCHES)
 cmake_pop_check_state()
 if(NOT CUROBO_RUNTIME_API_MATCHES)
-  message(FATAL_ERROR "The cuRobo fast headers and runtime must provide the RRT retry, configuration classification, TrajOpt diagnostics, and MPC joint-goal APIs. Rebuild the matching fast source with scripts/build.sh (see README.md).")
+  message(FATAL_ERROR "The cuRobo fast headers and runtime must provide plan_optimized, configuration classification, TrajOpt diagnostics, and MPC joint-goal APIs. Rebuild the matching fast source with scripts/build.sh (see README.md).")
 endif()
 add_library(curobo_planning
   src/robot_model.cpp

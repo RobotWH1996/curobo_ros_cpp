@@ -79,8 +79,8 @@ curobo_ros_cpp/
 这些接口必须在这份 fast 源码里。换提交、机器人模型、控制点数、内部插值或 `CUROBO_CUDA_ARCH` 之后，要重新导出 `artifacts`，并重新跑 `build.sh`。`CUROBO_CUDA_ARCH` 未设置时脚本使用 87。
 
 配置阶段会同时检查 fast 头文件和 `libcurobo_robot_runtime.so` 是否提供
-`plan_with_next_rrt_samples`、`classify_configurations`、`last_trajopt_graph_timing`、
-`retained_rrt_seed` 和 `update_joint_goal`。发布时，先合入提供这些接口的 fast 提交，再用同一份源码生成运行库。
+`plan_optimized`、`classify_configurations`、`last_trajopt_graph_timing`、
+`last_timeopt_capacity_diagnostics` 和 `update_joint_goal`。发布时先合入提供这些接口的 fast 提交，并用同一修订生成头文件和运行库。
 
 ## 构建
 

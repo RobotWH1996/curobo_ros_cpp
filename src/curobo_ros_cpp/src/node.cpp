@@ -125,7 +125,7 @@ PlanningNode::PlanningNode(const rclcpp::NodeOptions &options)
   settings.finetune = parameter<int>("trajopt_finetune_attempts", 0);
   settings.knots = parameter<int>("trajopt_num_control_points", 16);
   settings.interpolation_steps = parameter<int>("trajopt_interpolation_steps", 2);
-  settings.interpolation_buffer_size = parameter<int>("trajopt_interpolation_buffer_size", 512);
+  settings.interpolation_buffer_size = parameter<int>("trajopt_interpolation_buffer_size", 0);
   settings.mpc_knots = parameter<int>("mpc_num_control_points", 6);
   settings.mpc_iterations = parameter<int>("mpc_warm_start_iters", 50);
   settings.mpc_cold_iterations = parameter<int>("mpc_cold_start_iters", 100);
@@ -247,6 +247,7 @@ PlanningNode::PlanningNode(const rclcpp::NodeOptions &options)
         }
         joint_stamp_ = stamp.seconds();
         joint_time_ = received;
+        ++joint_epoch_;
         if (store_history) cloud_ready_.notify_all();
       },
       subscription_options);
@@ -264,6 +265,7 @@ PlanningNode::PlanningNode(const rclcpp::NodeOptions &options)
             if (cloud_ && capture <= rclcpp::Time(cloud_->header.stamp).nanoseconds()) return;
             cloud_ = message;
             cloud_time_ = Clock::now();
+            ++prewarm_epoch_;
           }
           cloud_ready_.notify_all();
         },
@@ -372,8 +374,8 @@ PlanningNode::PlanningNode(const rclcpp::NodeOptions &options)
       name,
       [this, group](const std::shared_ptr<SetBool::Request> request,
              std::shared_ptr<SetBool::Response> response) {
-        std::unique_lock<std::mutex> lock(operation, std::try_to_lock);
-        if (!lock.owns_lock() || busy_) {
+        auto lock = try_lock_service();
+        if (!lock) {
           response->message = "planner busy";
           return;
         }
@@ -496,29 +498,96 @@ PlanningNode::~PlanningNode() {
   if (worker_.joinable()) worker_.join();
 }
 
+// 通知后台点云预热线程有新状态变化（任务结束、持物释放或新点云）。
+void PlanningNode::notify_prewarm() {
+  {
+    std::lock_guard<std::mutex> guard(input_mutex_);
+    ++prewarm_epoch_;
+  }
+  cloud_ready_.notify_all();
+}
+
+void PlanningNode::clear_busy() {
+  busy_.store(false);
+  notify_prewarm();
+}
+
+// 正式同步服务加锁：仅被其他正式请求（Action 或同步服务）拒绝，不被后台点云预热抢占。
+PlanningNode::ServiceLock PlanningNode::try_lock_service() {
+  if (busy_.load() || service_busy_.exchange(true)) return {};
+  if (busy_.load()) {
+    service_busy_.store(false);
+    notify_prewarm();
+    return {};
+  }
+  ServiceLock guard;
+  guard.node = this;
+  std::unique_lock<std::mutex> lock(operation, std::defer_lock);
+  while (!lock.try_lock()) {
+    if (busy_.load() || shutdown_.load() || !rclcpp::ok()) {
+      return {};
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  if (busy_.load() || shutdown_.load() || !rclcpp::ok()) return {};
+  guard.lock = std::move(lock);
+  return guard;
+}
+
 // 规划器空闲时后台预构建最新点云对应的碰撞世界，使正式规划请求直接命中缓存。
 void PlanningNode::run_cloud_prewarm() {
   sensor_msgs::msg::PointCloud2::ConstSharedPtr last_done;
+  sensor_msgs::msg::PointCloud2::ConstSharedPtr last_joint_retry_cloud;
+  uint64_t last_epoch = 0;
+  uint64_t last_joint_epoch = 0;
+  int joint_retries = 0;
+  bool retry_on_joint = false;
   while (rclcpp::ok() && !shutdown_.load()) {
     sensor_msgs::msg::PointCloud2::ConstSharedPtr candidate;
+    uint64_t epoch = 0;
     {
       std::unique_lock<std::mutex> lock(input_mutex_);
       cloud_ready_.wait_for(lock, std::chrono::milliseconds(100), [&] {
-        return shutdown_.load() || !rclcpp::ok() || (cloud_ && cloud_ != last_done);
+        if (shutdown_.load() || !rclcpp::ok()) return true;
+        if (busy_.load() || service_busy_.load()) return false;
+        if (!cloud_ || cloud_ == last_done) return false;
+        return prewarm_epoch_ != last_epoch ||
+               (retry_on_joint && joint_epoch_ != last_joint_epoch);
       });
       if (shutdown_.load() || !rclcpp::ok()) break;
+      if (busy_.load() || service_busy_.load()) continue;
       candidate = cloud_;
+      epoch = prewarm_epoch_;
+      if (!candidate || candidate == last_done) continue;
+      const bool epoch_changed = epoch != last_epoch;
+      const bool joint_changed = retry_on_joint && joint_epoch_ != last_joint_epoch;
+      if (!epoch_changed && !joint_changed) continue;
+      last_joint_epoch = joint_epoch_;
     }
-    if (!candidate || candidate == last_done) continue;
-    if (busy_.load()) continue;
+    last_epoch = epoch;
+    if (candidate != last_joint_retry_cloud) {
+      last_joint_retry_cloud = candidate;
+      joint_retries = 0;
+    }
+    retry_on_joint = false;
+
     std::unique_lock<std::mutex> op(operation, std::try_to_lock);
     if (!op.owns_lock()) continue;
-    if (busy_.load() || !held_payloads_.empty() || !planner->payloads().empty()) continue;
+    if (busy_.load() || service_busy_.load() || !held_payloads_.empty() ||
+        !planner->payloads().empty())
+      continue;
     try {
       prepare_world(cloud_prewarm_group_, candidate, /*silent=*/true);
-      if (cached_aligned_ && cached_message_ == candidate) last_done = candidate;
+      if (cached_aligned_ && cached_message_ == candidate) {
+        last_done = candidate;
+        joint_retries = 0;
+      } else if (joint_retries < 3) {
+        // 关节历史尚未覆盖点云采集时刻时，等待后续关节反馈再有限次重试，避免空转。
+        ++joint_retries;
+        retry_on_joint = true;
+      }
     } catch (...) {
-      // TF 或点云瞬态未就绪时忽略，待下次输入或正式请求处理。
+      // TF 或点云瞬态未就绪时忽略，待下次点云或状态变化再唤醒。
     }
   }
 }
@@ -977,15 +1046,16 @@ void PlanningNode::publish_mpc_preview(const std::string &group, const JointMap 
 void PlanningNode::plan_joint(
     const std::shared_ptr<interfaces::srv::PlanJointGoal::Request> request,
     std::shared_ptr<interfaces::srv::PlanJointGoal::Response> response) {
-  std::unique_lock<std::mutex> lock(operation, std::try_to_lock);
-  if (!lock.owns_lock() || busy_) {
+  const auto started = Clock::now();
+  auto lock = try_lock_service();
+  const double lock_ms = elapsed_ms(started);
+  if (!lock) {
     response->message = "planner busy";
-    RCLCPP_WARN(get_logger(), "【任务】规划器忙，本次关节规划未开始。");
+    RCLCPP_WARN(get_logger(), "【任务】规划器忙，本次关节规划未开始。加锁等待 %.1f 毫秒。", lock_ms);
     return;
   }
-  const auto started = Clock::now();
   const auto arm = arm_text(request->group_name);
-  RCLCPP_INFO(get_logger(), "【任务】%s关节规划开始。", arm.c_str());
+  RCLCPP_INFO(get_logger(), "【任务】%s关节规划开始。加锁等待 %.1f 毫秒。", arm.c_str(), lock_ms);
   RCLCPP_DEBUG(get_logger(), "【OPT 规划】收到 %zu 个路点，图搜索配置为 %s，%s。",
                request->waypoints.size(), planner->settings.graph.c_str(),
                execution->enabled() ? "下发控制器" : "仅规划");
@@ -997,6 +1067,7 @@ void PlanningNode::plan_joint(
     auto initial = state(), current = initial;
     RCLCPP_INFO(get_logger(), "【OPT · 场景】输入 %zu 点 ｜ 保留 %zu 点 ｜ %.1f ms",
                 cloud.raw_count, cloud.points.size(), elapsed_ms(phase_started));
+    const bool single_waypoint = request->waypoints.size() == 1;
     std::vector<Trajectory> parts;
     for (const auto &waypoint : request->waypoints) {
       const size_t index = parts.size() + 1;
@@ -1017,7 +1088,8 @@ void PlanningNode::plan_joint(
       RCLCPP_INFO(get_logger(), "【OPT · 目标】路点 %zu/%zu ｜ 关节目标 rad [%s]",
                   index, request->waypoints.size(), joint_goal.str().c_str());
       phase_started = Clock::now();
-      auto result = planner->plan_joint(request->group_name, current, waypoint.positions, 3);
+      auto result = planner->plan_joint(request->group_name, current, waypoint.positions, 3,
+                                        /*mesh_along_path=*/single_waypoint);
       log_opt_result(get_logger(), index, request->waypoints.size(), result, elapsed_ms(phase_started));
       if (!result.success) throw std::runtime_error(result.message);
       for (size_t j = 0; j < result.trajectory.joint_names.size(); ++j)
@@ -1028,11 +1100,15 @@ void PlanningNode::plan_joint(
     phase_started = Clock::now();
     const auto &joints = robot->profile.groups.at(request->group_name);
     const auto limits = planner->dynamic_limits(request->group_name);
-    auto trajectory = prepare_opt_trajectory(parts, joints, limits, get_logger());
+    // 单路点候选已在同一场景下通过整轨验收，原样下发。
+    auto trajectory = single_waypoint ? std::move(parts.front())
+                                     : prepare_opt_trajectory(parts, joints, limits, get_logger());
     const double blend_ms = elapsed_ms(phase_started);
     phase_started = Clock::now();
-    planner->validate(request->group_name, initial, trajectory);
-    const double validation_ms = elapsed_ms(phase_started);
+    if (!single_waypoint)
+      planner->validate(request->group_name, initial, trajectory, true, std::nullopt,
+                        /*mesh_along_path=*/true);
+    const double validation_ms = single_waypoint ? 0. : elapsed_ms(phase_started);
     publish(request->group_name, initial, trajectory);
     phase_started = Clock::now();
     execution->submit(request->group_name, trajectory, [] { return false; });
@@ -1055,15 +1131,16 @@ void PlanningNode::plan_joint(
 // 逐个笛卡尔路点规划。段与段无法连续通过时改成一次多路点求解。
 void PlanningNode::plan_pose(const std::shared_ptr<interfaces::srv::PlanPoseGoal::Request> request,
                              std::shared_ptr<interfaces::srv::PlanPoseGoal::Response> response) {
-  std::unique_lock<std::mutex> lock(operation, std::try_to_lock);
-  if (!lock.owns_lock() || busy_) {
+  const auto started = Clock::now();
+  auto lock = try_lock_service();
+  const double lock_ms = elapsed_ms(started);
+  if (!lock) {
     response->message = "planner busy";
-    RCLCPP_WARN(get_logger(), "【任务】规划器忙，本次位姿规划未开始。");
+    RCLCPP_WARN(get_logger(), "【任务】规划器忙，本次位姿规划未开始。加锁等待 %.1f 毫秒。", lock_ms);
     return;
   }
-  const auto started = Clock::now();
   const auto arm = arm_text(request->group_name);
-  RCLCPP_INFO(get_logger(), "【任务】%s位姿规划开始。", arm.c_str());
+  RCLCPP_INFO(get_logger(), "【任务】%s位姿规划开始。加锁等待 %.1f 毫秒。", arm.c_str(), lock_ms);
   RCLCPP_DEBUG(get_logger(), "【OPT 规划】收到 %zu 个路点，图搜索配置为 %s，%s。",
                request->waypoints.size(), planner->settings.graph.c_str(),
                execution->enabled() ? "下发控制器" : "仅规划");
@@ -1164,8 +1241,8 @@ void PlanningNode::plan_pose(const std::shared_ptr<interfaces::srv::PlanPoseGoal
 // 只返回逆解关节角，不生成轨迹，也不下发控制器。
 void PlanningNode::compute_ik(const std::shared_ptr<interfaces::srv::ComputeIK::Request> request,
                               std::shared_ptr<interfaces::srv::ComputeIK::Response> response) {
-  std::unique_lock<std::mutex> lock(operation, std::try_to_lock);
-  if (!lock.owns_lock() || busy_) {
+  auto lock = try_lock_service();
+  if (!lock) {
     response->message = "planner busy";
     return;
   }
@@ -1195,10 +1272,10 @@ void PlanningNode::run_action_worker() {
       action();
     } catch (const std::exception &error) {
       RCLCPP_ERROR(get_logger(), "Action completion could not be queued: %s", error.what());
-      busy_ = false;
+      clear_busy();
     } catch (...) {
       RCLCPP_ERROR(get_logger(), "Unknown Action completion error");
-      busy_ = false;
+      clear_busy();
     }
   }
 }
@@ -1218,7 +1295,7 @@ void PlanningNode::publish_action_completion() {
     RCLCPP_ERROR(get_logger(), "Unknown error finishing Action");
   }
   // Goal admission runs in the same mutually exclusive callback group.
-  busy_ = false;
+  clear_busy();
 }
 
 template <class Action>
@@ -1275,10 +1352,10 @@ void PlanningNode::add_action(const std::string &name) {
             complete_action<Action>(handle, result);
           } catch (const std::exception &error) {
             RCLCPP_ERROR(get_logger(), "Failed to finish Action: %s", error.what());
-            busy_ = false;
+            clear_busy();
           } catch (...) {
             RCLCPP_ERROR(get_logger(), "Unknown error finishing Action");
-            busy_ = false;
+            clear_busy();
           }
         };
         try {

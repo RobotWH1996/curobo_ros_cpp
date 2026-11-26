@@ -359,16 +359,18 @@ TaskResult PlanningNode::manipulate(
           }
         }
       };
-      auto merged = blend_trajectories(pending, arm_joints, dynamic, contacts);
-      double blend_ms = elapsed_ms(before);
-      apply_opening(merged);
-      double validation_ms = 0., contact_fk_ms = 0.;
+      BlendedTrajectory merged;
+      double blend_ms = 0., validation_ms = 0., contact_fk_ms = 0.;
       try {
+        merged = blend_trajectories(pending, arm_joints, dynamic, contacts);
+        blend_ms = elapsed_ms(before);
+        apply_opening(merged);
         verify_block(merged, validation_ms, contact_fk_ms);
       } catch (const std::exception &blend_error) {
         if (pending.size() <= 1) throw;
+        if (blend_ms == 0.) blend_ms = elapsed_ms(before);
         RCLCPP_WARN(get_logger(),
-                    "【合并 · 回退】平滑拐角拼接验收未通过，改用逐段零速衔接重试：%s",
+                    "【合并 · 回退】平滑拐角拼接或验收未通过，改用逐段零速衔接重试：%s",
                     blend_error.what());
         const auto fallback_before = Clock::now();
         std::vector<Trajectory> retimed;

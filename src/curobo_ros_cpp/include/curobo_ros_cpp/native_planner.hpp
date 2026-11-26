@@ -78,7 +78,7 @@ struct PlannerSettings {
   int finetune = 0;                   // 求出可行解后再压缩时间的轮数
   int knots = 16;                     // OPT 控制点数，对应产物目录
   int interpolation_steps = 2;        // OPT 内部样条采样密度
-  int interpolation_buffer_size = 512; // OPT 稠密验证缓冲大小，0 使用产物默认容量
+  int interpolation_buffer_size = 0;   // OPT 稠密验证缓冲大小，0 使用产物默认容量
   int mpc_knots = 6;                  // MPC 控制点数
   int mpc_iterations = 50;            // MPC 热启动迭代
   int mpc_cold_iterations = 100;      // MPC 冷启动迭代

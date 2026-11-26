@@ -113,6 +113,7 @@ struct Payload {
   Transform in_tool = Transform::Identity();         // 盒子中心相对工具的位姿
   Transform source_pose = Transform::Identity();     // 抓取前工件在基座系的位姿，用于从点云里挖掉原位置
 };
+using Payloads = std::vector<Payload>;
 
 // 一次求解各阶段的墙钟耗时，毫秒。日志里的 ik、graph、trajopt、fcl 都从这里来。
 struct Timing {

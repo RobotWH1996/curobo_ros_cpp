@@ -345,7 +345,7 @@ std::set<std::string> RobotModel::tool_feedback_joints(const std::string &group)
 // 先摆好网格，再查自碰撞、环境和携物。
 std::optional<Collision> RobotModel::check(const JointMap &state, const std::string &group,
                                            bool environment, bool contact,
-                                           const std::optional<Payload> &payload) const {
+                                           const Payloads &payloads, const Payloads &grasp_targets) const {
   std::lock_guard<std::mutex> guard(query_mutex_);
   const auto transforms = forward(state);
   const auto moving = moving_links(group);
@@ -374,22 +374,40 @@ std::optional<Collision> RobotModel::check(const JointMap &state, const std::str
           mesh.object->getAABB().overlap(environment_->getAABB()) &&
           intersects(*mesh.object, *environment_))
         return Collision{"environment", mesh.link, "environment"};
-  if (payload) {
-    const auto side = payload->group.substr(0, payload->group.find('_'));
-    const auto &tool_name = profile.tools.at(payload->group);
-    std::set<std::string> allowed{tool_name,
-                                  substitute(profile.gripper_base_pattern, "{side}", side)};
-    for (const auto &name : profile.contact_links(payload->group)) allowed.insert(name);
-    auto geometry =
-        std::make_shared<fcl::Boxd>(payload->size.x(), payload->size.y(), payload->size.z());
-    fcl::CollisionObjectd object(geometry, transforms.at(tool_name) * payload->in_tool);
+  for (const auto &target : grasp_targets) {
+    const auto jaws = profile.contact_links(target.group);
+    auto shape = std::make_shared<fcl::Boxd>(target.size.x(), target.size.y(), target.size.z());
+    fcl::CollisionObjectd object(shape, target.source_pose);
+    for (const auto &mesh : meshes_)
+      if (moving.count(mesh.link) && std::find(jaws.begin(), jaws.end(), mesh.link) == jaws.end() &&
+          object.getAABB().overlap(mesh.object->getAABB()) && intersects(object, *mesh.object))
+        return Collision{"grasp_target", mesh.link, target.group};
+  }
+  struct CarriedBox {
+    std::string group;
+    bool moves;
+    std::unique_ptr<fcl::CollisionObjectd> object;
+  };
+  std::vector<CarriedBox> carried;
+  for (const auto &payload : payloads) {
+    const auto side = payload.group.substr(0, payload.group.find('_'));
+    const auto &tool_name = profile.tools.at(payload.group);
+    std::set<std::string> allowed{tool_name, substitute(profile.gripper_base_pattern, "{side}", side)};
+    for (const auto &name : profile.contact_links(payload.group)) allowed.insert(name);
+    auto geometry = std::make_shared<fcl::Boxd>(payload.size.x(), payload.size.y(), payload.size.z());
+    auto object = std::make_unique<fcl::CollisionObjectd>(geometry, transforms.at(tool_name) * payload.in_tool);
     const bool payload_moves = moving.count(tool_name);
     for (const auto &mesh : meshes_)
       if (!allowed.count(mesh.link) && (payload_moves || moving.count(mesh.link)) &&
-          object.getAABB().overlap(mesh.object->getAABB()) && intersects(object, *mesh.object))
-        return Collision{"payload_self", "payload", mesh.link};
-    if (payload_moves && environment && environment_ && intersects(object, *environment_))
-      return Collision{"payload_environment", "payload", "environment"};
+          object->getAABB().overlap(mesh.object->getAABB()) && intersects(*object, *mesh.object))
+        return Collision{"payload_self", payload.group, mesh.link};
+    if (payload_moves && environment && environment_ && intersects(*object, *environment_))
+      return Collision{"payload_environment", payload.group, "environment"};
+    for (const auto &other : carried)
+      if ((payload_moves || other.moves) && object->getAABB().overlap(other.object->getAABB()) &&
+          intersects(*object, *other.object))
+        return Collision{"payload_payload", payload.group, other.group};
+    carried.push_back({payload.group, payload_moves, std::move(object)});
   }
   return {};
 }

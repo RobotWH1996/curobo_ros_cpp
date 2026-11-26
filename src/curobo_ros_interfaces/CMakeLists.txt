@@ -14,6 +14,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/PickTask.msg"
   "msg/PlaceTask.msg"
   "action/Pick.action"
+  "action/DualPick.action"
   "action/Place.action"
   "action/CloseLever.action"
   "action/PickPlace.action"

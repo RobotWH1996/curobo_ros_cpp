@@ -51,25 +51,41 @@ void NativePlanner::warmup_interpolation(const std::string &name, const std::vec
   }
 }
 // 沿工具直线采样逆解。这一段不查环境碰撞。
-PlanResult NativePlanner::interpolate(const std::string &name, const JointMap &state,
-                                      const Transform &start, const Transform &end) {
+NativePlanner::ContactPath NativePlanner::linear_contact(const std::string &tool,
+    const Transform &start, const Transform &end) const {
   const Eigen::Vector3d delta = end.translation() - start.translation();
   const double length = delta.norm();
   const Eigen::Quaterniond qa(start.linear()), qb(end.linear());
   const int required = std::max({3, static_cast<int>(std::ceil(length / .005)) + 1,
                                  static_cast<int>(std::ceil(qa.angularDistance(qb) / .03)) + 1});
-  const auto pose_at = [&](double alpha) {
+  const auto pose_at = [start, delta, qa, qb](double alpha) {
     Transform pose = Transform::Identity();
     pose.translation() = start.translation() + alpha * delta;
     pose.linear() = qa.slerp(alpha, qb).toRotationMatrix();
     return pose;
   };
-  const auto progress = [&](const Transform &pose) {
+  const auto progress = [start, delta, length](const Transform &pose) {
     return (pose.translation() - start.translation()).dot(delta) / length;
   };
   const double tolerance =
       settings.path_tolerance > 0. ? settings.path_tolerance : settings.position_tolerance;
-  return interpolate_path(name, state, required, length, tolerance, pose_at, progress);
+  return {tool, length, tolerance, required, pose_at, progress};
+}
+
+PlanResult NativePlanner::interpolate(const std::string &name, const JointMap &state,
+                                      const Transform &start, const Transform &end) {
+  return interpolate_path(name, state, {linear_contact(robot_.profile.tools.at(name), start, end)});
+}
+
+PlanResult NativePlanner::interpolate_both(const JointMap &state,
+                                           const std::map<std::string, Transform> &targets) {
+  const auto transforms = robot_.forward(state);
+  std::vector<ContactPath> paths;
+  for (const auto &side : {"left_arm", "right_arm"}) {
+    const auto &tool = robot_.profile.tools.at(side);
+    paths.push_back(linear_contact(tool, transforms.at(tool), targets.at(tool)));
+  }
+  return interpolate_path("both_arms", state, paths);
 }
 
 PlanResult NativePlanner::interpolate_arc(const std::string &name, const JointMap &state,
@@ -89,24 +105,30 @@ PlanResult NativePlanner::interpolate_arc(const std::string &name, const JointMa
     return (sweep / 2. + angle) * std::copysign(radius, sweep);
   };
   const int required = std::max(3, static_cast<int>(std::ceil(length / .005)) + 1);
-  return interpolate_path(name, state, required, length, .003, pose_at, progress);
+  return interpolate_path(name, state, {{robot_.profile.tools.at(name), length, .003, required,
+                                         pose_at, progress}});
 }
 
 PlanResult NativePlanner::interpolate_path(
-    const std::string &name, const JointMap &state, int required, double length, double tolerance,
-    const std::function<Transform(double)> &pose_at,
-    const std::function<double(const Transform &)> &progress) {
+    const std::string &name, const JointMap &state, const std::vector<ContactPath> &paths) {
   const auto before = Clock::now();
   synchronize(name, state);
   auto &group = get(name);
-  if (name == "both_arms")
-    throw std::invalid_argument("Cartesian contact interpolation requires one arm");
-  const auto tool = robot_.profile.tools.at(name);
-  if (required > Group::kIkBatchCapacity || length < 1e-6)
+  int required = 0;
+  for (const auto &path : paths) {
+    required = std::max(required, path.samples);
+    if (path.length < 1e-6) throw std::invalid_argument("contact distance outside interpolation capacity");
+  }
+  if (required > Group::kIkBatchCapacity)
     throw std::invalid_argument("contact distance outside interpolation capacity");
+  auto targets_at = [&](double progress) {
+    std::map<std::string, Transform> targets;
+    for (const auto &path : paths) targets.emplace(path.tool, path.pose_at(progress));
+    return targets;
+  };
   int count = 33;
   while (count < required) count = 2 * count - 1;
-  auto endpoint = inverse_kinematics(name, state, {{tool, pose_at(1.)}}, false);
+  auto endpoint = inverse_kinematics(name, state, targets_at(1.), false);
   if (!endpoint.success) return endpoint;
   const auto first = positions(group, state);
   const auto last = endpoint.trajectory.points.back().positions;
@@ -114,9 +136,10 @@ PlanResult NativePlanner::interpolate_path(
   std::vector<float> p, q, seeds;
   for (int i = 0; i < count; ++i) {
     const double alpha = static_cast<double>(i) / (count - 1);
-    const Transform desired = pose_at(alpha);
+    const auto desired = targets_at(alpha);
     for (const auto &frame : group.tool_names) {
-      const auto &at = frame == tool ? desired : fixed.at(frame);
+      const auto found = desired.find(frame);
+      const auto &at = found == desired.end() ? fixed.at(frame) : found->second;
       Eigen::Quaterniond rotation(at.linear());
       for (int axis = 0; axis < 3; ++axis) p.push_back(at.translation()[axis]);
       q.insert(q.end(), {static_cast<float>(rotation.w()), static_cast<float>(rotation.x()),
@@ -156,7 +179,7 @@ PlanResult NativePlanner::interpolate_path(
     while (!pending.empty()) {
       const double alpha = pending.front();
       pending.pop_front();
-      auto step = inverse_kinematics(name, previous, {{tool, pose_at(alpha)}}, false);
+      auto step = inverse_kinematics(name, previous, targets_at(alpha), false);
       ++calls;
       bool valid = step.success;
       if (valid)
@@ -254,7 +277,7 @@ PlanResult NativePlanner::interpolate_path(
     }
     result.trajectory.points.push_back(std::move(point));
   }
-  double previous_along = -1.;
+  std::vector<double> previous_along(paths.size(), -1.);
   const double total = seconds(result.trajectory.points.back().time_from_start);
   const int samples = static_cast<int>(std::ceil(total / .02));
   for (int i = 0; i <= samples; ++i) {
@@ -267,17 +290,19 @@ PlanResult NativePlanner::interpolate_path(
       if (at.position[j] < lower || at.position[j] > upper)
         throw std::runtime_error("contact joint limit violation");
     }
-    const auto actual = robot_.tool(full, name);
-    const double along = progress(actual), alpha = along / length;
-    const auto projected = pose_at(alpha);
-    const Eigen::Quaterniond expected(pose_at(std::clamp(alpha, 0., 1.)).linear());
-    if ((actual.translation() - projected.translation()).norm() > tolerance || along < -.005 ||
-        along > length + .005 || along < previous_along - .005 ||
-        Eigen::Quaterniond(actual.linear())
-                .angularDistance(expected) >
-            settings.orientation_tolerance + .005)
-      throw std::runtime_error("contact interpolated spline deviates from Cartesian path");
-    previous_along = along;
+    const auto actual = robot_.forward(full);
+    for (size_t j = 0; j < paths.size(); ++j) {
+      const auto &path = paths[j];
+      const auto &pose = actual.at(path.tool);
+      const double along = path.progress(pose), alpha = along / path.length;
+      const auto projected = path.pose_at(alpha);
+      const Eigen::Quaterniond expected(path.pose_at(std::clamp(alpha, 0., 1.)).linear());
+      if ((pose.translation() - projected.translation()).norm() > path.tolerance || along < -.005 ||
+          along > path.length + .005 || along < previous_along[j] - .005 ||
+          Eigen::Quaterniond(pose.linear()).angularDistance(expected) > settings.orientation_tolerance + .005)
+        throw std::runtime_error("contact interpolated spline deviates from Cartesian path: " + path.tool);
+      previous_along[j] = along;
+    }
   }
   result.success = true;
   result.message = "contact IK interpolation";

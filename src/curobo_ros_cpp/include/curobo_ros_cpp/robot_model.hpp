@@ -88,7 +88,7 @@ class RobotModel {
   // 返回第一个碰撞对，无碰撞时返回空。
   std::optional<Collision> check(const JointMap &state, const std::string &group,
                                  bool environment = true, bool contact = false,
-                                 const std::optional<Payload> &payload = {}) const;
+                                 const Payloads &payloads = {}, const Payloads &grasp_targets = {}) const;
   // 返回与输入点一一对应的本体掩码，真表示落入运动连杆的膨胀几何。
   // padding 为膨胀距离，budget_ms 为处理预算。超时时保留已算掩码，未检查项为假。
   std::vector<bool> self_mask(const std::vector<Point> &points, const JointMap &state,

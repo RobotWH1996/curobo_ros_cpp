@@ -186,6 +186,26 @@ MPC 从第一条预测起要求点云持续更新，点云过期后退出跟随�
 
 ## 分开执行抓取、搬运和放置
 
+### 双臂同时抓取
+
+`/dual_pick` 使用 `curobo_ros_interfaces/action/DualPick`。Goal 中的 `left` 和 `right`
+都是 `PickTask`，`group_name` 分别为 `left_arm` 和 `right_arm`。每侧提供独立工件位姿、
+正尺寸、预抓取／抓取／抬升偏移和开闭目标。`waypoints` 与 `end_pose` 留空。
+
+`publish_trajectory: false` 返回可检查的完整轨迹。`publish_trajectory: true` 在部署模式下
+把通过验收的轨迹作为同一 UUID 的最终块交给执行桥接。Action 返回规划及提交结果，
+实测完成从同 UUID 的 `/inex/execution_status` 确认。两臂在抓取位停稳后一起闭爪，
+桥接等两侧新鲜夹爪反馈均到位后才执行抬升。
+
+```bash
+ros2 action send_goal /dual_pick curobo_ros_interfaces/action/DualPick "$(cat dual_pick_goal.yaml)" --feedback
+```
+
+现场确认夹持状态后，`/confirm_held_object_left` 和 `/confirm_held_object_right` 可分别用
+`std_srvs/srv/SetBool` 确认或清除本侧持物。`/confirm_held_object` 继续用于单工件任务。
+
+### 单独抓取
+
 单独执行 `/pick` 的轨迹并确认夹爪确实抓住工件后，调用：
 
 ```bash

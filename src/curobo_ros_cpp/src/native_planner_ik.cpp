@@ -195,7 +195,7 @@ PlanResult NativePlanner::inverse_kinematics(const std::string &name, const Join
     JointMap full = state;
     for (int j = 0; j < group.dof; ++j) full[group.names[j]] = solutions[seed * group.dof + j];
     if (collision) {
-      if (const auto hit = robot_.check(full, name, true, false, payload_)) {
+      if (const auto hit = robot_.check(full, name, true, false, payloads_)) {
         if (fcl_rejections++ == 0) first_collision = hit->message();
         continue;
       }

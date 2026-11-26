@@ -3,6 +3,7 @@
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
 #include <curobo_ros_interfaces/action/close_lever.hpp>
+#include <curobo_ros_interfaces/action/dual_pick.hpp>
 #include <curobo_ros_interfaces/action/follow_mpc.hpp>
 #include <curobo_ros_interfaces/action/pick.hpp>
 #include <curobo_ros_interfaces/action/pick_place.hpp>
@@ -138,6 +139,10 @@ class PlanningNode : public rclcpp::Node {
       const interfaces::action::CloseLever::Goal &goal, const std::string &task_id,
       const std::function<bool()> &stopped,
       const std::function<void(const std::string &, const std::string &)> &feedback);
+  interfaces::action::DualPick::Result dual_pick(
+      const interfaces::action::DualPick::Goal &goal, const std::string &task_id,
+      const std::function<bool()> &stopped,
+      const std::function<void(const std::string &, const std::string &, const std::string &)> &feedback);
   sensor_msgs::msg::PointCloud2::ConstSharedPtr select_cloud(CloudFreshness freshness,
                                                             bool require_cloud);
   const PreparedCloud &prepare_world(const std::string &group,
@@ -193,8 +198,8 @@ class PlanningNode : public rclcpp::Node {
   PointCloudMode pointcloud_mode_ = PointCloudMode::Optional;  // 启动时确定订阅和失败策略
   PointCloudSettings cloud_settings_;    // 裁剪范围、过滤模式、采样密度及点数上限
   PreparedCloud cached_cloud_;             // 上一帧已经写进求解器的点云
-  std::optional<Payload> pending_pick_;     // 单独抓取的规划结果，等待实机持物确认
-  std::optional<Payload> held_payload_;
+  Payloads pending_picks_;       // 已提交拾取的工件，等待确认
+  Payloads held_payloads_;
   std::optional<int64_t> payload_change_stamp_;
   std::map<std::string, std::set<std::string>> payload_pose_joints_;
   std::string cached_group_;               // 生成 cached_cloud_ 时的规划组

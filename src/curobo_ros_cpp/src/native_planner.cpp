@@ -205,7 +205,7 @@ NativePlanner::Group &NativePlanner::get(const std::string &name, bool mpc) {
   if (found == groups.end()) {
     auto group = create_group(name, mpc ? settings.mpc_knots : settings.knots, mpc);
     found = groups.emplace(name, std::move(group)).first;
-    if (payload_) set_payload(payload_);
+    if (!payloads_.empty()) set_payloads(payloads_);
   }
   return *found->second;
 }

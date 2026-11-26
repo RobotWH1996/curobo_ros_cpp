@@ -365,46 +365,69 @@ PlanningNode::PlanningNode(const rclcpp::NodeOptions &options)
       std::bind(&PlanningNode::compute_ik, this, std::placeholders::_1, std::placeholders::_2),
       rmw_qos_profile_services_default, callbacks_));
   using SetBool = std_srvs::srv::SetBool;
-  services_.push_back(create_service<SetBool>(
-      "confirm_held_object",
-      [this](const std::shared_ptr<SetBool::Request> request,
+  auto confirm_service = [&](const std::string &name, const std::string &group) {
+    services_.push_back(create_service<SetBool>(
+      name,
+      [this, group](const std::shared_ptr<SetBool::Request> request,
              std::shared_ptr<SetBool::Response> response) {
         std::unique_lock<std::mutex> lock(operation, std::try_to_lock);
         if (!lock.owns_lock() || busy_) {
           response->message = "planner busy";
           return;
         }
-        if (request->data && !pending_pick_ && !held_payload_) {
-          response->message = "no successful standalone pick to confirm";
+        if (group.empty() && pending_picks_.size() + held_payloads_.size() > 1) {
+          response->message = "use the per-arm held-object services for dual pick";
           return;
         }
-        const auto next = request->data ? (held_payload_ ? held_payload_ : pending_pick_)
-                                        : std::nullopt;
-        if (next.has_value() != held_payload_.has_value()) {
+        auto matches = [&](const Payload &object) { return group.empty() || object.group == group; };
+        Payloads next = held_payloads_;
+        if (request->data) {
+          for (const auto &object : pending_picks_) {
+            if (matches(object) && std::none_of(next.begin(), next.end(), [&](const Payload &held) {
+                  return held.group == object.group;
+                }))
+              next.push_back(object);
+          }
+          if (std::none_of(next.begin(), next.end(), matches)) {
+            response->message = "no successful standalone pick to confirm";
+            return;
+          }
+        } else {
+          next.erase(std::remove_if(next.begin(), next.end(), matches), next.end());
+        }
+        if (next.size() != held_payloads_.size()) {
           try {
-            planner->set_payload(next);
+            planner->set_payloads(next);
           } catch (const std::exception &error) {
-            planner->set_payload(held_payload_);
+            planner->set_payloads(held_payloads_);
             response->message = error.what();
             return;
           }
-          held_payload_ = next;
+          held_payloads_ = std::move(next);
           {
             std::lock_guard<std::mutex> guard(input_mutex_);
             payload_change_stamp_ = observe_input_clock();
           }
           cached_aligned_ = false;
         }
-        pending_pick_.reset();
+        pending_picks_.erase(std::remove_if(pending_picks_.begin(), pending_picks_.end(), matches),
+                             pending_picks_.end());
         response->success = true;
-        response->message = held_payload_ ? "holding " + held_payload_->group : "not holding";
+        std::vector<std::string> groups;
+        for (const auto &object : held_payloads_) groups.push_back(object.group);
+        response->message = groups.empty() ? "not holding" : "holding " + group_list(groups);
         RCLCPP_INFO(get_logger(), "【持物确认】%s", response->message.c_str());
       },
       rmw_qos_profile_services_default, callbacks_));
+  };
+  confirm_service("confirm_held_object", "");
+  confirm_service("confirm_held_object_left", "left_arm");
+  confirm_service("confirm_held_object_right", "right_arm");
   action_callbacks_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
   action_completion_timer_ = create_wall_timer(
       std::chrono::milliseconds(5), [this] { publish_action_completion(); }, action_callbacks_);
   add_action<interfaces::action::Pick>("pick");
+  add_action<interfaces::action::DualPick>("dual_pick");
   add_action<interfaces::action::Place>("place");
   add_action<interfaces::action::CloseLever>("close_lever");
   add_action<interfaces::action::CloseLever>("open_lever");
@@ -416,7 +439,7 @@ PlanningNode::PlanningNode(const rclcpp::NodeOptions &options)
               elapsed_ms(startup_time_));
   RCLCPP_INFO(get_logger(),
               "【规划节点 · 接口】服务 plan_pose_goal, plan_joint_goal, compute_ik ｜ "
-              "Action follow_mpc, pick, place, pick_place");
+              "Action follow_mpc, pick, dual_pick, place, pick_place");
   RCLCPP_INFO(get_logger(),
               "【规划节点 · 预热】OPT 初始化组 [%s] ｜ MPC 预热组 [%s] ｜ OPT 图搜索 %s",
               group_list(warm).c_str(), group_list(mpc_warm).c_str(), planner->settings.graph.c_str());
@@ -590,7 +613,7 @@ const PreparedCloud &PlanningNode::prepare_world(
     const std::string &group, const sensor_msgs::msg::PointCloud2::ConstSharedPtr &cloud) {
   if (!cloud) return cached_cloud_;
   const bool same_cloud = cached_aligned_ && cached_message_ == cloud && cached_group_ == group &&
-                          cached_payload_ == planner->payload().has_value() &&
+                          cached_payload_ == !planner->payloads().empty() &&
                           cached_generation_ == planner->world_generation();
   if (same_cloud) return cached_cloud_;
   const auto started = Clock::now();
@@ -603,21 +626,22 @@ const PreparedCloud &PlanningNode::prepare_world(
                             tf2::durationFromSec(.025)));
   const double tf_ms = elapsed_ms(started);
   JointMap captured_payload_joints;
-  if (held_payload_) {
+  if (!held_payloads_.empty()) {
     if (!capture) throw std::runtime_error("held-object filtering requires a pointcloud stamp");
     std::string missing;
     std::unique_lock<std::mutex> lock(input_mutex_);
     // A new cloud can arrive just before the joint sample that completes its bracket.
     const bool aligned = cloud_ready_.wait_for(lock, std::chrono::milliseconds(35), [&] {
       captured_payload_joints.clear();
-      for (const auto &name : payload_pose_joints_.at(held_payload_->group)) {
-        const auto position = joint_history_.position(name, capture);
-        if (!position) {
-          missing = name;
-          return false;
+      for (const auto &object : held_payloads_)
+        for (const auto &name : payload_pose_joints_.at(object.group)) {
+          const auto position = joint_history_.position(name, capture);
+          if (!position) {
+            missing = name;
+            return false;
+          }
+          captured_payload_joints.emplace(name, *position);
         }
-        captured_payload_joints.emplace(name, *position);
-      }
       return true;
     });
     if (!aligned)
@@ -652,15 +676,15 @@ const PreparedCloud &PlanningNode::prepare_world(
   auto prepared = prepare_cloud(*cloud, at, settings, *robot, filter_joints, group);
   if (prepared.points.empty() && prepared.removed.empty())
     throw std::runtime_error("pointcloud has no usable points inside planning bounds");
-  if (held_payload_) {
+  for (const auto &object : held_payloads_) {
     const Transform object_pose =
-        robot->tool(captured_payload_joints, held_payload_->group) * held_payload_->in_tool;
+        robot->tool(captured_payload_joints, object.group) * object.in_tool;
     const auto before = prepared.points.size();
-    prepared.points = exclude_box(prepared.points, object_pose, held_payload_->size);
+    prepared.points = exclude_box(prepared.points, object_pose, object.size);
     prepared.environment = settings.self_filter_mode == "observe"
-        ? exclude_box(prepared.environment, object_pose, held_payload_->size) : prepared.points;
+        ? exclude_box(prepared.environment, object_pose, object.size) : prepared.points;
     RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
-        "【持物滤除】%s ｜ 体素 %zu", held_payload_->group.c_str(), before - prepared.points.size());
+        "【持物滤除】%s ｜ 体素 %zu", object.group.c_str(), before - prepared.points.size());
   }
   for (const auto &publisher : self_filter_pubs_)
     if (publisher.second->get_subscription_count()) {
@@ -694,8 +718,10 @@ const PreparedCloud &PlanningNode::prepare_world(
       publisher.second->publish(message);
     }
   auto points = prepared.points;
-  const auto payload = planner->payload();
-  if (payload && !held_payload_) points = exclude_box(points, payload->source_pose, payload->size);
+  for (const auto &object : planner->payloads())
+    if (std::none_of(held_payloads_.begin(), held_payloads_.end(),
+                     [&](const Payload &held) { return held.group == object.group; }))
+      points = exclude_box(points, object.source_pose, object.size);
   const auto world_started = Clock::now();
   const auto previous_generation = planner->world_generation();
   planner->set_world(points, cloud_settings_.pitch, cloud_mode_, voxel_center_,
@@ -751,7 +777,7 @@ const PreparedCloud &PlanningNode::prepare_world(
   cached_group_ = group;
   cached_message_ = cloud;
   cached_aligned_ = filter_aligned && capture != 0;
-  cached_payload_ = planner->payload().has_value();
+  cached_payload_ = !planner->payloads().empty();
   cached_generation_ = planner->world_generation();
   return cached_cloud_;
 }
@@ -1293,12 +1319,27 @@ std::shared_ptr<typename Action::Result> PlanningNode::run_action(
     auto stopped = [&] { return cancelled() || elapsed_ms(started) >= timeout * 1000.; };
     outcome = move_lever(*goal, task_id, stopped, feedback);
   }
+  else if constexpr (std::is_same_v<Action, interfaces::action::DualPick>) {
+    auto stopped = [&] { return cancelled() || elapsed_ms(started) >= timeout * 1000.; };
+    auto report = [&](const std::string &stage, const std::string &group, const std::string &message) {
+      auto value = std::make_shared<typename Action::Feedback>();
+      value->stage = stage;
+      value->group_name = group;
+      value->message = message;
+      handle->publish_feedback(value);
+    };
+    auto dual = dual_pick(*goal, task_id, stopped, report);
+    if (!rclcpp::ok()) return nullptr;
+    return std::make_shared<typename Action::Result>(std::move(dual));
+  }
   else
     outcome = manipulate(&goal->pick, &goal->place, timeout, cancelled, feedback, started, task_id);
   auto result = std::make_shared<typename Action::Result>();
   result->success = outcome.success;
-  result->execution_requested = outcome.execution_requested;
-  result->execution_completed = outcome.execution_completed;
+  if constexpr (!std::is_same_v<Action, interfaces::action::DualPick>) {
+    result->execution_requested = outcome.execution_requested;
+    result->execution_completed = outcome.execution_completed;
+  }
   result->stage = outcome.stage;
   result->message = outcome.message;
   result->trajectory = std::move(outcome.trajectory);

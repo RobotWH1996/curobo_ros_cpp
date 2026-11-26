@@ -146,7 +146,7 @@ PlanResult NativePlanner::solve(Group &group, const JointMap &state,
             q.push_back(solutions[seed * group.dof + j]);
             full[group.names[j]] = q.back();
           }
-          if (const auto hit = robot_.check(full, group.name, true, false, payload_)) {
+          if (const auto hit = robot_.check(full, group.name, true, false, payloads_)) {
             if (first_collision.empty()) first_collision = hit->first + " 与 " + hit->second;
           } else {
             valid_goals.push_back(std::move(q));
@@ -250,7 +250,7 @@ PlanResult NativePlanner::solve(Group &group, const JointMap &state,
     JointMap endpoint = state;
     for (int j = 0; j < group.dof; ++j)
       endpoint[group.names[j]] = candidate.points.back().positions[j];
-    const auto check = robot_.check(endpoint, group.name, true, false, payload_);
+    const auto check = robot_.check(endpoint, group.name, true, false, payloads_);
     if (check) {
       reject(std::string(rrt_calls > 0 ? "RRT 找到了轨迹" : "直接优化找到了轨迹") +
              "，但在终点发现 " + check->first + " 与 " + check->second + " 发生碰撞。");
@@ -333,7 +333,7 @@ PlanResult NativePlanner::plan_joint(const std::string &name, const JointMap &st
     goal.push_back(target[i]);
   }
   PlanResult result;
-  const auto check = robot_.check(final, name, true, false, payload_);
+  const auto check = robot_.check(final, name, true, false, payloads_);
   if (check) {
     result.message = "到达目标时，" + check->first + " 会与 " + check->second + " 发生碰撞。";
     return result;
@@ -458,7 +458,7 @@ PlanResult NativePlanner::plan_pose_waypoints(
                         .angularDistance(Eigen::Quaterniond(tool.second.linear())) <=
                     settings.orientation_tolerance;
       if (!close) continue;
-      if (const auto hit = robot_.check(values, name, true, false, payload_)) {
+      if (const auto hit = robot_.check(values, name, true, false, payloads_)) {
         if (first_collision.empty()) first_collision = hit->message();
         continue;
       }
@@ -508,7 +508,8 @@ bool NativePlanner::gpu_valid(Group &group, const std::vector<std::vector<float>
 // 合并后的轨迹再查一遍限位和碰撞，接触段可以跳过环境。
 void NativePlanner::validate(const std::string &name, const JointMap &state,
                              const Trajectory &trajectory, bool collision,
-                             std::optional<double> velocity_scale, bool mesh_along_path) {
+                             std::optional<double> velocity_scale, bool mesh_along_path,
+                             const Payloads &grasp_targets) {
   synchronize(name, state);
   auto &group = get(name);
   const auto &arm = robot_.profile.groups.at(name);
@@ -551,7 +552,7 @@ void NativePlanner::validate(const std::string &name, const JointMap &state,
       for (size_t j = 0; j < columns.size(); ++j)
         mesh_state[group.names[j]] = value.position[columns[j]];
       for (const auto &[joint, column] : gripper_columns) mesh_state[joint] = value.position[column];
-      if (const auto hit = robot_.check(mesh_state, name, true, false, payload_))
+      if (const auto hit = robot_.check(mesh_state, name, true, false, payloads_, grasp_targets))
         throw MeshTrajectoryCollision("FCL trajectory collision | time=" +
                                       std::to_string(sample_time) + " s | " + hit->message());
     }

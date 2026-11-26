@@ -198,17 +198,17 @@ void NativePlanner::set_world(const std::vector<Point> &points, double pitch,
   rebuild_world();
 }
 // 更新手上的工件，并让碰撞世界跟着变。
-void NativePlanner::set_payload(const std::optional<Payload> &payload) {
-  payload_ = payload;
+void NativePlanner::set_payloads(const Payloads &payloads) {
+  payloads_ = payloads;
   auto apply = [&](auto &groups) {
     for (auto &entry : groups) {
       auto &group = *entry.second;
       for (const auto &side : {"left_arm", "right_arm"})
         group.planner->detach_object(robot_.profile.payload_link(side));
-      if (payload) {
+      for (const auto &payload : payloads_) {
         curobo::robot::SphereAttachment attachment;
-        attachment.link_name = robot_.profile.payload_link(payload->group);
-        const auto &value = payload->in_tool;
+        attachment.link_name = robot_.profile.payload_link(payload.group);
+        const auto &value = payload.in_tool;
         const Eigen::Quaterniond q(value.linear());
         attachment.object_in_link.position = {static_cast<float>(value.translation().x()),
                                               static_cast<float>(value.translation().y()),
@@ -216,7 +216,7 @@ void NativePlanner::set_payload(const std::optional<Payload> &payload) {
         attachment.object_in_link.quaternion = {
             static_cast<float>(q.w()), static_cast<float>(q.x()), static_cast<float>(q.y()),
             static_cast<float>(q.z())};
-        const auto cell = payload->size / 3.;
+        const auto cell = payload.size / 3.;
         const float radius = cell.norm() * .5 + .001;
         for (int x = 0; x < 3; ++x)
           for (int y = 0; y < 3; ++y)

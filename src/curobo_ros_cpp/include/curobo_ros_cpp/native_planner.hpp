@@ -155,10 +155,10 @@ class NativePlanner {
   const std::vector<Point> &world_points() const { return world_points_; }
   // 恢复快照里的点云和已放置物体，并重建 GPU 场景。
   void restore_world(const WorldState &state);
-  // 设置或清除手上的工件。空 optional 表示已经释放。
-  void set_payload(const std::optional<Payload> &payload);
+  // 按夹持臂设置携带工件。空数组表示已释放。
+  void set_payloads(const Payloads &payloads);
   // 返回当前携物配置的借用引用，生命周期随规划器。
-  const std::optional<Payload> &payload() const { return payload_; }
+  const Payloads &payloads() const { return payloads_; }
   // 规划到关节目标。target 按该组的活动关节顺序排列，state 提供全身起始位置。
   // attempts 是总尝试上限，结果包含轨迹、成功标志和阶段计时。
   PlanResult plan_joint(const std::string &group, const JointMap &state,
@@ -182,6 +182,7 @@ class NativePlanner {
   // 验收位置限位、关节连续性、动态限位及末端路径偏差，接触段跳过碰撞检查。
   PlanResult interpolate(const std::string &group, const JointMap &state, const Transform &start,
                          const Transform &end);
+  PlanResult interpolate_both(const JointMap &state, const std::map<std::string, Transform> &targets);
   PlanResult interpolate_arc(const std::string &group, const JointMap &state,
                              const Transform &start, const Eigen::Vector2d &center,
                              double sweep);
@@ -189,7 +190,7 @@ class NativePlanner {
   // 接触段传 false 时跳过碰撞，任一启用的检查失败即抛异常。
   void validate(const std::string &group, const JointMap &state, const Trajectory &trajectory,
                 bool collision = true, std::optional<double> velocity_scale = std::nullopt,
-                bool mesh_along_path = false);
+                bool mesh_along_path = false, const Payloads &grasp_targets = {});
   // 返回组内关节的执行限位。速度、加速度和 jerk 分别乘速度比例的一、二、三次方。
   DynamicLimits dynamic_limits(const std::string &group,
                                std::optional<double> velocity_scale = std::nullopt);
@@ -216,10 +217,16 @@ class NativePlanner {
   void reset_mpc();
 
  private:
-  PlanResult interpolate_path(const std::string &name, const JointMap &state, int required,
-                              double length, double tolerance,
-                              const std::function<Transform(double)> &pose_at,
-                              const std::function<double(const Transform &)> &progress);
+  struct ContactPath {
+    std::string tool;
+    double length, tolerance;
+    int samples;
+    std::function<Transform(double)> pose_at;
+    std::function<double(const Transform &)> progress;
+  };
+  ContactPath linear_contact(const std::string &tool, const Transform &start, const Transform &end) const;
+  PlanResult interpolate_path(const std::string &name, const JointMap &state,
+                              const std::vector<ContactPath> &paths);
   // 一个规划组的运行时。定义在私有头文件里，供规划器各实现文件共享。
   struct Group;
   // 从 artifacts/<group>/opt 或 mpc/<knots> 加载求解器、逆解和缓冲。
@@ -256,7 +263,7 @@ class NativePlanner {
   std::unique_ptr<curobo::robot::Scene> scene_;  // GPU 碰撞场景，各组共享
   std::map<std::string, std::unique_ptr<Group>> groups_;      // OPT 组
   std::map<std::string, std::unique_ptr<Group>> mpc_groups_;  // MPC 组
-  std::optional<Payload> payload_;  // 当前挂在工具上的工件，空表示未携带
+  Payloads payloads_;
   std::optional<curobo::robot::ObstacleHandle> world_;  // 当前点云障碍在场景中的句柄
   std::vector<Point> world_points_;  // 写入当前碰撞场景的基座系障碍点
   double world_pitch_ = 0.;  // 上次写入点云场景的体素边长，米

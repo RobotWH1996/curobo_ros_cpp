@@ -37,6 +37,22 @@ Trajectory without_wheel_joints(const Trajectory &trajectory) {
 struct ContactPath {
   Transform start, end;
 };
+struct RestoreWorld {
+  NativePlanner *planner;
+  Payloads payloads;
+  WorldState world;
+  rclcpp::Logger logger;
+  ~RestoreWorld() {
+    try {
+      planner->set_payloads(payloads);
+      planner->restore_world(world);
+    } catch (const std::exception &error) {
+      RCLCPP_ERROR(logger, "Failed to restore planning scene: %s", error.what());
+    } catch (...) {
+      RCLCPP_ERROR(logger, "Unknown error restoring planning scene");
+    }
+  }
+};
 }  // namespace
 // 抓取和放置都先规划非接触段，接触段用直线插补，再按夹爪停顿点分块提交。
 TaskResult PlanningNode::manipulate(
@@ -61,22 +77,7 @@ TaskResult PlanningNode::manipulate(
     open_task();
     RCLCPP_INFO(get_logger(), "──────── 任务结束 · %s · %s ────────", task_name, status);
   };
-  struct RestoreWorld {
-    NativePlanner *planner;
-    std::optional<Payload> payload;
-    WorldState world;
-    rclcpp::Logger logger;
-    ~RestoreWorld() {
-      try {
-        planner->set_payload(payload);
-        planner->restore_world(world);
-      } catch (const std::exception &error) {
-        RCLCPP_ERROR(logger, "Failed to restore planning scene: %s", error.what());
-      } catch (...) {
-        RCLCPP_ERROR(logger, "Unknown error restoring planning scene");
-      }
-    }
-  } restore{planner.get(), planner->payload(), planner->world_state(), get_logger()};
+  RestoreWorld restore{planner.get(), planner->payloads(), planner->world_state(), get_logger()};
   bool submitted = false;
   const bool external_stream = !execution->enabled() && !task_id.empty();
   uint32_t block_revision = 0;
@@ -105,7 +106,9 @@ TaskResult PlanningNode::manipulate(
     if (execution->active()) throw std::runtime_error("execution busy");
     execution->clear();
     const std::string group = pick ? pick->group_name : place->group_name;
-    if (held_payload_ && (pick || held_payload_->group != group))
+    const auto held = std::find_if(held_payloads_.begin(), held_payloads_.end(),
+                                   [&](const Payload &object) { return object.group == group; });
+    if (!held_payloads_.empty() && (pick || held == held_payloads_.end()))
       throw std::invalid_argument("release the confirmed held object before changing the pick arm");
     arm = arm_text(group);
     open_task();
@@ -203,15 +206,15 @@ TaskResult PlanningNode::manipulate(
       object.size = size(pick->object_size);
       object.in_tool = grasp.inverse() * reference;
       object.source_pose = reference;
-    } else if (held_payload_) {
-      object = *held_payload_;
+    } else if (held != held_payloads_.end()) {
+      object = *held;
     } else {
       const auto reference = in_base(place->tool_pose);
       const auto goal = compose(reference, place->place_pose, place->in_base_frame);
       object.size = size(place->object_size);
       object.in_tool = goal.inverse() * reference;
       object.source_pose = robot->tool(current, group) * object.in_tool;
-      planner->set_payload(object);
+      planner->set_payloads({object});
     }
     if (pick && !stop_at_pick) current[gripper] = pick->open_position;
     std::vector<std::pair<Transform, Eigen::Vector3d>> source_exclusions;
@@ -221,9 +224,8 @@ TaskResult PlanningNode::manipulate(
       auto points = frozen_cloud.points;
       for (const auto &exclusion : source_exclusions)
         points = exclude_box(points, exclusion.first, exclusion.second);
-      const auto payload = planner->payload();
-      if (payload && !held_payload_)
-        points = exclude_box(points, payload->source_pose, payload->size);
+      for (const auto &payload : planner->payloads())
+        if (held_payloads_.empty()) points = exclude_box(points, payload.source_pose, payload.size);
       planner->set_world(points, cloud_settings_.pitch, cloud_mode_, voxel_center_,
                          voxel_dimensions_);
     };
@@ -366,7 +368,10 @@ TaskResult PlanningNode::manipulate(
       result.trajectory = concatenate(completed);
       publish(group, initial, result.trajectory, !external_stream);
       if (external_stream) send_block(false, false);
-      if (completed.size() == 1 && !stop_at_pick) pending_pick_.reset();
+      if (completed.size() == 1 && !stop_at_pick)
+        pending_picks_.erase(std::remove_if(pending_picks_.begin(), pending_picks_.end(),
+                                           [&](const Payload &item) { return item.group == group; }),
+                             pending_picks_.end());
       execution->submit(group, result.trajectory, stopped);
       submitted = execution->enabled();
       RCLCPP_INFO(get_logger(), "【提交】第 %zu 块 ｜ 已等待 %.1f 毫秒", completed.size(),
@@ -407,7 +412,7 @@ TaskResult PlanningNode::manipulate(
       if (!stop_at_pick) {
         close(pick->close_position, "close");
         object.source_pose = robot->tool(current, group) * object.in_tool;
-        planner->set_payload(object);
+        planner->set_payloads({object});
         move(empty, "lift", true, lift);
         refresh_world();
         if (!pick->end_pose.type.empty()) move(pick->end_pose, "end", false, {});
@@ -427,7 +432,11 @@ TaskResult PlanningNode::manipulate(
       move(empty, "place", true, goal);
       close(place->open_position, "release");
       if (pick) source_exclusions.emplace_back(object.source_pose, object.size);
-      planner->set_payload({});
+      auto remaining = planner->payloads();
+      remaining.erase(std::remove_if(remaining.begin(), remaining.end(),
+                                     [&](const Payload &payload) { return payload.group == group; }),
+                      remaining.end());
+      planner->set_payloads(remaining);
       planner->add_placed_object(goal * object.in_tool, object.size);
       move(empty, "retreat", true, retreat);
       refresh_world();
@@ -444,7 +453,7 @@ TaskResult PlanningNode::manipulate(
       result.execution_completed = true;
     }
     result.success = true;
-    if (pick && !place && !stop_at_pick) pending_pick_ = object;
+    if (pick && !place && !stop_at_pick) pending_picks_ = {object};
 
     result.message = "planning success";
     RCLCPP_INFO(get_logger(),
@@ -460,6 +469,173 @@ TaskResult PlanningNode::manipulate(
     RCLCPP_ERROR(get_logger(), "【任务】失败 ｜ 阶段 %s ｜ 总耗时 %.1f 毫秒 ｜ 已提交 %s ｜ 错误：%s",
                  label.c_str(), elapsed_ms(started), submitted ? "是" : "否", result.message.c_str());
     close_task("失败");
+  }
+  return result;
+}
+
+interfaces::action::DualPick::Result PlanningNode::dual_pick(
+    const interfaces::action::DualPick::Goal &goal, const std::string &task_id,
+    const std::function<bool()> &stopped,
+    const std::function<void(const std::string &, const std::string &, const std::string &)> &feedback) {
+  interfaces::action::DualPick::Result result;
+  const std::string group = "both_arms";
+  const std::array<std::string, 2> sides{"left_arm", "right_arm"};
+  const std::array<const interfaces::msg::PickTask *, 2> tasks{&goal.left, &goal.right};
+  std::array<std::string, 2> grippers;
+  std::array<double, 2> open{}, close{};
+  std::map<std::string, Transform> prepicks, grasps, lifts;
+  Payloads objects;
+  auto check = [&] {
+    if (stopped()) throw std::runtime_error("dual pick cancelled or timed out");
+  };
+  auto stage = [&](const std::string &name, const std::string &side) {
+    result.stage = name;
+    result.failed_group = side;
+    check();
+    feedback(name, side, "planning");
+  };
+
+  try {
+    stage("prepare", group);
+    if (cloud_mode_ != "mesh") throw std::invalid_argument("dual pick requires pointcloud_collision=mesh");
+    if (execution->active() || (goal.publish_trajectory && execution->enabled()))
+      throw std::invalid_argument("dual pick publishing requires an idle SDK bridge mode");
+    if (!held_payloads_.empty()) throw std::invalid_argument("release carried objects before dual pick");
+    if (goal.publish_trajectory && !pending_picks_.empty())
+      throw std::invalid_argument("resolve pending held-object confirmation before publishing another dual pick");
+    for (size_t i = 0; i < sides.size(); ++i) {
+      const auto &side = sides[i];
+      const auto &task = *tasks[i];
+      result.failed_group = side;
+      if (task.group_name != side || !task.waypoints.empty() || !task.end_pose.type.empty() ||
+          !task.end_pose.joint_positions.empty() || !task.end_pose.pose.header.frame_id.empty())
+        throw std::invalid_argument("dual pick requires the fixed arm and empty waypoints/end_pose");
+      grippers[i] = robot->profile.grippers.at(side);
+      open[i] = task.open_position;
+      close[i] = task.close_position;
+      const auto [lower, upper] = robot->limits.at(grippers[i]);
+      if (!(open[i] >= lower && open[i] <= upper && close[i] >= lower && close[i] < open[i]))
+        throw std::invalid_argument("dual pick gripper targets must close within URDF limits");
+      const auto &tool = robot->profile.tools.at(side);
+      const auto reference = in_base(task.tool_pose);
+      const auto grasp = compose(reference, task.pick_pose, task.in_base_frame);
+      const auto prepick = compose(reference, task.prepick_in_target, task.in_base_frame);
+      const auto lift = compose(reference, task.lift_in_target, task.in_base_frame);
+      const double descent = (prepick.translation() - grasp.translation()).norm();
+      const double rise = (lift.translation() - grasp.translation()).norm();
+      if (descent < .001 || descent > .5 || rise < .001 || rise > .5)
+        throw std::invalid_argument("dual pick contact paths must be between 1mm and 0.5m");
+      const Eigen::Vector3d size(task.object_size.x, task.object_size.y, task.object_size.z);
+      if (!size.allFinite() || (size.array() <= 0.).any())
+        throw std::invalid_argument("dual pick requires three positive object dimensions per arm");
+      prepicks.emplace(tool, prepick);
+      grasps.emplace(tool, grasp);
+      lifts.emplace(tool, lift);
+      objects.push_back({side, size, grasp.inverse() * reference, reference});
+    }
+    if ((objects[0].source_pose.translation() - objects[1].source_pose.translation()).norm() < .001)
+      throw std::invalid_argument("dual pick requires two distinct objects");
+
+    stage("scene", group);
+    RestoreWorld restore{planner.get(), planner->payloads(), planner->world_state(), get_logger()};
+    const auto cloud = select_cloud(CloudFreshness::WaitForPickPlace, true);
+    check();
+    const auto initial = state(true);
+    auto current = initial;
+    auto points = prepare_world(group, cloud).points;
+    const auto &arm = robot->profile.groups.at(group);
+    auto names = robot->full_joint_names;
+    names.erase(std::remove_if(names.begin(), names.end(),
+                               [](const std::string &name) { return name.rfind("Wheel", 0) == 0; }),
+                names.end());
+    const auto dynamics = planner->dynamic_limits(group);
+
+    auto accept = [&](Trajectory trajectory, const Payloads &targets = {}) {
+      retime_dynamics(trajectory, arm, dynamics);
+      planner->validate(group, current, trajectory, true, std::nullopt, true, targets);
+      const auto &end = trajectory.points.back().positions;
+      for (size_t i = 0; i < names.size(); ++i) current[names[i]] = end[i];
+      result.trajectory_stages.push_back(result.stage);
+      result.trajectories.push_back(std::move(trajectory));
+    };
+    auto accept_arm = [&](PlanResult part, const Payloads &targets = {}) {
+      if (!part.success) throw std::runtime_error(part.message);
+      auto path = expand_trajectory(part.trajectory, names, current);
+      for (auto *point : {&path.points.front(), &path.points.back()}) {
+        point->velocities.assign(names.size(), 0.);
+        point->accelerations.assign(names.size(), 0.);
+      }
+      accept(std::move(path), targets);
+    };
+    auto move_grippers = [&](const std::array<double, 2> &targets, const Payloads &contact) {
+      double time = 0.;
+      for (size_t i = 0; i < grippers.size(); ++i)
+        if (std::abs(targets[i] - current.at(grippers[i])) > 1e-8) {
+          const auto [lower, upper] = robot->limits.at(grippers[i]);
+          time = std::max(time, robot->gripper_duration(grippers[i], upper, lower));
+        }
+      if (time == 0.) return;
+      auto path = gripper_trajectory(names, current, grippers[0], targets[0], time, planner->settings.dt);
+      overlay_gripper(path, grippers[1], current.at(grippers[1]), targets[1], time);
+      if (result.stage == "close") append_hold(path, parameter<double>("gripper_wait_time", 1.));
+      accept(std::move(path), contact);
+    };
+
+    stage("open", group);
+    move_grippers(open, {});
+    stage("prepick", group);
+    publish_goals("dual_prepick", prepicks);
+    accept_arm(planner->plan_pose(group, current, prepicks));
+
+    stage("descend", group);
+    // Only the intended jaw/object pair may touch; keep each target as a separate FCL box.
+    for (const auto &object : objects) points = exclude_box(points, object.source_pose, object.size);
+    planner->set_world(points, cloud_settings_.pitch, cloud_mode_, voxel_center_, voxel_dimensions_);
+    publish_goals("dual_pick", grasps);
+    accept_arm(planner->interpolate_both(current, grasps), objects);
+    stage("close", group);
+    move_grippers(close, objects);
+
+    stage("lift", group);
+    const auto grasp_state = robot->forward(current);
+    for (auto &object : objects)
+      object.in_tool = grasp_state.at(robot->profile.tools.at(object.group)).inverse() * object.source_pose;
+    planner->set_payloads(objects);
+    publish_goals("dual_lift", lifts);
+    accept_arm(planner->interpolate_both(current, lifts));
+
+    stage("validate", group);
+    result.trajectory = concatenate(result.trajectories);
+    validate_dynamics(result.trajectory, arm, dynamics);
+    if (result.trajectory.points.size() > 5000)
+      throw std::runtime_error("dual pick trajectory exceeds the bridge point capacity");
+    result.trajectory.header.frame_id = base;
+    result.trajectory.header.stamp = now();
+    publish(group, initial, result.trajectory, false);
+    check();
+    if (goal.publish_trajectory) {
+      const auto latest = state(true);
+      for (size_t i = 0; i < sides.size(); ++i)
+        if (std::abs(latest.at(grippers[i]) - initial.at(grippers[i])) > .0005)
+          throw std::runtime_error("gripper opening changed before publishing dual pick trajectory");
+      check();
+      interfaces::msg::TrajectoryBlock block;
+      block.task_id = task_id;
+      block.block_index = 1;
+      block.final = true;
+      block.trajectory = result.trajectory;
+      block_pub_->publish(block);
+      pending_picks_ = std::move(objects);
+      result.trajectory_published = true;
+    }
+    result.stage = "ready";
+    result.failed_group.clear();
+    result.success = true;
+    result.message = goal.publish_trajectory ? "dual pick submitted to bridge" : "dual pick plan ready";
+  } catch (const std::exception &error) {
+    result.message = error.what();
+    RCLCPP_ERROR(get_logger(), "【双臂抓取】失败 ｜ %s ｜ %s ｜ %s", result.stage.c_str(),
+                 result.failed_group.c_str(), result.message.c_str());
   }
   return result;
 }
@@ -481,7 +657,7 @@ TaskResult PlanningNode::move_lever(
     const std::string group = "left_arm";
     if (execution->active() || (goal.publish_trajectory && execution->enabled()))
       throw std::invalid_argument("lever motion requires an idle SDK bridge");
-    if (held_payload_)
+    if (!held_payloads_.empty())
       throw std::invalid_argument("release and clear the attached payload before moving the lever");
     if (goal.contact_start.header.frame_id != base)
       throw std::invalid_argument("lever contact and pivot must use the planning base frame");

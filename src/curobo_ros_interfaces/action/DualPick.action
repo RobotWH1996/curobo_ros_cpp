@@ -1,0 +1,19 @@
+curobo_ros_interfaces/PickTask left
+curobo_ros_interfaces/PickTask right
+# Planning timeout in seconds; zero uses the node default.
+float64 timeout
+# False returns the complete plan for inspection.
+bool publish_trajectory false
+---
+bool success
+bool trajectory_published
+string stage
+string failed_group
+string message
+trajectory_msgs/JointTrajectory trajectory
+trajectory_msgs/JointTrajectory[] trajectories
+string[] trajectory_stages
+---
+string stage
+string group_name
+string message

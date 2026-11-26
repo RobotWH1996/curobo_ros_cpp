@@ -137,7 +137,7 @@ PlanResult compact_detour(NativePlanner &planner, const RobotModel &robot,
     }
     return route;
   };
-  if (!planner.payload() && rotation_distance(start, goal) <= .10) {
+  if (planner.payloads().empty() && rotation_distance(start, goal) <= .10) {
     const auto points = suggest_mpc_detour(start.translation(), goal.translation(),
         robot.gripper_spheres(group, poses), planner.world_points(), pitch,
         planner.settings.mpc_collision_activation_distance);

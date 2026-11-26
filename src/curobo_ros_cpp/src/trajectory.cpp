@@ -43,27 +43,10 @@ void check_time(const Trajectory &trajectory) {
     previous = time;
   }
 }
-}  // namespace
-
-TrajectorySampler::TrajectorySampler(const Trajectory &trajectory) : tr(trajectory) {
-  if (tr.points.size() < 2) throw std::runtime_error("trajectory requires two points");
-}
-
-void TrajectorySampler::load_segment(double time) {
-  auto right = std::upper_bound(
-      tr.points.begin(), tr.points.end(), time,
-      [](double t, const auto &entry) { return t < seconds(entry.time_from_start); });
-  index = static_cast<size_t>(std::distance(tr.points.begin(), right));
-  index = std::clamp<size_t>(index, 1, tr.points.size() - 1) - 1;
-  const auto &first = tr.points[index];
-  const auto &last = tr.points[index + 1];
-  start = seconds(first.time_from_start);
-  end = seconds(last.time_from_start);
-  const double h = end - start;
-  if (!(h > 0.) || first.positions.size() != tr.joint_names.size() ||
-      last.positions.size() != tr.joint_names.size())
-    throw std::runtime_error("invalid trajectory layout or clock at " + std::to_string(time));
-  const auto n = tr.joint_names.size();
+void segment_coefficients(const trajectory_msgs::msg::JointTrajectoryPoint &first,
+                          const trajectory_msgs::msg::JointTrajectoryPoint &last, double h,
+                          Eigen::MatrixXd &coefficients) {
+  const auto n = first.positions.size();
   coefficients.setZero(n, 6);
   coefficients.col(0) = vector(first.positions);
   const bool have_v = first.velocities.size() == n && last.velocities.size() == n;
@@ -87,6 +70,28 @@ void TrajectorySampler::load_segment(double time) {
     }
   } else
     coefficients.col(1) = vector(last.positions) - vector(first.positions);
+}
+}  // namespace
+
+TrajectorySampler::TrajectorySampler(const Trajectory &trajectory) : tr(trajectory) {
+  if (tr.points.size() < 2) throw std::runtime_error("trajectory requires two points");
+}
+
+void TrajectorySampler::load_segment(double time) {
+  auto right = std::upper_bound(
+      tr.points.begin(), tr.points.end(), time,
+      [](double t, const auto &entry) { return t < seconds(entry.time_from_start); });
+  index = static_cast<size_t>(std::distance(tr.points.begin(), right));
+  index = std::clamp<size_t>(index, 1, tr.points.size() - 1) - 1;
+  const auto &first = tr.points[index];
+  const auto &last = tr.points[index + 1];
+  start = seconds(first.time_from_start);
+  end = seconds(last.time_from_start);
+  const double h = end - start;
+  if (!(h > 0.) || first.positions.size() != tr.joint_names.size() ||
+      last.positions.size() != tr.joint_names.size())
+    throw std::runtime_error("invalid trajectory layout or clock at " + std::to_string(time));
+  segment_coefficients(first, last, h, coefficients);
 }
 
 const TrajectorySample &TrajectorySampler::sample(double time) {
@@ -270,9 +275,10 @@ void append_hold(Trajectory &tr, double time) {
   insert_hold(tr, seconds(tr.points.back().time_from_start), time);
 }
 
-// 按固定步长采样，超出动态上限就失败。
-void validate_dynamics(const Trajectory &tr, const std::vector<std::string> &arm,
-                       const DynamicLimits &limits, double step) {
+namespace {
+template <class Check>
+void sample_dynamics(const Trajectory &tr, const std::vector<std::string> &arm,
+                     double step, Check check) {
   check_time(tr);
   const auto selected = columns(tr, arm);
   const auto end = seconds(tr.points.back().time_from_start);
@@ -283,20 +289,121 @@ void validate_dynamics(const Trajectory &tr, const std::vector<std::string> &arm
   TrajectorySampler sampler(tr);
   for (const double time : times) {
     const auto &value = sampler.sample(time);
-    for (size_t i = 0; i < selected.size(); ++i) {
-      const auto j = selected[i];
-      const auto verify = [&](const char *quantity, double measured, double limit) {
-        if (std::abs(measured) > limit * 1.015 + 1e-5)
-          throw std::runtime_error(std::string("trajectory ") + quantity + " limit exceeded " +
-                                   arm[i] + " | time=" + std::to_string(time) +
-                                   " s | value=" + std::to_string(measured) +
-                                   " | absolute_limit=" + std::to_string(limit));
-      };
-      verify("velocity", value.velocity[j], limits.velocity[i]);
-      verify("acceleration", value.acceleration[j], limits.acceleration[i]);
-      verify("jerk", value.jerk[j], limits.jerk[i]);
+    for (size_t i = 0; i < selected.size(); ++i)
+      check(time, i, value.velocity[selected[i]], value.acceleration[selected[i]], value.jerk[selected[i]]);
+  }
+}
+}  // namespace
+
+// 按固定步长采样，超出动态上限就失败。
+void validate_dynamics(const Trajectory &tr, const std::vector<std::string> &arm,
+                       const DynamicLimits &limits, double step) {
+  sample_dynamics(tr, arm, step, [&](double time, size_t i, double velocity, double acceleration,
+                                    double jerk) {
+    const auto verify = [&](const char *quantity, double measured, double limit) {
+      if (std::abs(measured) > limit * 1.015 + 1e-5)
+        throw std::runtime_error(std::string("trajectory ") + quantity + " limit exceeded " +
+                                 arm[i] + " | time=" + std::to_string(time) +
+                                 " s | value=" + std::to_string(measured) +
+                                 " | absolute_limit=" + std::to_string(limit));
+    };
+    verify("velocity", velocity, limits.velocity[i]);
+    verify("acceleration", acceleration, limits.acceleration[i]);
+    verify("jerk", jerk, limits.jerk[i]);
+  });
+}
+
+void stretch_trajectory(Trajectory &trajectory, double scale) {
+  for (auto &point : trajectory.points) {
+    point.time_from_start = duration(seconds(point.time_from_start) * scale);
+    for (auto &velocity : point.velocities) velocity /= scale;
+    for (auto &acceleration : point.accelerations) acceleration /= scale * scale;
+  }
+}
+
+namespace {
+// Derivatives in normalized segment time u. Each interval owns both endpoint extrema.
+std::array<double, 3> segment_dynamic_peaks(const Eigen::MatrixXd &c, size_t joint) {
+  const double velocity_start = c(joint, 1), acceleration_start = 2. * c(joint, 2),
+               jerk_start = 6. * c(joint, 3), jerk_linear = 24. * c(joint, 4),
+               jerk_quadratic = 60. * c(joint, 5);
+  const auto velocity = [&](double u) {
+    return (((jerk_quadratic / 12. * u + jerk_linear / 6.) * u + jerk_start / 2.) * u +
+            acceleration_start) * u + velocity_start;
+  };
+  const auto acceleration = [&](double u) {
+    return ((jerk_quadratic / 3. * u + jerk_linear / 2.) * u + jerk_start) * u + acceleration_start;
+  };
+  const auto jerk = [&](double u) { return (jerk_quadratic * u + jerk_linear) * u + jerk_start; };
+  double max_jerk = std::max(std::abs(jerk(0.)), std::abs(jerk(1.)));
+  if (jerk_quadratic != 0.) {
+    const double u = -jerk_linear / (2. * jerk_quadratic);
+    if (0. < u && u < 1.) max_jerk = std::max(max_jerk, std::abs(jerk(u)));
+  }
+
+  // Zeros of jerk split acceleration into monotone pieces and give its extrema.
+  std::array<double, 4> boundaries{0.};
+  size_t count = 1;
+  const auto add_root = [&](double u) {
+    if (0. < u && u < 1.) boundaries[count++] = u;
+  };
+  if (jerk_quadratic == 0.) {
+    if (jerk_linear != 0.) add_root(-jerk_start / jerk_linear);
+  } else {
+    const double discriminant = std::fma(-4. * jerk_quadratic, jerk_start, jerk_linear * jerk_linear);
+    if (discriminant >= 0.) {
+      const double numerator = -.5 * (jerk_linear + std::copysign(std::sqrt(discriminant), jerk_linear));
+      add_root(numerator / jerk_quadratic);
+      if (numerator != 0.) add_root(jerk_start / numerator);
     }
   }
+  if (count == 3 && boundaries[1] > boundaries[2]) std::swap(boundaries[1], boundaries[2]);
+  boundaries[count++] = 1.;
+  double max_acceleration = std::abs(acceleration(0.));
+  double max_velocity = std::abs(velocity(0.));
+  for (size_t i = 1; i < count; ++i) {
+    double left = boundaries[i - 1], right = boundaries[i];
+    const double a_left = acceleration(left), a_right = acceleration(right);
+    max_acceleration = std::max(max_acceleration, std::abs(a_right));
+    max_velocity = std::max(max_velocity, std::abs(velocity(right)));
+    if ((a_left < 0. && a_right > 0.) || (a_left > 0. && a_right < 0.)) {
+      // A zero of acceleration inside this interval is also a velocity extremum.
+      for (int iteration = 0; iteration < 40; ++iteration) {
+        const double middle = (left + right) / 2.;
+        if ((acceleration(middle) < 0.) == (a_left < 0.)) left = middle;
+        else right = middle;
+      }
+      max_velocity = std::max(max_velocity, std::abs(velocity((left + right) / 2.)));
+    }
+  }
+  return {max_velocity, max_acceleration, max_jerk};
+}
+}  // namespace
+
+double retime_dynamics(Trajectory &trajectory, const std::vector<std::string> &arm,
+                       const DynamicLimits &limits) {
+  check_time(trajectory);
+  const auto selected = columns(trajectory, arm);
+  double scale = 1.;
+  Eigen::MatrixXd coefficients;
+  for (size_t i = 1; i < trajectory.points.size(); ++i) {
+    const auto &first = trajectory.points[i - 1], &last = trajectory.points[i];
+    const double h = seconds(last.time_from_start) - seconds(first.time_from_start);
+    segment_coefficients(first, last, h, coefficients);
+    if (!coefficients.allFinite()) throw std::runtime_error("nonfinite trajectory polynomial");
+    for (size_t j = 0; j < selected.size(); ++j) {
+      const auto [velocity, acceleration, jerk] = segment_dynamic_peaks(coefficients, selected[j]);
+      scale = std::max({scale, velocity / limits.velocity[j] / h,
+                        std::sqrt(acceleration / limits.acceleration[j]) / h,
+                        std::cbrt(jerk / limits.jerk[j]) / h});
+    }
+  }
+  if (scale > 1.) {
+    // Timestamps are rounded to nanoseconds when stretched.
+    scale *= 1.01;
+    stretch_trajectory(trajectory, scale);
+  }
+  return scale;
 }
 
 namespace {

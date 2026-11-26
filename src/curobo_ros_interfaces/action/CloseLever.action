@@ -1,0 +1,22 @@
+# Contact point and desired tool orientation in the planning base frame.
+geometry_msgs/PoseStamped contact_start
+# Pivot XY in the same frame. Pivot Z is unused.
+geometry_msgs/Point pivot
+float64 sweep_rad
+geometry_msgs/Vector3 contact_in_ee
+float64 gripper_position
+# False computes a plan for inspection without publishing execution blocks.
+bool publish_trajectory
+float64 timeout
+---
+bool success
+bool execution_requested
+bool execution_completed
+string message
+string stage
+trajectory_msgs/JointTrajectory trajectory
+trajectory_msgs/JointTrajectory[] trajectories
+string[] trajectory_stages
+---
+string stage
+string message

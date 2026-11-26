@@ -2,6 +2,7 @@
 #pragma once
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
+#include <curobo_ros_interfaces/action/close_lever.hpp>
 #include <curobo_ros_interfaces/action/follow_mpc.hpp>
 #include <curobo_ros_interfaces/action/pick.hpp>
 #include <curobo_ros_interfaces/action/pick_place.hpp>
@@ -133,6 +134,10 @@ class PlanningNode : public rclcpp::Node {
   std::mutex parameter_mutex_;             // 保护参数的延迟声明
 
  private:
+  TaskResult move_lever(
+      const interfaces::action::CloseLever::Goal &goal, const std::string &task_id,
+      const std::function<bool()> &stopped,
+      const std::function<void(const std::string &, const std::string &)> &feedback);
   sensor_msgs::msg::PointCloud2::ConstSharedPtr select_cloud(CloudFreshness freshness,
                                                             bool require_cloud);
   const PreparedCloud &prepare_world(const std::string &group,

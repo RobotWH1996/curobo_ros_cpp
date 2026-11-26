@@ -406,6 +406,8 @@ PlanningNode::PlanningNode(const rclcpp::NodeOptions &options)
       std::chrono::milliseconds(5), [this] { publish_action_completion(); }, action_callbacks_);
   add_action<interfaces::action::Pick>("pick");
   add_action<interfaces::action::Place>("place");
+  add_action<interfaces::action::CloseLever>("close_lever");
+  add_action<interfaces::action::CloseLever>("open_lever");
   add_action<interfaces::action::PickPlace>("pick_place");
   add_action<interfaces::action::FollowMpc>("follow_mpc");
   RCLCPP_INFO(get_logger(),
@@ -1174,8 +1176,12 @@ template <class Action>
 void PlanningNode::add_action(const std::string &name) {
   actions_.push_back(rclcpp_action::create_server<Action>(
       this, name,
-      [this](const auto &, auto goal) {
+      [this, name](const auto &, auto goal) {
         if (!std::isfinite(goal->timeout)) return rclcpp_action::GoalResponse::REJECT;
+        if constexpr (std::is_same_v<Action, interfaces::action::CloseLever>) {
+          if (name == "open_lever" ? !(goal->sweep_rad < 0.) : !(goal->sweep_rad > 0.))
+            return rclcpp_action::GoalResponse::REJECT;
+        }
         if constexpr (!std::is_same_v<Action, interfaces::action::FollowMpc>) {
           if (goal->timeout < 0) return rclcpp_action::GoalResponse::REJECT;
           try {
@@ -1283,6 +1289,10 @@ std::shared_ptr<typename Action::Result> PlanningNode::run_action(
                          goal->stop_at_pick);
   else if constexpr (std::is_same_v<Action, interfaces::action::Place>)
     outcome = manipulate(nullptr, &goal->task, timeout, cancelled, feedback, started, task_id);
+  else if constexpr (std::is_same_v<Action, interfaces::action::CloseLever>) {
+    auto stopped = [&] { return cancelled() || elapsed_ms(started) >= timeout * 1000.; };
+    outcome = move_lever(*goal, task_id, stopped, feedback);
+  }
   else
     outcome = manipulate(&goal->pick, &goal->place, timeout, cancelled, feedback, started, task_id);
   auto result = std::make_shared<typename Action::Result>();

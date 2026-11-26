@@ -519,6 +519,13 @@ void NativePlanner::validate(const std::string &name, const JointMap &state,
     if (found == trajectory.joint_names.end()) throw std::runtime_error("validation joint missing");
     columns.push_back(found - trajectory.joint_names.begin());
   }
+  std::vector<std::pair<std::string, size_t>> gripper_columns;
+  if (collision)
+    for (const auto &[group_name, joint] : robot_.profile.grippers) {
+      const auto found = std::find(trajectory.joint_names.begin(), trajectory.joint_names.end(), joint);
+      if (found != trajectory.joint_names.end())
+        gripper_columns.emplace_back(joint, found - trajectory.joint_names.begin());
+    }
   std::vector<std::vector<float>> samples;
   const double end = seconds(trajectory.points.back().time_from_start);
   const int count = std::max(2, static_cast<int>(std::ceil(end / .005)) + 1);
@@ -543,6 +550,7 @@ void NativePlanner::validate(const std::string &name, const JointMap &state,
     if (collision && (mesh_along_path || i == 0 || i == count - 1)) {
       for (size_t j = 0; j < columns.size(); ++j)
         mesh_state[group.names[j]] = value.position[columns[j]];
+      for (const auto &[joint, column] : gripper_columns) mesh_state[joint] = value.position[column];
       if (const auto hit = robot_.check(mesh_state, name, true, false, payload_))
         throw MeshTrajectoryCollision("FCL trajectory collision | time=" +
                                       std::to_string(sample_time) + " s | " + hit->message());

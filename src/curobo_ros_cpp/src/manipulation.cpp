@@ -463,4 +463,139 @@ TaskResult PlanningNode::manipulate(
   }
   return result;
 }
+
+TaskResult PlanningNode::move_lever(
+    const interfaces::action::CloseLever::Goal &goal, const std::string &task_id,
+    const std::function<bool()> &stopped,
+    const std::function<void(const std::string &, const std::string &)> &feedback) {
+  TaskResult result;
+  const bool opening = goal.sweep_rad < 0.;
+  const std::string action = opening ? "open_lever" : "close_lever";
+  auto stage = [&](const std::string &name) {
+    if (stopped()) throw std::runtime_error("lever motion cancelled or timed out");
+    result.stage = name;
+    feedback(name, "planning");
+  };
+  try {
+    stage("prepare_" + action);
+    const std::string group = "left_arm";
+    if (execution->active() || (goal.publish_trajectory && execution->enabled()))
+      throw std::invalid_argument("lever motion requires an idle SDK bridge");
+    if (held_payload_)
+      throw std::invalid_argument("release and clear the attached payload before moving the lever");
+    if (goal.contact_start.header.frame_id != base)
+      throw std::invalid_argument("lever contact and pivot must use the planning base frame");
+    const auto contact = in_base(goal.contact_start);
+    const Eigen::Vector3d finger(goal.contact_in_ee.x, goal.contact_in_ee.y, goal.contact_in_ee.z);
+    const Eigen::Vector2d pivot(goal.pivot.x, goal.pivot.y);
+    const double radius = (contact.translation().head<2>() - pivot).norm();
+    if (!pivot.allFinite() || !finger.allFinite() || !(radius >= .03 && radius <= .12) ||
+        !(std::abs(goal.sweep_rad) <= std::acos(-1.)) ||
+        !(goal.gripper_position >= -.042 && goal.gripper_position <= 0.))
+      throw std::invalid_argument("invalid lever geometry or gripper position");
+
+    update_world(group, CloudFreshness::WaitForPickPlace, true);
+    const auto initial = state(true);
+    const auto gripper = robot->profile.grippers.at(group);
+    const double gripper_start = initial.at(gripper);
+    const bool move_gripper = gripper_start != goal.gripper_position;
+    const auto [closed, open] = robot->limits.at(gripper);
+    const double gripper_time = robot->gripper_duration(gripper, open, closed);
+    const auto &arm_joints = robot->profile.groups.at(group);
+    const auto limits = planner->dynamic_limits(group);
+    auto names = arm_joints;
+    names.push_back(gripper);
+    const Eigen::Vector3d shift = contact.linear() * finger;
+    Transform start = contact;
+    start.translation() -= shift;
+    Transform above = start;
+    above.translation().z() += .08;
+    const Eigen::Vector2d tcp_pivot = pivot - shift.head<2>();
+    const auto &tool = robot->profile.tools.at(group);
+
+    auto current = initial;
+    auto append = [&](PlanResult part, bool stop_at_ends = false) {
+      if (!part.success) throw std::runtime_error(part.message);
+      auto trajectory = expand_trajectory(part.trajectory, names, current);
+      if (stop_at_ends) {
+        for (auto *stop : {&trajectory.points.front(), &trajectory.points.back()}) {
+          stop->velocities.assign(names.size(), 0.);
+          stop->accelerations.assign(names.size(), 0.);
+        }
+      }
+      const auto before = seconds(trajectory.points.back().time_from_start);
+      if (retime_dynamics(trajectory, arm_joints, limits) > 1.)
+        RCLCPP_INFO(get_logger(), "【拨杆 · 分段定时】%s %.3f s → %.3f s", result.stage.c_str(),
+                    before, seconds(trajectory.points.back().time_from_start));
+      const auto &endpoint = trajectory.points.back().positions;
+      for (size_t i = 0; i < names.size(); ++i) current[names[i]] = endpoint[i];
+      result.trajectory_stages.push_back(result.stage);
+      result.trajectories.push_back(std::move(trajectory));
+    };
+
+    stage("approach_above_lever");
+    const auto current_tool = robot->tool(initial, group);
+    if ((current_tool.translation() - above.translation()).norm() > .001 ||
+        Eigen::Quaterniond(current_tool.linear()).angularDistance(Eigen::Quaterniond(above.linear())) > .01) {
+      append(planner->plan_pose(group, initial, {{tool, above}}), true);
+      auto &approach = result.trajectories.back();
+      if (move_gripper) {
+        const double scale = std::max(1., gripper_time / seconds(approach.points.back().time_from_start));
+        if (scale > 1.) stretch_trajectory(approach, scale);
+        // Close at the stationary approach endpoint, where the bridge waits for feedback.
+        overlay_gripper(approach, gripper, gripper_start, goal.gripper_position,
+                        seconds(approach.points.back().time_from_start));
+      }
+    } else if (move_gripper) {
+      result.trajectory_stages.push_back(result.stage);
+      result.trajectories.push_back(
+          gripper_trajectory(names, initial, gripper, goal.gripper_position, gripper_time,
+                             planner->settings.dt));
+    }
+    if (!result.trajectories.empty())
+      planner->validate(group, initial, result.trajectories.back(), /*collision=*/true,
+                        std::nullopt, /*mesh_along_path=*/true);
+    current[gripper] = goal.gripper_position;
+    stage("descend_to_lever");
+    append(planner->interpolate(group, current, above, start));
+
+    stage("sweep_" + action);
+    append(planner->interpolate_arc(group, current, start, tcp_pivot, goal.sweep_rad));
+
+    stage("lift_after_lever");
+    const auto lift_start = robot->tool(current, group);
+    auto lift_end = lift_start;
+    lift_end.translation().z() += .10;
+    append(planner->interpolate(group, current, lift_start, lift_end));
+
+    stage("validate_lever_trajectory");
+    result.trajectory = concatenate(result.trajectories);
+    // The approach is collision-checked above; preserve the accepted stage timings here.
+    planner->validate(group, initial, result.trajectory, /*collision=*/false);
+
+    stage(action + "_ready");
+    const auto latest = state(true);
+    if (std::abs(latest.at(gripper) - gripper_start) > .0005)
+      throw std::runtime_error("gripper opening changed before publishing lever trajectory");
+    publish(group, initial, result.trajectory, false);
+    if (stopped()) throw std::runtime_error("lever motion cancelled or timed out");
+    if (goal.publish_trajectory) {
+      interfaces::msg::TrajectoryBlock block;
+      block.task_id = task_id;
+      block.block_index = 1;
+      block.final = true;
+      result.trajectory.header.frame_id = base;
+      result.trajectory.header.stamp = now();
+      block.trajectory = result.trajectory;
+      block_pub_->publish(block);
+    }
+    result.success = true;
+    result.message = goal.publish_trajectory ? "lever trajectory published" : "lever plan ready";
+  } catch (const std::exception &error) {
+    result.message = error.what();
+    RCLCPP_ERROR(get_logger(), "【%s拨杆】失败 ｜ %s ｜ %s", opening ? "开" : "关",
+                 result.stage.c_str(), error.what());
+  }
+  return result;
+}
 }  // namespace curobo_ros_cpp

@@ -53,22 +53,60 @@ void NativePlanner::warmup_interpolation(const std::string &name, const std::vec
 // 沿工具直线采样逆解。这一段不查环境碰撞。
 PlanResult NativePlanner::interpolate(const std::string &name, const JointMap &state,
                                       const Transform &start, const Transform &end) {
+  const Eigen::Vector3d delta = end.translation() - start.translation();
+  const double length = delta.norm();
+  const Eigen::Quaterniond qa(start.linear()), qb(end.linear());
+  const int required = std::max({3, static_cast<int>(std::ceil(length / .005)) + 1,
+                                 static_cast<int>(std::ceil(qa.angularDistance(qb) / .03)) + 1});
+  const auto pose_at = [&](double alpha) {
+    Transform pose = Transform::Identity();
+    pose.translation() = start.translation() + alpha * delta;
+    pose.linear() = qa.slerp(alpha, qb).toRotationMatrix();
+    return pose;
+  };
+  const auto progress = [&](const Transform &pose) {
+    return (pose.translation() - start.translation()).dot(delta) / length;
+  };
+  const double tolerance =
+      settings.path_tolerance > 0. ? settings.path_tolerance : settings.position_tolerance;
+  return interpolate_path(name, state, required, length, tolerance, pose_at, progress);
+}
+
+PlanResult NativePlanner::interpolate_arc(const std::string &name, const JointMap &state,
+                                           const Transform &start, const Eigen::Vector2d &center,
+                                           double sweep) {
+  const Eigen::Vector2d radial = start.translation().head<2>() - center;
+  const double radius = radial.norm(), length = radius * std::abs(sweep);
+  const auto pose_at = [&](double alpha) {
+    Transform pose = start;
+    pose.translation().head<2>() = center + Eigen::Rotation2Dd(alpha * sweep) * radial;
+    return pose;
+  };
+  const Eigen::Vector2d middle = Eigen::Rotation2Dd(sweep / 2.) * radial;
+  const auto progress = [&](const Transform &pose) {
+    const Eigen::Vector2d at = pose.translation().head<2>() - center;
+    const double angle = std::atan2(middle.x() * at.y() - middle.y() * at.x(), middle.dot(at));
+    return (sweep / 2. + angle) * std::copysign(radius, sweep);
+  };
+  const int required = std::max(3, static_cast<int>(std::ceil(length / .005)) + 1);
+  return interpolate_path(name, state, required, length, .003, pose_at, progress);
+}
+
+PlanResult NativePlanner::interpolate_path(
+    const std::string &name, const JointMap &state, int required, double length, double tolerance,
+    const std::function<Transform(double)> &pose_at,
+    const std::function<double(const Transform &)> &progress) {
   const auto before = Clock::now();
   synchronize(name, state);
   auto &group = get(name);
   if (name == "both_arms")
     throw std::invalid_argument("Cartesian contact interpolation requires one arm");
   const auto tool = robot_.profile.tools.at(name);
-  const double distance = (end.translation() - start.translation()).norm();
-  const Eigen::Quaterniond qa(start.linear()), qb(end.linear());
-  const double angle = qa.angularDistance(qb);
-  const int required = std::max({3, static_cast<int>(std::ceil(distance / .005)) + 1,
-                                 static_cast<int>(std::ceil(angle / .03)) + 1});
-  if (required > Group::kIkBatchCapacity || distance < 1e-6)
+  if (required > Group::kIkBatchCapacity || length < 1e-6)
     throw std::invalid_argument("contact distance outside interpolation capacity");
   int count = 33;
   while (count < required) count = 2 * count - 1;
-  auto endpoint = inverse_kinematics(name, state, {{tool, end}}, false);
+  auto endpoint = inverse_kinematics(name, state, {{tool, pose_at(1.)}}, false);
   if (!endpoint.success) return endpoint;
   const auto first = positions(group, state);
   const auto last = endpoint.trajectory.points.back().positions;
@@ -76,9 +114,7 @@ PlanResult NativePlanner::interpolate(const std::string &name, const JointMap &s
   std::vector<float> p, q, seeds;
   for (int i = 0; i < count; ++i) {
     const double alpha = static_cast<double>(i) / (count - 1);
-    Transform desired = Transform::Identity();
-    desired.translation() = (1 - alpha) * start.translation() + alpha * end.translation();
-    desired.linear() = qa.slerp(alpha, qb).toRotationMatrix();
+    const Transform desired = pose_at(alpha);
     for (const auto &frame : group.tool_names) {
       const auto &at = frame == tool ? desired : fixed.at(frame);
       Eigen::Quaterniond rotation(at.linear());
@@ -120,10 +156,7 @@ PlanResult NativePlanner::interpolate(const std::string &name, const JointMap &s
     while (!pending.empty()) {
       const double alpha = pending.front();
       pending.pop_front();
-      Transform at = Transform::Identity();
-      at.translation() = (1 - alpha) * start.translation() + alpha * end.translation();
-      at.linear() = qa.slerp(alpha, qb).toRotationMatrix();
-      auto step = inverse_kinematics(name, previous, {{tool, at}}, false);
+      auto step = inverse_kinematics(name, previous, {{tool, pose_at(alpha)}}, false);
       ++calls;
       bool valid = step.success;
       if (valid)
@@ -222,8 +255,6 @@ PlanResult NativePlanner::interpolate(const std::string &name, const JointMap &s
     result.trajectory.points.push_back(std::move(point));
   }
   double previous_along = -1.;
-  const auto delta = end.translation() - start.translation();
-  const auto direction = delta.normalized();
   const double total = seconds(result.trajectory.points.back().time_from_start);
   const int samples = static_cast<int>(std::ceil(total / .02));
   for (int i = 0; i <= samples; ++i) {
@@ -237,14 +268,13 @@ PlanResult NativePlanner::interpolate(const std::string &name, const JointMap &s
         throw std::runtime_error("contact joint limit violation");
     }
     const auto actual = robot_.tool(full, name);
-    const Eigen::Vector3d offset = actual.translation() - start.translation();
-    const double along = offset.dot(direction);
-    const double lateral =
-        settings.path_tolerance > 0. ? settings.path_tolerance : settings.position_tolerance;
-    if ((offset - along * direction).norm() > lateral || along < -.005 ||
-        along > distance + .005 || along < previous_along - .005 ||
+    const double along = progress(actual), alpha = along / length;
+    const auto projected = pose_at(alpha);
+    const Eigen::Quaterniond expected(pose_at(std::clamp(alpha, 0., 1.)).linear());
+    if ((actual.translation() - projected.translation()).norm() > tolerance || along < -.005 ||
+        along > length + .005 || along < previous_along - .005 ||
         Eigen::Quaterniond(actual.linear())
-                .angularDistance(qa.slerp(std::clamp(along / distance, 0., 1.), qb)) >
+                .angularDistance(expected) >
             settings.orientation_tolerance + .005)
       throw std::runtime_error("contact interpolated spline deviates from Cartesian path");
     previous_along = along;

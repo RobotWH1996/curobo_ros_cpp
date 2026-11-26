@@ -74,6 +74,11 @@ BlendedTrajectory blend_trajectories(const std::vector<Trajectory> &segments,
 bool trajectory_needs_retiming(const Trajectory &trajectory,
                                const std::vector<std::string> &arm_joints,
                                const DynamicLimits &limits);
+// 等比例拉长时间并同步缩放导数，保持各关节的插值路径。
+void stretch_trajectory(Trajectory &trajectory, double scale);
+// 求每个插值区间的动态极值，超限时拉长时间，返回实际采用的倍数。
+double retime_dynamics(Trajectory &trajectory, const std::vector<std::string> &arm_joints,
+                       const DynamicLimits &limits);
 // 按 step 秒采样并检查 arm_joints 的动态上限。轨迹布局、时间或任一动态限位违规时抛异常。
 void validate_dynamics(const Trajectory &trajectory, const std::vector<std::string> &arm_joints,
                        const DynamicLimits &limits, double step = .005);

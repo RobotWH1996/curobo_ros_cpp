@@ -182,6 +182,9 @@ class NativePlanner {
   // 验收位置限位、关节连续性、动态限位及末端路径偏差，接触段跳过碰撞检查。
   PlanResult interpolate(const std::string &group, const JointMap &state, const Transform &start,
                          const Transform &end);
+  PlanResult interpolate_arc(const std::string &group, const JointMap &state,
+                             const Transform &start, const Eigen::Vector2d &center,
+                             double sweep);
   // 采样检查限位和 GPU 碰撞。FCL 默认检查端点，mesh_along_path 检查所有采样。
   // 接触段传 false 时跳过碰撞，任一启用的检查失败即抛异常。
   void validate(const std::string &group, const JointMap &state, const Trajectory &trajectory,
@@ -213,6 +216,10 @@ class NativePlanner {
   void reset_mpc();
 
  private:
+  PlanResult interpolate_path(const std::string &name, const JointMap &state, int required,
+                              double length, double tolerance,
+                              const std::function<Transform(double)> &pose_at,
+                              const std::function<double(const Transform &)> &progress);
   // 一个规划组的运行时。定义在私有头文件里，供规划器各实现文件共享。
   struct Group;
   // 从 artifacts/<group>/opt 或 mpc/<knots> 加载求解器、逆解和缓冲。

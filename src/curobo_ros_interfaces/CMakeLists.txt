@@ -15,6 +15,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/PlaceTask.msg"
   "action/Pick.action"
   "action/Place.action"
+  "action/CloseLever.action"
   "action/PickPlace.action"
   "msg/TrajectoryBlock.msg"
   "msg/JointWaypoint.msg"

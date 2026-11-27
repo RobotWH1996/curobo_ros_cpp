@@ -2,7 +2,9 @@
 // 回放记录的关节、TF 和点云，验证规划、抓放和 MPC 接口。
 #include <tf2_ros/static_transform_broadcaster.h>
 #include <std_srvs/srv/set_bool.hpp>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <thread>
@@ -64,8 +66,15 @@ int main(int argc, char **argv) {
   rclcpp::init(argc, argv);
   int status = 0;
   try {
-    const auto fixture = YAML::LoadFile("/tmp/curobo_cpp_20261112/case/case.yaml");
-    auto node = std::make_shared<PlanningNode>();
+    const char *directory = std::getenv("CUROBO_SNAPSHOT_DIR");
+    if (!directory || !*directory)
+      throw std::runtime_error("set CUROBO_SNAPSHOT_DIR to the case.yaml and cloud.bin directory");
+    const std::filesystem::path fixture_directory(directory);
+    const auto fixture = YAML::LoadFile((fixture_directory / "case.yaml").string());
+    rclcpp::NodeOptions options;
+    options.append_parameter_override("execute_trajectory", false);
+    options.append_parameter_override("pointcloud_prewarm", false);
+    auto node = std::make_shared<PlanningNode>(options);
     if (node->execution->enabled())
       throw std::runtime_error("validation requires execute_trajectory=false");
     std::cout << "READY_WALL_MS " << elapsed_ms(process) << std::endl;
@@ -95,7 +104,8 @@ int main(int argc, char **argv) {
       f.count = field["count"].as<uint32_t>();
       cloud.fields.push_back(f);
     }
-    std::ifstream bytes("/tmp/curobo_cpp_20261112/case/cloud.bin", std::ios::binary);
+    std::ifstream bytes(fixture_directory / "cloud.bin", std::ios::binary);
+    if (!bytes) throw std::runtime_error("snapshot cloud.bin cannot be opened");
     cloud.data = {std::istreambuf_iterator<char>(bytes), std::istreambuf_iterator<char>()};
     geometry_msgs::msg::TransformStamped tf;
     auto t = captured["cloud_tf"];
@@ -150,8 +160,12 @@ int main(int argc, char **argv) {
       place.retreat_in_target = read_pose(fixture["place"]["retreat_in_target"]);
       auto joint_map = node->state();
       auto gpu_fk = node->planner->forward("left_arm", joint_map);
-      const auto artifact = YAML::LoadFile(
-          "/home/ai/wh/curobo_ros_cpp/artifacts/left_arm/16/robot_kinematics_manifest.json");
+      const std::filesystem::path artifacts(node->get_parameter("artifacts_directory").as_string());
+      const auto knots = std::to_string(node->get_parameter("trajopt_num_control_points").as_int());
+      const auto group = artifacts / "left_arm";
+      const auto role = group / "opt" / knots;
+      const auto path = std::filesystem::exists(role) ? role : group / knots;
+      const auto artifact = YAML::LoadFile((path / "robot_kinematics_manifest.json").string());
       const auto tools = strings(artifact["tool_frames"]);
       const auto cpu_fk = node->robot->forward(joint_map);
       for (size_t i = 0; i < tools.size(); ++i) {

@@ -41,19 +41,42 @@ struct ContactPath {
 };
 struct RestoreWorld {
   NativePlanner *planner;
-  Payloads payloads;
-  WorldState world;
   rclcpp::Logger logger;
-  ~RestoreWorld() {
+  Payloads payloads;
+  std::optional<WorldState> world;
+  uint64_t generation = 0;
+  bool payloads_changed = false;
+
+  void capture() {
+    payloads = planner->payloads();
+    world = planner->world_state();
+    generation = planner->world_generation();
+  }
+
+  void set_payloads(const Payloads &value) {
+    payloads_changed = true;
+    planner->set_payloads(value);
+  }
+
+  double finish() noexcept {
+    if (!world) return 0.;
+    auto previous = std::move(world);
+    world.reset();
+    const bool world_changed = planner->world_generation() != generation;
+    if (!payloads_changed && !world_changed) return 0.;
+    const auto started = Clock::now();
     try {
-      planner->set_payloads(payloads);
-      planner->restore_world(world);
+      if (payloads_changed) planner->set_payloads(payloads);
+      if (world_changed) planner->restore_world(*previous);
     } catch (const std::exception &error) {
       RCLCPP_ERROR(logger, "Failed to restore planning scene: %s", error.what());
     } catch (...) {
       RCLCPP_ERROR(logger, "Unknown error restoring planning scene");
     }
+    return elapsed_ms(started);
   }
+
+  ~RestoreWorld() { finish(); }
 };
 }  // namespace
 // 抓取和放置都先规划非接触段，接触段用直线插补，再按夹爪停顿点分块提交。
@@ -79,7 +102,7 @@ TaskResult PlanningNode::manipulate(
     open_task();
     RCLCPP_INFO(get_logger(), "──────── 任务结束 · %s · %s ────────", task_name, status);
   };
-  RestoreWorld restore{planner.get(), planner->payloads(), planner->world_state(), get_logger()};
+  RestoreWorld restore{planner.get(), get_logger(), {}, std::nullopt};
   bool submitted = false;
   const bool external_stream = !execution->enabled() && !task_id.empty();
   uint32_t block_revision = 0;
@@ -196,18 +219,23 @@ TaskResult PlanningNode::manipulate(
     }
     const auto cloud = select_cloud(CloudFreshness::WaitForPickPlace, true);
     check();
+    const auto &frozen_cloud = prepare_world(group, cloud);
+    restore.capture();
+    check();
     const auto initial = state(true);
     auto current = initial;
     if (place && std::abs(place->open_position - (pick ? pick->close_position : initial.at(gripper))) < 1e-6)
       throw std::invalid_argument("place release equals initial gripping position");
     planner->synchronize(group, current);
     const auto dynamic = planner->dynamic_limits(group);
+    std::optional<Transform> cloud_source_pose;
     if (pick) {
       const auto reference = in_base(pick->tool_pose);
       const auto grasp = compose(reference, pick->pick_pose, pick->in_base_frame);
       object.size = size(pick->object_size);
       object.in_tool = grasp.inverse() * reference;
       object.source_pose = reference;
+      if (cloud) cloud_source_pose = reference;
     } else if (held != held_payloads_.end()) {
       object = *held;
     } else {
@@ -216,21 +244,19 @@ TaskResult PlanningNode::manipulate(
       object.size = size(place->object_size);
       object.in_tool = goal.inverse() * reference;
       object.source_pose = robot->tool(current, group) * object.in_tool;
-      planner->set_payloads({object});
+      if (cloud) cloud_source_pose = object.source_pose;
+      restore.set_payloads({object});
     }
     if (pick && !stop_at_pick) current[gripper] = pick->open_position;
-    std::vector<std::pair<Transform, Eigen::Vector3d>> source_exclusions;
-    const auto &frozen_cloud = prepare_world(group, cloud);
-    // 抬升或撤退后，用冻结点云去掉已处理物体并刷新碰撞场景。
+    // 冻结点云里的工件位置不随手臂移动，已确认携物在取帧时已扣除。
     auto refresh_world = [&]() {
-      auto points = frozen_cloud.points;
-      for (const auto &exclusion : source_exclusions)
-        points = exclude_box(points, exclusion.first, exclusion.second);
-      for (const auto &payload : planner->payloads())
-        if (held_payloads_.empty()) points = exclude_box(points, payload.source_pose, payload.size);
+      const auto points = cloud_source_pose
+          ? exclude_box(frozen_cloud.points, *cloud_source_pose, object.size)
+          : frozen_cloud.points;
       planner->set_world(points, cloud_settings_.pitch, cloud_mode_, voxel_center_,
                          voxel_dimensions_);
     };
+    if (!pick && cloud_source_pose) refresh_world();
     std::vector<Trajectory> pending, completed;
     std::vector<bool> contacts;
     std::vector<ContactPath> contact_paths;
@@ -295,6 +321,7 @@ TaskResult PlanningNode::manipulate(
     auto arm_block = [&]() {
       if (pending.empty()) return Trajectory{};
       const auto before = Clock::now();
+      const auto requested_stage = result.stage;
       const auto &arm_joints = robot->profile.groups.at(group);
       const size_t deadline_index =
           std::find(contacts.begin(), contacts.end(), true) - contacts.begin();
@@ -392,6 +419,7 @@ TaskResult PlanningNode::manipulate(
         apply_opening(unblended);
         verify_block(unblended, validation_ms, contact_fk_ms);
         merged = std::move(unblended);
+        result.stage = requested_stage;
       }
       opening = false;
       result.trajectories.push_back(without_wheel_joints(merged.trajectory));
@@ -420,7 +448,8 @@ TaskResult PlanningNode::manipulate(
       check();
       completed.push_back(without_wheel_joints(chunk));
       result.trajectory = concatenate(completed);
-      publish(group, initial, result.trajectory, !external_stream);
+      if (completed.size() == 1) validate_start(initial, result.trajectory);
+      publish(group, initial, result.trajectory, !execution->enabled() && !external_stream);
       if (external_stream) send_block(false, false);
       if (completed.size() == 1 && !stop_at_pick)
         pending_picks_.erase(std::remove_if(pending_picks_.begin(), pending_picks_.end(),
@@ -473,7 +502,7 @@ TaskResult PlanningNode::manipulate(
       if (!stop_at_pick) {
         close(pick->close_position, "close");
         object.source_pose = robot->tool(current, group) * object.in_tool;
-        planner->set_payloads({object});
+        restore.set_payloads({object});
         move(empty, "lift", true, lift);
         refresh_world();
         if (!pick->end_pose.type.empty()) move(pick->end_pose, "end", false, {});
@@ -492,12 +521,11 @@ TaskResult PlanningNode::manipulate(
       move(empty, "preplace", false, preplace);
       move(empty, "place", true, goal);
       close(place->open_position, "release");
-      if (pick) source_exclusions.emplace_back(object.source_pose, object.size);
       auto remaining = planner->payloads();
       remaining.erase(std::remove_if(remaining.begin(), remaining.end(),
                                      [&](const Payload &payload) { return payload.group == group; }),
                       remaining.end());
-      planner->set_payloads(remaining);
+      restore.set_payloads(remaining);
       planner->add_placed_object(goal * object.in_tool, object.size);
       move(empty, "retreat", true, retreat);
       refresh_world();
@@ -516,16 +544,18 @@ TaskResult PlanningNode::manipulate(
     result.success = true;
     if (pick && !place && !stop_at_pick) pending_picks_ = {object};
 
+    const double restore_ms = restore.finish();
     result.message = "planning success";
     RCLCPP_INFO(get_logger(),
-                "【任务】成功 ｜ 规划 %.1f 毫秒 ｜ 总耗时 %.1f 毫秒 ｜ points %zu ｜ 时长 %.3f 秒 ｜ 分块 %zu",
-                planning_ms, elapsed_ms(started), result.trajectory.points.size(),
+                "【任务】成功 ｜ 规划 %.1f 毫秒 ｜ 总耗时 %.1f 毫秒 ｜ 场景恢复 %.1f 毫秒 ｜ points %zu ｜ 时长 %.3f 秒 ｜ 分块 %zu",
+                planning_ms, elapsed_ms(started), restore_ms, result.trajectory.points.size(),
                 seconds(result.trajectory.points.back().time_from_start), completed.size());
     close_task("成功");
   } catch (const std::exception &error) {
     result.message = cancelled() ? "Action cancelled" : timed_out() ? "Action timeout" : error.what();
     if (block_revision && external_stream) send_block(true, true);
     if (submitted) execution->cancel();
+    restore.finish();
     const auto label = stage_text(result.stage);
     RCLCPP_ERROR(get_logger(), "【任务】失败 ｜ 阶段 %s ｜ 总耗时 %.1f 毫秒 ｜ 已提交 %s ｜ 错误：%s",
                  label.c_str(), elapsed_ms(started), submitted ? "是" : "否", result.message.c_str());
@@ -598,12 +628,14 @@ interfaces::action::DualPick::Result PlanningNode::dual_pick(
       throw std::invalid_argument("dual pick requires two distinct objects");
 
     stage("scene", group);
-    RestoreWorld restore{planner.get(), planner->payloads(), planner->world_state(), get_logger()};
+    RestoreWorld restore{planner.get(), get_logger(), {}, std::nullopt};
     const auto cloud = select_cloud(CloudFreshness::WaitForPickPlace, true);
+    check();
+    auto points = prepare_world(group, cloud).points;
+    restore.capture();
     check();
     const auto initial = state(true);
     auto current = initial;
-    auto points = prepare_world(group, cloud).points;
     const auto &arm = robot->profile.groups.at(group);
     auto names = robot->full_joint_names;
     names.erase(std::remove_if(names.begin(), names.end(),
@@ -661,7 +693,7 @@ interfaces::action::DualPick::Result PlanningNode::dual_pick(
     const auto grasp_state = robot->forward(current);
     for (auto &object : objects)
       object.in_tool = grasp_state.at(robot->profile.tools.at(object.group)).inverse() * object.source_pose;
-    planner->set_payloads(objects);
+    restore.set_payloads(objects);
     publish_goals("dual_lift", lifts);
     accept_arm(planner->interpolate_both(current, lifts));
 
@@ -675,10 +707,7 @@ interfaces::action::DualPick::Result PlanningNode::dual_pick(
     publish(group, initial, result.trajectory, false);
     check();
     if (goal.publish_trajectory) {
-      const auto latest = state(true);
-      for (size_t i = 0; i < sides.size(); ++i)
-        if (std::abs(latest.at(grippers[i]) - initial.at(grippers[i])) > .0005)
-          throw std::runtime_error("gripper opening changed before publishing dual pick trajectory");
+      validate_start(initial, result.trajectory, .0005);
       check();
       interfaces::msg::TrajectoryBlock block;
       block.task_id = task_id;
@@ -828,12 +857,10 @@ TaskResult PlanningNode::move_lever(
     }
 
     stage(action + "_ready");
-    const auto latest = state(true);
-    if (std::abs(latest.at(gripper) - gripper_start) > .0005)
-      throw std::runtime_error("gripper opening changed before publishing lever trajectory");
     publish(group, initial, result.trajectory, false);
     if (stopped()) throw std::runtime_error("lever motion cancelled or timed out");
     if (goal.publish_trajectory) {
+      validate_start(initial, result.trajectory, .0005);
       interfaces::msg::TrajectoryBlock block;
       block.task_id = task_id;
       block.block_index = 1;

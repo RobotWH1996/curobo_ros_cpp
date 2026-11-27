@@ -63,6 +63,9 @@ class Executor {
   std::vector<Goal> send(const std::vector<std::pair<std::string, Trajectory>> &trajectories,
                          rclcpp::Time origin, rclcpp::Time deadline,
                          const std::function<bool()> &cancelled);
+  static bool results_complete(const std::vector<Goal> &goals);
+  void wait_results(const std::vector<Goal> &goals, const std::function<bool()> &cancelled,
+                    const char *timeout_message);
   // 按话题名复用动作客户端，避免每次提交都重新创建。
   rclcpp_action::Client<Follow>::SharedPtr client(const std::string &topic);
 

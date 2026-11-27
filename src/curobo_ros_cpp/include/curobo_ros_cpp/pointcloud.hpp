@@ -53,6 +53,9 @@ PreparedCloud prepare_cloud(const sensor_msgs::msg::PointCloud2 &message, const 
 curobo::robot::Mesh voxel_mesh(const std::vector<Point> &points, double pitch);
 // 返回与 voxel_mesh 对应的去重占用体素中心，用于 FCL 盒子树碰撞检查。
 std::vector<Eigen::Vector3d> voxel_centers(const std::vector<Point> &points, double pitch);
+// 原点和占据格都相同时，两个点集生成相同的网格和碰撞盒。
+bool same_voxel_occupancy(const std::vector<Point> &first, const std::vector<Point> &second,
+                          double pitch);
 // 在 center 和 dimensions 指定的基座系范围构建带符号的欧氏距离场。
 // pitch 是分辨率，输出按 x、y、z 顺序展平，z 最快。占用体素为负，空场返回 5 米。
 // 栅格尺寸无效或容量超限时抛异常。

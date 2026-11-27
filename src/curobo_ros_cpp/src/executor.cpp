@@ -210,16 +210,7 @@ void Executor::submit(const std::string &group, const Trajectory &cumulative,
     if (node_.now() >= boundary) {
       const auto preceding = goals_;
       guard.unlock();
-      const auto started = Clock::now();
-      for (const auto &goal : preceding) {
-        wait_ready([&](auto interval) { return goal.result.wait_for(interval) == std::future_status::ready; },
-                   timeout_ - elapsed_ms(started) / 1000., cancelled,
-                   "previous execution result timeout");
-        const auto result = goal.result.get();
-        if (result.code != rclcpp_action::ResultCode::SUCCEEDED || !result.result ||
-            result.result->error_code != 0)
-          throw std::runtime_error("previous execution failed");
-      }
+      wait_results(preceding, cancelled, "previous execution result timeout");
       guard.lock();
       offset = seconds(previous_.points.back().time_from_start);
       origin = node_.now() + rclcpp::Duration(duration(kCommandLead)) -
@@ -253,11 +244,47 @@ void Executor::submit(const std::string &group, const Trajectory &cumulative,
         origin_ + rclcpp::Duration(duration(
                       std::max(0., seconds(previous_.points.back().time_from_start) - .05)));
     if (boundary < deadline) deadline = boundary;
+    try {
+      results_complete(goals_);
+    } catch (...) {
+      guard.unlock();
+      cancel();
+      throw;
+    }
   }
   goals_ = send(goals, stamp, deadline, cancelled);
   origin_ = origin;
   trajectory_offset_ = offset;
   previous_ = cumulative;
+}
+bool Executor::results_complete(const std::vector<Goal> &goals) {
+  bool complete = true;
+  for (const auto &goal : goals) {
+    if (goal.result.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
+      complete = false;
+      continue;
+    }
+    const auto &result = goal.result.get();
+    if (result.code != rclcpp_action::ResultCode::SUCCEEDED || !result.result ||
+        result.result->error_code != 0)
+      throw std::runtime_error("controller execution failed: " + goal.controller);
+  }
+  return complete;
+}
+
+void Executor::wait_results(const std::vector<Goal> &goals, const std::function<bool()> &cancelled,
+                            const char *timeout_message) {
+  if (goals.empty()) return;
+  try {
+    wait_ready([&](auto interval) {
+      if (results_complete(goals)) return true;
+      std::this_thread::sleep_for(interval);
+      return false;
+    }, timeout_, cancelled, timeout_message);
+  } catch (...) {
+    cancel();
+    throw;
+  }
 }
 // 等到控制器结束，或调用方取消。
 void Executor::wait(const std::function<bool()> &cancelled) {
@@ -266,20 +293,7 @@ void Executor::wait(const std::function<bool()> &cancelled) {
     std::lock_guard<std::mutex> guard(mutex_);
     goals = goals_;
   }
-  const auto start = Clock::now();
-  try {
-    for (const auto &goal : goals) {
-      wait_ready([&](auto interval) { return goal.result.wait_for(interval) == std::future_status::ready; },
-                 timeout_ - elapsed_ms(start) / 1000., cancelled, "execution result timeout");
-      const auto result = goal.result.get();
-      if (result.code != rclcpp_action::ResultCode::SUCCEEDED || !result.result ||
-          result.result->error_code != 0)
-        throw std::runtime_error("controller execution failed");
-    }
-  } catch (...) {
-    cancel();
-    throw;
-  }
+  wait_results(goals, cancelled, "execution result timeout");
 }
 // 取消尚未完成的控制器目标。
 void Executor::cancel() noexcept {

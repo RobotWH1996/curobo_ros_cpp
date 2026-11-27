@@ -3,13 +3,92 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Iterator
 import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import stat
 import subprocess
 import sys
+from typing import Any
 import xml.etree.ElementTree as ET
+
+
+def file_hash(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open('rb') as stream:
+        for block in iter(lambda: stream.read(1 << 20), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def robot_assets(kinematics: dict[str, Any], assets: Path, configs: Path) -> tuple[Path, dict[str, str | None]]:
+    asset_base = Path(kinematics.get('external_asset_path') or assets)
+    urdf = asset_base / kinematics['urdf_path']
+    mesh_base = asset_base / kinematics['asset_root_path'] if kinematics.get('asset_root_path') else urdf.parent
+    hashes: dict[str, str | None] = {'urdf': file_hash(urdf)}
+    spheres = kinematics.get('collision_spheres')
+    if isinstance(spheres, str):
+        sphere_base = Path(kinematics.get('external_robot_configs_path') or configs)
+        hashes['collision_spheres'] = file_hash(sphere_base / spheres)
+    for name in sorted({mesh.attrib['filename'] for mesh in ET.parse(urdf).getroot().iter('mesh')}):
+        mesh_path = mesh_base / name.replace('package://', '')
+        # Kinematics-only exports may carry URDF references to absent visual meshes.
+        hashes[f'mesh:{name}'] = file_hash(mesh_path) if mesh_path.is_file() else None
+    return urdf, hashes
+
+
+def manifest_files(value: Any) -> Iterator[tuple[str, int | None]]:
+    if isinstance(value, dict):
+        if 'file' in value:
+            yield value['file'], value['bytes']
+        if 'cubin' in value:
+            yield value['cubin'], None
+            if value.get('source') == 'curobo_python_warp_kernel':
+                yield str(Path(value['cubin']).with_suffix('.warp_meta.json')), None
+        for item in value.values():
+            yield from manifest_files(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from manifest_files(item)
+
+
+def reusable_artifacts(output: Path, fingerprint: str, arch: str, interpolation_steps: int) -> bool:
+    try:
+        deployment = json.loads((output / 'deployment.json').read_text())
+        kinematics = json.loads((output / 'robot_kinematics_manifest.json').read_text())
+        trajopt = json.loads((output / 'robot_trajopt_manifest.json').read_text())
+        if (deployment['fingerprint'] != fingerprint or kinematics['arch'] != arch or
+                trajopt['spline_layout']['interpolation_steps'] != interpolation_steps):
+            return False
+
+        # Match export_robot's full robot export, including both time-opt reference modes.
+        manifest_names = ['robot_ik_manifest.json', 'robot_rollout_manifest.json',
+                          'robot_rrt_manifest.json', 'robot_motion_manifest.json']
+        manifest_names += [f'timeopt_{knots}_{reference}.json'
+                           for knots in sorted({trajopt['num_knots'], 32, 64})
+                           for reference in (0, 1)]
+        manifests = [kinematics, trajopt]
+        manifests.extend(json.loads((output / name).read_text()) for name in manifest_names)
+        if any(not manifest['tensors'] for manifest in manifests):
+            return False
+        mpc = json.loads((output / 'robot_mpc_manifest.json').read_text())
+        files = [('robot.runtime.yml', None), ('mpc_cost_weights.f32', 4 * len(mpc['weights']))]
+        files.extend(entry for manifest in manifests for entry in manifest_files(manifest))
+
+        sizes: dict[str, int] = {}
+        for name, expected in files:
+            if name not in sizes:
+                info = (output / name).stat()
+                if not stat.S_ISREG(info.st_mode):
+                    return False
+                sizes[name] = info.st_size
+            if (sizes[name] == 0 if expected is None else sizes[name] != expected):
+                return False
+        return True
+    except (OSError, KeyError, TypeError, ValueError):
+        return False
 
 
 def main() -> None:
@@ -62,27 +141,43 @@ def main() -> None:
             options['transition_model'] = transition
         return create_config(*values, **options)
     TrajOptSolverCfg.create = staticmethod(configured_create)
-    robot_source = Path(join_path(str(get_robot_configs_path()), args.robot))
+    robot_configs = Path(get_robot_configs_path())
+    robot_source = robot_configs / args.robot
     source = load_yaml(str(robot_source))
-    digest=hashlib.sha256()
-    for file in [robot_source, exporter_path, Path(__file__),
-                 args.python_project/'src/curobo_ros_python/curobo_ros_python/planning/motion_collision.py',
-                 args.python_project/'src/curobo_ros_python/curobo_ros_python/planning/payload.py']:
-        digest.update(file.read_bytes())
-    digest.update(subprocess.check_output(['git','-C',str(args.curobo),'rev-parse','HEAD']))
-    digest.update(subprocess.check_output(['git','-C',str(args.curobo),'diff','--binary','--','curobo']))
-    digest.update(str((args.opt_interpolation_steps,args.max_trajopt_seeds,args.max_ik_seeds,args.output_dt)).encode())
-    fingerprint=digest.hexdigest()
+    urdf, asset_hashes = robot_assets(source['robot_cfg']['kinematics'],
+                                    Path(get_assets_path()), robot_configs)
+    joints = ET.parse(urdf).getroot().findall('joint')
+    target = exporter.ExportDevice.current(torch.cuda.current_device())
+    planning = args.python_project / 'src/curobo_ros_python/curobo_ros_python/planning'
+    robot_hash = file_hash(robot_source)
+    curobo_commit = subprocess.check_output(
+        ['git', '-C', str(args.curobo), 'rev-parse', 'HEAD'], text=True).strip()
+    curobo_diff = subprocess.check_output(
+        ['git', '-C', str(args.curobo), 'diff', '--binary', '--no-ext-diff', 'HEAD',
+         '--', 'curobo', 'cpp_runtime/robot'])
+    fingerprint_inputs = {
+        'schema': 2,
+        'target': target.to_dict(),
+        'robot': robot_hash,
+        'assets': asset_hashes,
+        'scripts': [file_hash(file) for file in (exporter_path, Path(__file__),
+                    planning / 'groups.py', planning / 'motion_collision.py', planning / 'payload.py')],
+        'curobo_commit': curobo_commit,
+        'curobo_diff': hashlib.sha256(curobo_diff).hexdigest(),
+        'options': [args.opt_interpolation_steps, args.max_trajopt_seeds,
+                    args.max_ik_seeds, args.output_dt],
+    }
+    fingerprint = hashlib.sha256(json.dumps(fingerprint_inputs, sort_keys=True).encode()).hexdigest()
     for group in args.groups:
         active = list(GROUP_JOINTS[group])
         for role, knots in [('opt', value) for value in args.opt_knots] + [('mpc', value) for value in args.mpc_knots]:
             output = args.output / group / role / str(knots)
             marker = output / 'deployment.json'
-            if marker.is_file():
-                layout=json.loads((output/'robot_trajopt_manifest.json').read_text())['spline_layout']
-                if json.loads(marker.read_text()).get('fingerprint')==fingerprint and layout['interpolation_steps']==(4 if role=='mpc' else args.opt_interpolation_steps):
-                    print(f'REUSE {output}', flush=True)
-                    continue
+            interpolation_steps = 4 if role == 'mpc' else args.opt_interpolation_steps
+            if reusable_artifacts(output, fingerprint, target.arch, interpolation_steps):
+                print(f'REUSE {output}', flush=True)
+                continue
+            marker.unlink(missing_ok=True)
             output.mkdir(parents=True, exist_ok=True)
             robot = configure_payload_links(yaml.safe_load(yaml.safe_dump(source)))
             kin = robot['robot_cfg']['kinematics']
@@ -107,8 +202,6 @@ def main() -> None:
             exporter.export_robot(options)
             config = KinematicsCfg.from_robot_yaml_file(str(robot_file))
             params = config.kinematics_config
-            urdf = Path(join_path(str(get_assets_path()), kin['urdf_path']))
-            joints = ET.parse(urdf).getroot().findall('joint')
             dynamic = []
             for joint in joints:
                 name = joint.get('name')
@@ -141,12 +234,14 @@ def main() -> None:
                 fixed_transforms=params.fixed_transforms.detach().cpu().reshape(-1).tolist(),
                 position_lower=params.joint_limits.position[0].detach().cpu().tolist(),
                 position_upper=params.joint_limits.position[1].detach().cpu().tolist(),
-                robot_sha256=hashlib.sha256(robot_source.read_bytes()).hexdigest(),
-                curobo_commit=subprocess.check_output(['git', '-C', str(args.curobo), 'rev-parse', 'HEAD']).decode().strip(),
+                robot_sha256=robot_hash, urdf_sha256=asset_hashes['urdf'],
+                target_device=target.to_dict(), curobo_commit=curobo_commit,
             )
-            marker.write_text(json.dumps(metadata, ensure_ascii=False, indent=2))
-            print(f'EXPORTED {group} knots={knots}', flush=True)
             torch.cuda.synchronize()
+            staged_marker = marker.with_suffix('.json.tmp')
+            staged_marker.write_text(json.dumps(metadata, ensure_ascii=False, indent=2))
+            staged_marker.replace(marker)
+            print(f'EXPORTED {group} knots={knots}', flush=True)
 
 
 if __name__ == '__main__':

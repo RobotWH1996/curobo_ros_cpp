@@ -170,7 +170,7 @@ class NativePlanner {
   // 未指定的工具用求解器当前 FK 补齐。attempts 是总尝试上限。
   PlanResult plan_pose(const std::string &group, const JointMap &state,
                        const std::map<std::string, Transform> &targets, int attempts = 3,
-                       bool rrt_on_first_attempt = false);
+                       bool rrt_on_first_attempt = false, bool validate_for_dispatch = false);
   // 按顺序将多个笛卡尔路点交给一次规划，每个路点按工具帧指定基座系位姿。
   PlanResult plan_pose_waypoints(const std::string &group, const JointMap &state,
                                  const std::vector<std::map<std::string, Transform>> &targets);
@@ -251,17 +251,19 @@ class NativePlanner {
                     const std::map<std::string, Transform> &targets);
   // 对一组候选关节目标做轨迹优化。pose 为真时目标来自笛卡尔逆解。
   // allow_graph 控制是否允许 RRT/PRM 回退，PRM 路径细化时关闭。
+  enum class CandidateValidation { DenseGpu, MeshEndpoints, MeshAlongPath };
   PlanResult solve(Group &group, const JointMap &state,
                    const std::vector<std::vector<float>> &goals, int attempts, bool pose,
                    bool allow_graph = true, bool rrt_on_first_attempt = false,
-                   bool mesh_along_path = false);
+                   CandidateValidation validation = CandidateValidation::DenseGpu);
   // 失败时读取 IK 候选误差及碰撞代价。各项最小值独立统计。
   std::string ik_failure_detail(const Group &group, size_t candidates,
                                 bool collision_checked) const;
   // 从 GPU 轨迹缓冲读回 ROS 轨迹。scaled 为真时按 velocity_scale 拉长时间。
   Trajectory output(Group &group, bool scaled);
   // 一批关节样本的 GPU 碰撞和限位检查，全部通过才返回真。
-  bool gpu_valid(Group &group, const std::vector<std::vector<float>> &samples);
+  bool gpu_valid(Group &group, const std::vector<std::vector<float>> &samples,
+                 size_t *first_violation = nullptr);
   // 批量检查 PRM 静止状态，返回与输入顺序相同的违规标志，0 表示通过。
   std::vector<uint8_t> configuration_violations(
       Group &group, const std::vector<std::vector<float>> &samples);
@@ -285,7 +287,10 @@ class NativePlanner {
   std::vector<curobo::robot::Cuboid> placed_boxes_;  // 本次任务已放下的盒子
   std::vector<curobo::robot::Mesh> static_meshes_;   // 静态场景里的网格
   uint64_t world_generation_ = 0;                    // 每次重建场景加一，用来判断点云缓存是否还有效
+  bool world_valid_ = true;  // GPU 和 FCL 碰撞场景都已完成更新
+  bool payloads_valid_ = true;  // 所有已加载规划组都已同步携物几何
+  void require_valid_world() const;
   // 按当前点云、静态物体、已放置物体和携物重建 GPU 场景。
-  void rebuild_world();
+  void rebuild_world(WorldState candidate);
 };
 }  // namespace curobo_ros_cpp

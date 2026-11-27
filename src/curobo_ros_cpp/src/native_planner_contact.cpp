@@ -444,9 +444,13 @@ PlanResult NativePlanner::interpolate_path(
   std::vector<double> previous_along(paths.size(), -1.);
   const double total = seconds(result.trajectory.points.back().time_from_start);
   const int samples = static_cast<int>(std::ceil(total / .02));
+  TrajectorySampler sampler(result.trajectory);
+  JointMap full = state;
+  const auto tool = robot_.profile.tools.find(name);
+  const bool single_tool = paths.size() == 1 && tool != robot_.profile.tools.end() &&
+                           paths.front().tool == tool->second;
   for (int i = 0; i <= samples; ++i) {
-    const auto at = sample_trajectory(result.trajectory, total * i / samples);
-    JointMap full = state;
+    const auto &at = sampler.sample(total * i / samples);
     for (int j = 0; j < group.dof; ++j) {
       full[group.names[j]] = at.position[j];
       const float lower = group.lower[j];
@@ -454,10 +458,10 @@ PlanResult NativePlanner::interpolate_path(
       if (at.position[j] < lower || at.position[j] > upper)
         throw ContactPathFailure("contact joint limit violation");
     }
-    const auto actual = robot_.forward(full);
+    const auto actual = single_tool ? std::map<std::string, Transform>{} : robot_.forward(full);
     for (size_t j = 0; j < paths.size(); ++j) {
       const auto &path = paths[j];
-      const auto &pose = actual.at(path.tool);
+      const auto pose = single_tool ? robot_.tool(full, name) : actual.at(path.tool);
       const double along = path.progress(pose), alpha = along / path.length;
       const auto projected = path.pose_at(alpha);
       const Eigen::Quaterniond expected(path.pose_at(std::clamp(alpha, 0., 1.)).linear());

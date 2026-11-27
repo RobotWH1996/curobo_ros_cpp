@@ -33,6 +33,22 @@ struct GridHash {
   }
 };
 using Grid = std::unordered_set<std::array<int64_t, 3>, GridHash>;
+Eigen::Vector3d voxel_origin(const std::vector<Point> &points, double pitch) {
+  Eigen::Vector3d origin = points.front().cast<double>();
+  for (const auto &point : points) origin = origin.cwiseMin(point.cast<double>());
+  return origin.array() - pitch;
+}
+Grid occupied_voxels(const std::vector<Point> &points, const Eigen::Vector3d &origin, double pitch) {
+  Grid voxels;
+  voxels.reserve(points.size());
+  for (const auto &point : points) {
+    std::array<int64_t, 3> key;
+    for (int axis = 0; axis < 3; ++axis)
+      key[axis] = static_cast<int64_t>(std::floor((point[axis] - origin[axis]) / pitch));
+    voxels.insert(key);
+  }
+  return voxels;
+}
 bool protected_label(const uint8_t *data, const sensor_msgs::msg::PointField *field,
                      bool big_endian) {
   if (!field) return false;
@@ -184,16 +200,8 @@ curobo::robot::Mesh voxel_mesh(const std::vector<Point> &points, double pitch) {
   curobo::robot::Mesh mesh;
   mesh.name = "environment";
   if (points.empty()) return mesh;
-  Eigen::Vector3d origin = points.front().cast<double>();
-  for (const auto &point : points) origin = origin.cwiseMin(point.cast<double>());
-  origin.array() -= pitch;
-  Grid voxels;
-  for (const auto &point : points) {
-    std::array<int64_t, 3> key;
-    for (int axis = 0; axis < 3; ++axis)
-      key[axis] = static_cast<int64_t>(std::floor((point[axis] - origin[axis]) / pitch));
-    voxels.insert(key);
-  }
+  const auto origin = voxel_origin(points, pitch);
+  const auto voxels = occupied_voxels(points, origin, pitch);
   // Faces are emitted only at occupied/empty interfaces, matching Mesh.from_pointcloud.
   const std::array<std::array<int, 3>, 8> corners{
       {{0, 0, 0}, {1, 0, 0}, {1, 1, 0}, {0, 1, 0}, {0, 0, 1}, {1, 0, 1}, {1, 1, 1}, {0, 1, 1}}};
@@ -229,23 +237,22 @@ curobo::robot::Mesh voxel_mesh(const std::vector<Point> &points, double pitch) {
 std::vector<Eigen::Vector3d> voxel_centers(const std::vector<Point> &points, double pitch) {
   std::vector<Eigen::Vector3d> centers;
   if (points.empty()) return centers;
-  Eigen::Vector3d origin = points.front().cast<double>();
-  for (const auto &point : points) origin = origin.cwiseMin(point.cast<double>());
-  origin.array() -= pitch;
-  Grid voxels;
-  voxels.reserve(points.size());
-  for (const auto &point : points) {
-    std::array<int64_t, 3> key;
-    for (int axis = 0; axis < 3; ++axis)
-      key[axis] = static_cast<int64_t>(std::floor((point[axis] - origin[axis]) / pitch));
-    voxels.insert(key);
-  }
+  const auto origin = voxel_origin(points, pitch);
+  const auto voxels = occupied_voxels(points, origin, pitch);
   centers.reserve(voxels.size());
   for (const auto &key : voxels)
     centers.emplace_back(origin.x() + (static_cast<double>(key[0]) + .5) * pitch,
                          origin.y() + (static_cast<double>(key[1]) + .5) * pitch,
                          origin.z() + (static_cast<double>(key[2]) + .5) * pitch);
   return centers;
+}
+
+bool same_voxel_occupancy(const std::vector<Point> &first, const std::vector<Point> &second,
+                          double pitch) {
+  if (first.empty() || second.empty()) return first.empty() && second.empty();
+  const auto origin = voxel_origin(first, pitch);
+  return origin == voxel_origin(second, pitch) &&
+      occupied_voxels(first, origin, pitch) == occupied_voxels(second, origin, pitch);
 }
 
 // 去掉工件包围盒里的点，避免把手上或已放下的物体再当成障碍。
@@ -263,11 +270,13 @@ std::vector<Point> exclude_box(const std::vector<Point> &points, const Transform
 // 体素模式使用的距离场。网格模式不走这里。
 std::vector<float> point_esdf(const std::vector<Point> &points, const Eigen::Vector3d &center,
                               const Eigen::Vector3d &dimensions, double pitch) {
-  const Eigen::Array3i shape = (dimensions.array() / pitch - 1e-9).ceil().cast<int>();
-  if ((shape <= 0).any())
+  const Eigen::Array3d extent = (dimensions.array() / pitch - 1e-9).ceil();
+  if (!center.allFinite() || !std::isfinite(pitch) || pitch <= 0. ||
+      !extent.allFinite() || (extent <= 0.).any())
     throw std::invalid_argument("ESDF dimensions must be finite and positive");
+  if (extent.prod() > 4000000) throw std::runtime_error("invalid ESDF capacity");
+  const Eigen::Array3i shape = extent.cast<int>();
   const size_t count = static_cast<size_t>(shape.x()) * shape.y() * shape.z();
-  if (count == 0 || count > 4000000) throw std::runtime_error("invalid ESDF capacity");
   const Eigen::Vector3d lower = center - shape.cast<double>().matrix() * pitch * .5;
   std::vector<float> distance(count, 1e10f);
   std::vector<bool> inside(count, false);
@@ -275,9 +284,9 @@ std::vector<float> point_esdf(const std::vector<Point> &points, const Eigen::Vec
     return (static_cast<size_t>(x) * shape.y() + y) * shape.z() + z;
   };
   for (const auto &point : points) {
-    const Eigen::Array3i index =
-        ((point.cast<double>() - lower).array() / pitch).floor().cast<int>();
-    if ((index >= 0).all() && (index < shape).all()) {
+    const Eigen::Array3d cell = ((point.cast<double>() - lower).array() / pitch).floor();
+    if ((cell >= 0.).all() && (cell < extent).all()) {
+      const Eigen::Array3i index = cell.cast<int>();
       distance[offset(index.x(), index.y(), index.z())] = 0.;
       inside[offset(index.x(), index.y(), index.z())] = true;
     }

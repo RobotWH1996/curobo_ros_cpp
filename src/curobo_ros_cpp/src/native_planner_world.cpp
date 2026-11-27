@@ -39,13 +39,9 @@ curobo::robot::Mesh box_mesh(const curobo::robot::Cuboid &box) {
 }  // namespace
 // 静态盒子和网格只记录下来，下次重建场景时一并放进 GPU。
 void NativePlanner::load_static_scene(const std::string &file) {
-  static_boxes_.clear();
-  static_meshes_.clear();
-  if (file.empty()) {
-    rebuild_world();
-    return;
-  }
-  const auto config = YAML::LoadFile(file);
+  const auto config = file.empty() ? YAML::Node(YAML::NodeType::Map) : YAML::LoadFile(file);
+  std::vector<curobo::robot::Cuboid> boxes;
+  std::vector<curobo::robot::Mesh> meshes;
   for (const auto &entry : config["cuboid"]) {
     curobo::robot::Cuboid box;
     box.name = entry.first.as<std::string>();
@@ -56,7 +52,7 @@ void NativePlanner::load_static_scene(const std::string &file) {
       box.pose.position[i] = pose[i];
     }
     for (int i = 0; i < 4; ++i) box.pose.quaternion[i] = pose[3 + i];
-    static_boxes_.push_back(box);
+    boxes.push_back(box);
   }
   for (const auto &entry : config["mesh"]) {
     curobo::robot::Mesh mesh;
@@ -71,12 +67,20 @@ void NativePlanner::load_static_scene(const std::string &file) {
     const auto pose = value["pose"].as<std::vector<float>>();
     for (int i = 0; i < 3; ++i) mesh.pose.position[i] = pose.at(i);
     for (int i = 0; i < 4; ++i) mesh.pose.quaternion[i] = pose.at(i + 3);
-    static_meshes_.push_back(std::move(mesh));
+    meshes.push_back(std::move(mesh));
   }
   for (const auto &kind : {"sphere", "capsule", "cylinder", "voxel"})
     if (config[kind] && config[kind].size())
       throw std::invalid_argument("static primitive or voxel scene requires offline scene export");
-  rebuild_world();
+  static_boxes_.swap(boxes);
+  static_meshes_.swap(meshes);
+  try {
+    rebuild_world(world_state());
+  } catch (...) {
+    static_boxes_.swap(boxes);
+    static_meshes_.swap(meshes);
+    throw;
+  }
 }
 // 放下的物体留在场景里，直到本任务结束被恢复。
 void NativePlanner::add_placed_object(const Transform &pose, const Eigen::Vector3d &size) {
@@ -84,10 +88,12 @@ void NativePlanner::add_placed_object(const Transform &pose, const Eigen::Vector
   box.name = "placed_" + std::to_string(placed_boxes_.size());
   box.pose = native_pose(pose);
   for (int i = 0; i < 3; ++i) box.dimensions[i] = size[i];
-  if (placed_boxes_.size() >= max_placed_objects || static_boxes_.size() + placed_boxes_.size() >= 32)
+  if (placed_boxes_.size() >= max_placed_objects ||
+      static_boxes_.size() + placed_boxes_.size() >= static_cast<size_t>(scene_->config().max_cuboids))
     throw std::runtime_error("placed object capacity exceeded");
-  placed_boxes_.push_back(box);
-  rebuild_world();
+  auto candidate = world_state();
+  candidate.placed.push_back(std::move(box));
+  rebuild_world(std::move(candidate));
 }
 // 拷贝当前障碍和已放置物体，供任务结束后恢复。
 WorldState NativePlanner::world_state() const {
@@ -96,30 +102,37 @@ WorldState NativePlanner::world_state() const {
 }
 // 抓放结束或失败后回到任务开始时的障碍。
 void NativePlanner::restore_world(const WorldState &state) {
-  placed_boxes_ = state.placed;
-  world_points_ = state.points;
-  world_pitch_ = state.pitch;
-  world_mode_ = state.mode;
-  world_center_ = state.center;
-  world_dimensions_ = state.dimensions;
-  rebuild_world();
+  rebuild_world(state);
 }
 // 去掉已放置物体并重建场景。
 void NativePlanner::clear_placed_objects() {
-  if (placed_boxes_.empty()) return;
-  placed_boxes_.clear();
-  rebuild_world();
+  if (world_valid_ && placed_boxes_.empty()) return;
+  auto candidate = world_state();
+  candidate.placed.clear();
+  rebuild_world(std::move(candidate));
 }
 // 清空点云障碍，静态场景仍然保留。
 void NativePlanner::clear_world() {
-  world_points_.clear();
-  rebuild_world();
+  rebuild_world({{}, world_pitch_, world_mode_, world_center_, world_dimensions_, placed_boxes_});
+}
+void NativePlanner::require_valid_world() const {
+  if (!world_valid_) throw std::runtime_error("collision world requires successful rebuild");
+  if (!payloads_valid_) throw std::runtime_error("collision payloads require successful update");
 }
 // 点云、静态物体、已放置物体和携物合成当前 GPU 场景。
-void NativePlanner::rebuild_world() {
+void NativePlanner::rebuild_world(WorldState candidate) {
   ++world_generation_;
-  scene_->clear();
-  world_.reset();
+  world_valid_ = false;
+  const auto &capacity = scene_->config();
+  const bool has_points = !candidate.points.empty();
+  const bool voxel = has_points && candidate.mode == "voxel";
+  if (static_boxes_.size() + candidate.placed.size() > static_cast<size_t>(capacity.max_cuboids) ||
+      static_meshes_.size() + (has_points && !voxel) > static_cast<size_t>(capacity.max_meshes))
+    throw std::runtime_error("collision world exceeds obstacle capacity");
+  if (has_points && (!std::isfinite(candidate.pitch) || candidate.pitch <= 0. ||
+                     (candidate.mode != "mesh" && candidate.mode != "voxel")))
+    throw std::invalid_argument("invalid pointcloud collision spacing or mode");
+
   std::vector<Eigen::Vector3d> vertices;
   std::vector<fcl::Triangle> faces;
   auto add_geometry = [&](const curobo::robot::Mesh &mesh) {
@@ -130,84 +143,88 @@ void NativePlanner::rebuild_world() {
     for (const auto &face : mesh.triangles)
       faces.emplace_back(face[0] + offset, face[1] + offset, face[2] + offset);
   };
-  for (const auto &mesh : static_meshes_) {
-    scene_->add_mesh(mesh);
-    add_geometry(mesh);
-  }
-  for (const auto &box : static_boxes_) {
-    scene_->add_cuboid(box);
-    add_geometry(box_mesh(box));
-  }
-  for (const auto &box : placed_boxes_) {
-    scene_->add_cuboid(box);
-    add_geometry(box_mesh(box));
-  }
+  for (const auto &mesh : static_meshes_) add_geometry(mesh);
+  for (const auto &box : static_boxes_) add_geometry(box_mesh(box));
+  for (const auto &box : candidate.placed) add_geometry(box_mesh(box));
   std::vector<Eigen::Vector3d> fcl_voxels;
-  if (!world_points_.empty()) {
-    curobo::robot::Mesh mesh;
-    if (world_mode_ == "voxel") {
-      const Eigen::Array3i shape =
-          (world_dimensions_.array() / world_pitch_ - 1e-9).ceil().cast<int>();
-      const Eigen::Vector3d lower =
-          world_center_ - shape.cast<double>().matrix() * world_pitch_ * .5;
-      std::vector<Point> occupied;
-      for (const auto &point : world_points_) {
-        const Eigen::Array3i index =
-            ((point.cast<double>() - lower).array() / world_pitch_).floor().cast<int>();
-        if ((index >= 0).all() && (index < shape).all())
-          occupied.push_back(index.cast<float>().matrix());
-      }
-      fcl_voxels = voxel_centers(occupied, 1.);
-      for (auto &center : fcl_voxels)
-        for (int axis = 0; axis < 3; ++axis) center[axis] = lower[axis] + center[axis] * world_pitch_;
-    } else {
-      mesh = voxel_mesh(world_points_, world_pitch_);
-      fcl_voxels = voxel_centers(world_points_, world_pitch_);
+  curobo::robot::Mesh mesh;
+  curobo::robot::VoxelGrid grid;
+  if (voxel) {
+    const Eigen::Array3d shape = (candidate.dimensions.array() / candidate.pitch - 1e-9).ceil();
+    if (!candidate.center.allFinite() || !shape.allFinite() || (shape <= 0.).any())
+      throw std::invalid_argument("ESDF center and dimensions must be finite, dimensions positive");
+    if (capacity.max_voxel_grids < 1 || shape.prod() > capacity.max_voxels_per_grid)
+      throw std::runtime_error("pointcloud ESDF exceeds voxel capacity");
+    const Eigen::Vector3d lower = candidate.center - shape.matrix() * candidate.pitch * .5;
+    std::vector<Point> occupied;
+    for (const auto &point : candidate.points) {
+      const Eigen::Array3d index =
+          ((point.cast<double>() - lower).array() / candidate.pitch).floor();
+      if ((index >= 0.).all() && (index < shape).all())
+        occupied.push_back(index.cast<float>().matrix());
     }
-    if (world_mode_ == "voxel") {
-      curobo::robot::VoxelGrid grid;
-      grid.name = "environment";
-      for (int i = 0; i < 3; ++i) {
-        grid.pose.position[i] = world_center_[i];
-        grid.dimensions[i] = std::ceil(world_dimensions_[i] / world_pitch_ - 1e-9) * world_pitch_;
-      }
-      grid.voxel_size = world_pitch_;
-      grid.esdf = point_esdf(world_points_, world_center_, world_dimensions_, world_pitch_);
-      world_ = scene_->add_voxel_grid(grid);
-    } else
-      world_ = scene_->add_mesh(mesh);
+    fcl_voxels = voxel_centers(occupied, 1.);
+    for (auto &center : fcl_voxels) center = lower + center * candidate.pitch;
+    grid.name = "environment";
+    for (int i = 0; i < 3; ++i) {
+      grid.pose.position[i] = candidate.center[i];
+      grid.dimensions[i] = shape[i] * candidate.pitch;
+    }
+    grid.voxel_size = candidate.pitch;
+    grid.esdf = point_esdf(candidate.points, candidate.center, candidate.dimensions, candidate.pitch);
+  } else if (has_points) {
+    mesh = voxel_mesh(candidate.points, candidate.pitch);
+    fcl_voxels = voxel_centers(candidate.points, candidate.pitch);
   }
+  // All geometry and capacity checks precede mutation of the active GPU scene.
+  scene_->clear();
+  world_.reset();
+  for (const auto &static_mesh : static_meshes_) scene_->add_mesh(static_mesh);
+  for (const auto &box : static_boxes_) scene_->add_cuboid(box);
+  for (const auto &box : candidate.placed) scene_->add_cuboid(box);
+  if (voxel)
+    world_ = scene_->add_voxel_grid(grid);
+  else if (has_points)
+    world_ = scene_->add_mesh(mesh);
   if (faces.empty() && fcl_voxels.empty())
     robot_.clear_environment();
   else
     robot_.set_environment(std::move(vertices), std::move(faces), std::move(fcl_voxels),
-                           world_pitch_);
+                           candidate.pitch);
+  placed_boxes_ = std::move(candidate.placed);
+  world_points_ = std::move(candidate.points);
+  world_pitch_ = candidate.pitch;
+  world_mode_ = std::move(candidate.mode);
+  world_center_ = candidate.center;
+  world_dimensions_ = candidate.dimensions;
+  world_valid_ = true;
 }
 // 换一帧点云。mesh 和 voxel 的差别在重建时处理。
 void NativePlanner::set_world(const std::vector<Point> &points, double pitch,
                               const std::string &mode, const Eigen::Vector3d &center,
                               const Eigen::Vector3d &dimensions) {
-  if (pitch == world_pitch_ && mode == world_mode_ && center == world_center_ &&
-      dimensions == world_dimensions_ && points.size() == world_points_.size() &&
-      std::equal(points.begin(), points.end(), world_points_.begin(),
-                 [](const Point &a, const Point &b) { return a == b; }))
-    return;
-  world_points_ = points;
-  world_pitch_ = pitch;
-  world_mode_ = mode;
-  world_center_ = center;
-  world_dimensions_ = dimensions;
-  rebuild_world();
+  if (world_valid_ && pitch == world_pitch_ && mode == world_mode_ && center == world_center_ &&
+      dimensions == world_dimensions_) {
+    if (points.size() == world_points_.size() &&
+        std::equal(points.begin(), points.end(), world_points_.begin(),
+                   [](const Point &a, const Point &b) { return a == b; }))
+      return;
+    if (mode == "mesh" && same_voxel_occupancy(points, world_points_, pitch)) {
+      world_points_ = points;
+      return;
+    }
+  }
+  rebuild_world({points, pitch, mode, center, dimensions, placed_boxes_});
 }
 // 更新手上的工件，并让碰撞世界跟着变。
 void NativePlanner::set_payloads(const Payloads &payloads) {
-  payloads_ = payloads;
+  payloads_valid_ = false;
   auto apply = [&](auto &groups) {
     for (auto &entry : groups) {
       auto &group = *entry.second;
       for (const auto &side : {"left_arm", "right_arm"})
         group.planner->detach_object(robot_.profile.payload_link(side));
-      for (const auto &payload : payloads_) {
+      for (const auto &payload : payloads) {
         curobo::robot::SphereAttachment attachment;
         attachment.link_name = robot_.profile.payload_link(payload.group);
         const auto &value = payload.in_tool;
@@ -233,5 +250,7 @@ void NativePlanner::set_payloads(const Payloads &payloads) {
   };
   apply(groups_);
   apply(mpc_groups_);
+  payloads_ = payloads;
+  payloads_valid_ = true;
 }
 }  // namespace curobo_ros_cpp

@@ -107,8 +107,9 @@ Trajectory NativePlanner::output(Group &group, bool scaled) {
 PlanResult NativePlanner::solve(Group &group, const JointMap &state,
                                 const std::vector<std::vector<float>> &goals, int attempts,
                                 bool pose, bool allow_graph, bool rrt_on_first_attempt,
-                                bool mesh_along_path) {
+                                CandidateValidation validation) {
   PlanResult result;
+  const bool mesh_along_path = validation == CandidateValidation::MeshAlongPath;
   const auto current = positions(group, state);
   group.start.upload(current);
   std::vector<float> prm_goal;
@@ -237,6 +238,7 @@ PlanResult NativePlanner::solve(Group &group, const JointMap &state,
     result.timing.graph_ms += rrt_ms;
     result.timing.trajopt_ms += std::max(0., total - rrt_ms);
     if (!success) {
+      if (allow_graph && prm_goal.empty()) prm_goal = valid_goals.front();
       const auto cap_note = timeopt_capacity_note(group.planner->last_timeopt_capacity_diagnostics());
       if (!cap_note.empty())
         RCLCPP_WARN(logger, "【OPT · 缓冲容量】group=%s ｜ 尝试=%d ｜%s",
@@ -253,12 +255,16 @@ PlanResult NativePlanner::solve(Group &group, const JointMap &state,
                       diagnostics.max_path_points, diagnostics.iterations, group.cost.host(1).front(),
                       group.collision.host(1).front(), rrt_ms, std::max(0., total - rrt_ms));
         }
+        if (!pose && skip_direct && diagnostics.paths_found > 0 &&
+            diagnostics.max_path_points == 2 && diagnostics.iterations == 0) {
+          RCLCPP_INFO(logger, "【OPT · RRT】固定目标的直连初值未通过优化，进入 PRM");
+          break;
+        }
       } else {
         reject("直接优化未能生成可执行轨迹，求解器未提供失败原因。" + cap_note);
       }
       RCLCPP_DEBUG(logger, "【OPT 规划】第 %d 次求解共耗时 %.1f 毫秒，其中 RRT 用时 %.1f 毫秒。",
                    attempt + 1, total, rrt_ms);
-      if (allow_graph && prm_goal.empty()) prm_goal = valid_goals.front();
       continue;
     }
     auto candidate = output(group, true);
@@ -271,13 +277,13 @@ PlanResult NativePlanner::solve(Group &group, const JointMap &state,
              "，但在终点发现 " + check->first + " 与 " + check->second + " 发生碰撞。");
       continue;
     }
-    if (mesh_along_path) {
+    if (validation != CandidateValidation::DenseGpu) {
       const auto check_started = Clock::now();
       const auto limits = dynamic_limits(group.name);
       if (trajectory_needs_retiming(candidate, group.names, limits))
         candidate = blend_trajectories({std::move(candidate)}, group.names, limits, {false}).trajectory;
       try {
-        validate(group.name, state, candidate, true, std::nullopt, /*mesh_along_path=*/true);
+        validate(group.name, state, candidate, true, std::nullopt, mesh_along_path);
       } catch (const TrajectoryCandidateRejected &error) {
         result.timing.check_ms += elapsed_ms(check_started);
         reject(error.what());
@@ -400,12 +406,13 @@ PlanResult NativePlanner::plan_joint(const std::string &name, const JointMap &st
     if (name == "both_arms" || name == side)
       target_poses[robot_.profile.tools.at(side)] = robot_.tool(final, side);
   fill_targets(group, state, target_poses);
-  return solve(group, state, {goal}, attempts, false, true, false, mesh_along_path);
+  return solve(group, state, {goal}, attempts, false, true, false,
+               mesh_along_path ? CandidateValidation::MeshAlongPath : CandidateValidation::DenseGpu);
 }
 // 位姿先逆解出关节目标，再做轨迹优化。
 PlanResult NativePlanner::plan_pose(const std::string &name, const JointMap &state,
                                     const std::map<std::string, Transform> &targets, int attempts,
-                                    bool rrt_on_first_attempt) {
+                                    bool rrt_on_first_attempt, bool validate_for_dispatch) {
   for (const auto &[tool, target] : targets) {
     const Eigen::Quaterniond q(target.linear());
     const auto &p = target.translation();
@@ -417,7 +424,9 @@ PlanResult NativePlanner::plan_pose(const std::string &name, const JointMap &sta
   synchronize(name, state);
   auto &group = get(name);
   fill_targets(group, state, targets);
-  return solve(group, state, {}, attempts, true, true, rrt_on_first_attempt);
+  return solve(group, state, {}, attempts, true, true, rrt_on_first_attempt,
+               validate_for_dispatch ? CandidateValidation::MeshEndpoints
+                                     : CandidateValidation::DenseGpu);
 }
 // 多个位姿路点一次求解，供逐段拼接失败时回退。
 PlanResult NativePlanner::plan_pose_waypoints(
@@ -540,7 +549,8 @@ PlanResult NativePlanner::plan_pose_waypoints(
   return result;
 }
 // 一批关节点的 GPU 碰撞检查，有一个失败就返回假。
-bool NativePlanner::gpu_valid(Group &group, const std::vector<std::vector<float>> &samples) {
+bool NativePlanner::gpu_valid(Group &group, const std::vector<std::vector<float>> &samples,
+                              size_t *first_violation) {
   if (samples.empty()) return false;
   if (samples.size() > static_cast<size_t>(group.capacity))
     throw std::runtime_error("validation sample capacity exceeded");
@@ -553,7 +563,10 @@ bool NativePlanner::gpu_valid(Group &group, const std::vector<std::vector<float>
                                          static_cast<int>(samples.size()),
                                          group.configuration_feasible.get());
   const auto violations = group.configuration_feasible.host(samples.size());
-  return std::all_of(violations.begin(), violations.end(), [](uint8_t v) { return v == 0; });
+  const auto first = std::find_if(violations.begin(), violations.end(), [](uint8_t v) { return v != 0; });
+  if (first == violations.end()) return true;
+  if (first_violation) *first_violation = std::distance(violations.begin(), first);
+  return false;
 }
 // 合并后的轨迹再查一遍限位和碰撞，接触段可以跳过环境。
 void NativePlanner::validate(const std::string &name, const JointMap &state,
@@ -608,77 +621,67 @@ void NativePlanner::validate(const std::string &name, const JointMap &state,
     }
     samples.push_back(std::move(row));
     if (samples.size() == static_cast<size_t>(group.capacity) || i == count - 1) {
-      if (collision && !gpu_valid(group, samples)) {
+      size_t first = 0;
+      if (collision && !gpu_valid(group, samples, &first)) {
         const auto batch_start = i + 1 - samples.size();
         std::ostringstream detail;
         detail << std::fixed << std::setprecision(6)
                << "GPU collision or joint-limit validation failed | interval=["
                << end * batch_start / (count - 1) << ", " << sample_time << "] s";
         try {
-          // The GPU reports one flag per seed. Recheck prefixes with the same validator.
-          size_t first = 0, last = samples.size() - 1;
-          std::vector<std::vector<float>> prefix;
-          while (first < last) {
-            const size_t middle = first + (last - first) / 2;
-            prefix.assign(samples.begin(), samples.begin() + middle + 1);
-            if (gpu_valid(group, prefix)) first = middle + 1;
-            else last = middle;
-          }
           const auto &failed = samples[first];
-          if (gpu_valid(group, {failed})) {
-            detail << " | batch rejection did not reproduce at an isolated sample";
-          } else {
-            const auto index = batch_start + first;
-            const double failed_time = end * index / (count - 1);
-            JointMap failed_state = state;
-            size_t nearest = 0;
-            float margin = std::numeric_limits<float>::infinity();
-            for (size_t j = 0; j < failed.size(); ++j) {
-              failed_state[group.names[j]] = failed[j];
-              const float gap = std::min(failed[j] - group.lower[j], group.upper[j] - failed[j]);
-              if (gap < margin) {
-                margin = gap;
-                nearest = j;
-              }
+          const auto index = batch_start + first;
+          const double failed_time = end * index / (count - 1);
+          JointMap failed_state = state;
+          size_t nearest = 0;
+          float margin = std::numeric_limits<float>::infinity();
+          for (size_t j = 0; j < failed.size(); ++j) {
+            failed_state[group.names[j]] = failed[j];
+            const float gap = std::min(failed[j] - group.lower[j], group.upper[j] - failed[j]);
+            if (gap < margin) {
+              margin = gap;
+              nearest = j;
             }
-            detail << " | sample=" << index + 1 << '/' << count << " | time=" << failed_time
-                   << " s | nearest_joint=" << group.names[nearest] << " q=" << failed[nearest]
-                   << " allowed=[" << group.lower[nearest] << ", " << group.upper[nearest]
-                   << "] | joint_margin_rad=" << margin;
-            const auto hit = robot_.check(failed_state, name, true, false, payloads_, grasp_targets);
-            detail << " | FCL_same_state=" << (hit ? hit->message() : "clear");
-            auto right_knot = std::upper_bound(
-                trajectory.points.begin(), trajectory.points.end(), failed_time,
-                [](double t, const auto &entry) { return t < seconds(entry.time_from_start); });
-            const size_t hi_knot = std::clamp<size_t>(
-                static_cast<size_t>(std::distance(trajectory.points.begin(), right_knot)),
-                1, trajectory.points.size() - 1);
-            const size_t lo_knot = hi_knot - 1;
-            auto knot_row = [&](size_t k) {
-              std::vector<float> row;
-              row.reserve(columns.size());
-              for (size_t j = 0; j < columns.size(); ++j)
-                row.push_back(static_cast<float>(trajectory.points[k].positions[columns[j]]));
-              return row;
-            };
-            const bool lo_ok = gpu_valid(group, {knot_row(lo_knot)});
-            const bool hi_ok = gpu_valid(group, {knot_row(hi_knot)});
-            detail << " | bracket_knots=[" << lo_knot << ':' << (lo_ok ? "ok" : "FAIL")
-                   << ", " << hi_knot << ':' << (hi_ok ? "ok" : "FAIL") << ']';
-            const auto &planned = sampler.sample(failed_time);
-            for (const auto &[joint, column] : gripper_columns)
-              detail << " | " << joint << " GPU_locked_m=" << state.at(joint)
-                     << " planned_m=" << planned.position[column];
-            const auto transforms = robot_.forward(failed_state);
-            for (const auto &[side, tool] : robot_.profile.tools)
-              if (name == "both_arms" || side == name)
-                detail << " | " << side << "_tcp_xyz_m=["
-                       << transforms.at(tool).translation().transpose() << ']';
-            detail << " | q_rad=[";
-            for (size_t j = 0; j < failed.size(); ++j)
-              detail << (j ? ", " : "") << failed[j];
-            detail << ']';
           }
+          detail << " | sample=" << index + 1 << '/' << count << " | time=" << failed_time
+                 << " s | nearest_joint=" << group.names[nearest] << " q=" << failed[nearest]
+                 << " allowed=[" << group.lower[nearest] << ", " << group.upper[nearest]
+                 << "] | joint_margin_rad=" << margin;
+          const auto &planned = sampler.sample(failed_time);
+          for (const auto &[joint, column] : gripper_columns)
+            failed_state[joint] = planned.position[column];
+          const auto hit = robot_.check(failed_state, name, true, false, payloads_, grasp_targets);
+          detail << " | FCL_same_state=" << (hit ? hit->message() : "clear");
+          auto right_knot = std::upper_bound(
+              trajectory.points.begin(), trajectory.points.end(), failed_time,
+              [](double t, const auto &entry) { return t < seconds(entry.time_from_start); });
+          const size_t hi_knot = std::clamp<size_t>(
+              static_cast<size_t>(std::distance(trajectory.points.begin(), right_knot)),
+              1, trajectory.points.size() - 1);
+          const size_t lo_knot = hi_knot - 1;
+          auto knot_row = [&](size_t k) {
+            std::vector<float> row;
+            row.reserve(columns.size());
+            for (size_t j = 0; j < columns.size(); ++j)
+              row.push_back(static_cast<float>(trajectory.points[k].positions[columns[j]]));
+            return row;
+          };
+          const bool lo_ok = gpu_valid(group, {knot_row(lo_knot)});
+          const bool hi_ok = gpu_valid(group, {knot_row(hi_knot)});
+          detail << " | bracket_knots=[" << lo_knot << ':' << (lo_ok ? "ok" : "FAIL")
+                 << ", " << hi_knot << ':' << (hi_ok ? "ok" : "FAIL") << ']';
+          for (const auto &[joint, column] : gripper_columns)
+            detail << " | " << joint << " GPU_locked_m=" << state.at(joint)
+                   << " planned_m=" << planned.position[column];
+          const auto transforms = robot_.forward(failed_state);
+          for (const auto &[side, tool] : robot_.profile.tools)
+            if (name == "both_arms" || side == name)
+              detail << " | " << side << "_tcp_xyz_m=["
+                     << transforms.at(tool).translation().transpose() << ']';
+          detail << " | q_rad=[";
+          for (size_t j = 0; j < failed.size(); ++j)
+            detail << (j ? ", " : "") << failed[j];
+          detail << ']';
         } catch (const std::exception &error) {
           detail << " | diagnostic_error=" << error.what();
         }

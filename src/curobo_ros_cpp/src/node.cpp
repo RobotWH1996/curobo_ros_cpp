@@ -101,6 +101,13 @@ PlanningNode::PlanningNode(const rclcpp::NodeOptions &options)
       (geometry / "robot.urdf").string(), (geometry / "robot.yml").string(),
       share + "/config/robots/" + id + ".yaml", share + "/config", geometry.string(),
       load_self_filter_spheres ? std::optional{cloud_settings_.self_filter_padding} : std::nullopt);
+  // Lycus 的只读轮关节不随机械臂轨迹下发，保留既有默认姿态处理。
+  for (const auto &name : robot->required_joint_names)
+    if (name.rfind("Wheel", 0) != 0) planning_joints_.insert(name);
+  for (const auto &entry : robot->profile.groups)
+    planning_joints_.insert(entry.second.begin(), entry.second.end());
+  for (const auto &entry : robot->profile.grippers)
+    planning_joints_.insert(entry.second);
   if (pointcloud_mode_ != PointCloudMode::Off && cloud_settings_.self_filter_mode != "off")
     for (const auto &entry : robot->profile.groups) {
       auto &names = self_filter_joints_[entry.first];
@@ -108,12 +115,15 @@ PlanningNode::PlanningNode(const rclcpp::NodeOptions &options)
                                        cloud_settings_.self_filter_sphere_compare);
       for (const auto &name : names) joint_history_.track(name);
     }
-  if (pointcloud_mode_ != PointCloudMode::Off)
-    for (const auto &[group, tool] : robot->profile.tools) {
-      auto &names = payload_pose_joints_[group];
-      names = robot->tool_feedback_joints(group);
+  for (const auto &entry : robot->profile.tools) {
+    auto names = robot->tool_feedback_joints(entry.first);
+    for (const auto &name : names)
+      if (name.rfind("Wheel", 0) != 0) planning_joints_.insert(name);
+    if (pointcloud_mode_ != PointCloudMode::Off) {
       for (const auto &name : names) joint_history_.track(name);
+      payload_pose_joints_.emplace(entry.first, std::move(names));
     }
+  }
   RCLCPP_INFO(get_logger(), "【初始化 · 碰撞模型】完成 ｜ 网格 %zu ｜ 耗时 %.1f 毫秒",
               robot->meshes().size(), elapsed_ms(fcl_start));
   step = "规划参数";
@@ -222,18 +232,24 @@ PlanningNode::PlanningNode(const rclcpp::NodeOptions &options)
       parameter<std::string>("joint_states_topic", "/joint_states"), 10,
       [this](sensor_msgs::msg::JointState::SharedPtr message) {
         std::lock_guard<std::mutex> guard(input_mutex_);
-        const rclcpp::Time stamp(message->header.stamp);
-        const double dt = stamp.seconds() - joint_stamp_;
+        const auto capture = rclcpp::Time(message->header.stamp).nanoseconds();
         const bool reported = message->velocity.size() == message->name.size() &&
                               std::any_of(message->velocity.begin(), message->velocity.end(),
                                           [](double value) { return std::abs(value) > 1e-4; });
         const auto received = Clock::now();
         const bool store_history = !payload_pose_joints_.empty();
-        if (store_history) observe_input_clock();
+        if (capture > observe_input_clock()) return;
         for (size_t i = 0; i < std::min(message->name.size(), message->position.size()); ++i) {
           const auto &name = message->name[i];
           const double position = message->position[i];
-          auto old = joints_.find(name);
+          const auto previous_capture = joint_capture_.find(name);
+          const bool stamped = previous_capture != joint_capture_.end();
+          // 乱序样本可补齐点云历史，实时缓存只接受该关节更新的时间戳。
+          if (store_history && (!stamped || capture != previous_capture->second))
+            joint_history_.record(name, capture, position);
+          if (stamped && capture <= previous_capture->second) continue;
+          const auto old = joints_.find(name);
+          const double dt = stamped ? (capture - previous_capture->second) * 1e-9 : 0.;
           if (reported)
             joint_velocity_[name] = message->velocity[i];
           else if (old != joints_.end() && dt > 1e-4 && dt < .5) {
@@ -243,10 +259,8 @@ PlanningNode::PlanningNode(const rclcpp::NodeOptions &options)
             joint_velocity_[name] = 0.;
           joints_[name] = position;
           joint_received_[name] = received;
-          if (store_history) joint_history_.record(name, stamp.nanoseconds(), position);
+          if (capture > 0) joint_capture_[name] = capture;
         }
-        joint_stamp_ = stamp.seconds();
-        joint_time_ = received;
         ++joint_epoch_;
         if (store_history) cloud_ready_.notify_all();
       },
@@ -577,7 +591,28 @@ void PlanningNode::run_cloud_prewarm() {
         !planner->payloads().empty())
       continue;
     try {
-      prepare_world(cloud_prewarm_group_, candidate, /*silent=*/true);
+      const bool uses_mesh_filter = cloud_settings_.self_filter_mode != "off" &&
+          (!cloud_settings_.self_filter_use_spheres || cloud_settings_.self_filter_sphere_compare);
+      if (uses_mesh_filter) {
+        // Mesh filtering shares the FCL query lock. Do not contend with an active request.
+        prepare_world(cloud_prewarm_group_, candidate, /*silent=*/true);
+      } else {
+        const auto generation = planner->world_generation();
+        const auto mode = cloud_mode_;
+        op.unlock();
+        auto prepared = prepare_world_cloud(cloud_prewarm_group_, candidate, {}, /*silent=*/true);
+        if (!op.try_lock() || busy_.load() || service_busy_.load() ||
+            !held_payloads_.empty() || !planner->payloads().empty() ||
+            generation != planner->world_generation() || mode != cloud_mode_)
+          continue;
+        const double max_age_ms = parameter<double>("pick_place_cloud_max_age", 2.) * 1000.;
+        {
+          std::lock_guard<std::mutex> guard(input_mutex_);
+          if (cloud_ != candidate || prewarm_epoch_ != epoch || !cloud_is_fresh(max_age_ms)) continue;
+        }
+        if (prepared)
+          commit_world_cloud(cloud_prewarm_group_, candidate, std::move(*prepared), /*silent=*/true);
+      }
       if (cached_aligned_ && cached_message_ == candidate) {
         last_done = candidate;
         joint_retries = 0;
@@ -591,32 +626,60 @@ void PlanningNode::run_cloud_prewarm() {
     }
   }
 }
-// 用最新关节反馈覆盖默认值。fresh 时检查年龄和任务关节是否齐全。
+// 用最新关节反馈覆盖默认值。fresh 时逐项检查年龄和数值。
 JointMap PlanningNode::state(bool fresh) {
+  const auto max_age_ms = fresh
+      ? parameter<double>("pick_place_joint_state_max_age", 1.) * 1000. : 0.;
+  if (fresh && (!std::isfinite(max_age_ms) || max_age_ms <= 0.))
+    throw std::invalid_argument("pick_place_joint_state_max_age must be positive and finite");
   std::lock_guard<std::mutex> guard(input_mutex_);
   if (joints_.empty()) throw std::runtime_error("no joint_states received");
-  if (fresh &&
-      elapsed_ms(joint_time_) > parameter<double>("pick_place_joint_state_max_age", 1.) * 1000.)
-    throw std::runtime_error("joint_states expired");
   if (fresh)
-    for (const auto &joint : robot->required_joint_names)
+    for (const auto &joint : planning_joints_) {
       if (!joints_.count(joint) || !std::isfinite(joints_.at(joint)))
-        throw std::runtime_error("missing or invalid task joint feedback " + joint);
+        throw std::runtime_error("missing or invalid planning joint feedback " + joint);
+      if (elapsed_ms(joint_received_.at(joint)) > max_age_ms)
+        throw std::runtime_error("planning joint feedback expired: " + joint);
+    }
   auto result = robot->defaults;
   for (const auto &joint : joints_) result[joint.first] = joint.second;
   return result;
+}
+void PlanningNode::validate_start(const JointMap &expected, const Trajectory &trajectory,
+                                 double gripper_tolerance) {
+  const auto latest = state(true);
+  const auto tolerance = [&](const std::string &name) {
+    // 与轨迹桥默认起点容差一致，手臂为弧度，夹爪为米。
+    return robot->profile.gripper_controllers.count(name) ? gripper_tolerance : .01;
+  };
+  for (const auto &name : planning_joints_)
+    if (std::abs(latest.at(name) - expected.at(name)) > tolerance(name))
+      throw std::runtime_error("planning start state changed before dispatch: " + name);
+  const auto &first = trajectory.points.front();
+  for (size_t i = 0; i < trajectory.joint_names.size(); ++i) {
+    const auto &name = trajectory.joint_names[i];
+    if (planning_joints_.count(name) &&
+        std::abs(latest.at(name) - first.positions.at(i)) > tolerance(name))
+      throw std::runtime_error("trajectory start differs from fresh joint feedback: " + name);
+  }
 }
 // 感知位姿留在原坐标系，这里再用 TF 变到基座系。
 Transform PlanningNode::in_base(const geometry_msgs::msg::PoseStamped &pose) {
   const auto value = transform(pose.pose);
   if (pose.header.frame_id.empty() || pose.header.frame_id == base) return value;
-  return tf2::transformToEigen(tf_.lookupTransform(base, pose.header.frame_id, tf2::TimePointZero,
+  const auto stamp = tf2::TimePoint(std::chrono::nanoseconds(
+      rclcpp::Time(pose.header.stamp).nanoseconds()));
+  return tf2::transformToEigen(tf_.lookupTransform(base, pose.header.frame_id, stamp,
                                                    tf2::durationFromSec(1.))) *
          value;
 }
 int64_t PlanningNode::observe_input_clock() {
   const auto current = now().nanoseconds();
   if (joint_history_.observe_clock(current)) {
+    joints_.clear();
+    joint_velocity_.clear();
+    joint_received_.clear();
+    joint_capture_.clear();
     cloud_.reset();
     // A payload transition from the previous clock epoch predates new-epoch captures.
     if (payload_change_stamp_) payload_change_stamp_ = 0;
@@ -633,7 +696,7 @@ bool PlanningNode::cloud_is_fresh(double max_age_ms) const {
          (!payload_change_stamp_ || capture > *payload_change_stamp_);
 }
 
-// 处理一帧点云并写入碰撞场景。场景更新失败时保留原有碰撞世界。
+// 处理一帧点云并写入碰撞场景。更新失败时终止本次规划。
 const PreparedCloud &PlanningNode::update_world(const std::string &group, CloudFreshness freshness,
                                                 bool require_cloud) {
   return prepare_world(group, select_cloud(freshness, require_cloud));
@@ -719,6 +782,7 @@ const PreparedCloud &PlanningNode::prepare_world(
     bool silent) {
   if (!cloud) return cached_cloud_;
   const bool same_cloud = cached_aligned_ && cached_message_ == cloud && cached_group_ == group &&
+                          cached_mode_ == cloud_mode_ &&
                           cached_payload_ == !planner->payloads().empty() &&
                           cached_generation_ == planner->world_generation();
   if (same_cloud) {
@@ -727,6 +791,14 @@ const PreparedCloud &PlanningNode::prepare_world(
                   cached_cloud_.points.size());
     return cached_cloud_;
   }
+  auto prepared = prepare_world_cloud(group, cloud, held_payloads_, silent);
+  if (!prepared) return cached_cloud_;
+  return commit_world_cloud(group, cloud, std::move(*prepared), silent);
+}
+
+std::optional<PlanningNode::CloudPreparation> PlanningNode::prepare_world_cloud(
+    const std::string &group, const sensor_msgs::msg::PointCloud2::ConstSharedPtr &cloud,
+    const Payloads &held, bool silent) {
   const auto started = Clock::now();
   const auto capture = rclcpp::Time(cloud->header.stamp).nanoseconds();
   Transform at = Transform::Identity();
@@ -737,14 +809,14 @@ const PreparedCloud &PlanningNode::prepare_world(
                             tf2::durationFromSec(.025)));
   const double tf_ms = elapsed_ms(started);
   JointMap captured_payload_joints;
-  if (!held_payloads_.empty()) {
+  if (!held.empty()) {
     if (!capture) throw std::runtime_error("held-object filtering requires a pointcloud stamp");
     std::string missing;
     std::unique_lock<std::mutex> lock(input_mutex_);
     // A new cloud can arrive just before the joint sample that completes its bracket.
     const bool aligned = cloud_ready_.wait_for(lock, std::chrono::milliseconds(35), [&] {
       captured_payload_joints.clear();
-      for (const auto &object : held_payloads_)
+      for (const auto &object : held)
         for (const auto &name : payload_pose_joints_.at(object.group)) {
           const auto position = joint_history_.position(name, capture);
           if (!position) {
@@ -777,7 +849,7 @@ const PreparedCloud &PlanningNode::prepare_world(
       }
     }
     if (!missing.empty()) {
-      if (silent) return cached_cloud_;
+      if (silent) return std::nullopt;
       filter_aligned = false;
       settings.self_filter_mode = "off";
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
@@ -788,7 +860,7 @@ const PreparedCloud &PlanningNode::prepare_world(
   auto prepared = prepare_cloud(*cloud, at, settings, *robot, filter_joints, group);
   if (prepared.points.empty() && prepared.removed.empty())
     throw std::runtime_error("pointcloud has no usable points inside planning bounds");
-  for (const auto &object : held_payloads_) {
+  for (const auto &object : held) {
     const Transform object_pose =
         robot->tool(captured_payload_joints, object.group) * object.in_tool;
     const auto before = prepared.points.size();
@@ -798,6 +870,14 @@ const PreparedCloud &PlanningNode::prepare_world(
     RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
         "【持物滤除】%s ｜ 体素 %zu", object.group.c_str(), before - prepared.points.size());
   }
+  return CloudPreparation{std::move(prepared), started, tf_ms, filter_aligned && capture != 0,
+                          settings.self_filter_mode != "off"};
+}
+
+const PreparedCloud &PlanningNode::commit_world_cloud(
+    const std::string &group, const sensor_msgs::msg::PointCloud2::ConstSharedPtr &cloud,
+    CloudPreparation candidate, bool silent) {
+  auto &prepared = candidate.cloud;
   for (const auto &publisher : self_filter_pubs_)
     if (publisher.second->get_subscription_count()) {
       const auto &points = publisher.first == "input"     ? prepared.input
@@ -872,13 +952,13 @@ const PreparedCloud &PlanningNode::prepare_world(
         "环境%s %.1f ｜ 总耗时 %.1f 毫秒",
         prepared.raw_count, prepared.cropped_count, points.size(), prepared.removed.size(),
         !cloud_settings_.self_filter_use_spheres && prepared.mesh_filter_timed_out ? "是" : "否",
-        tf_ms, prepared.crop_ms,
-        settings.self_filter_mode == "off" ? "关闭" :
-        settings.self_filter_use_spheres ? "碰撞球" : "网格",
+        candidate.tf_ms, prepared.crop_ms,
+        !candidate.filter_enabled ? "关闭" :
+        cloud_settings_.self_filter_use_spheres ? "碰撞球" : "网格",
         prepared.self_filter_ms, prepared.voxel_ms,
         planner->world_generation() == previous_generation ? "复用" : "重建",
-        world_ms, elapsed_ms(started));
-  if (settings.self_filter_sphere_compare && settings.self_filter_mode != "off")
+        world_ms, elapsed_ms(candidate.started));
+  if (cloud_settings_.self_filter_sphere_compare && candidate.filter_enabled)
     RCLCPP_INFO_THROTTLE(
         get_logger(), *get_clock(), 1000,
         "【本体滤除对照】体素化前 ｜ 网格 %.3f ms（超时 %s）｜ 碰撞球 %.3f ms ｜ "
@@ -888,8 +968,9 @@ const PreparedCloud &PlanningNode::prepare_world(
         prepared.sphere_only.size());
   cached_cloud_ = std::move(prepared);
   cached_group_ = group;
+  cached_mode_ = cloud_mode_;
   cached_message_ = cloud;
-  cached_aligned_ = filter_aligned && capture != 0;
+  cached_aligned_ = candidate.aligned;
   cached_payload_ = !planner->payloads().empty();
   cached_generation_ = planner->world_generation();
   return cached_cloud_;
@@ -1064,7 +1145,7 @@ void PlanningNode::plan_joint(
     execution->clear();
     auto phase_started = Clock::now();
     const auto &cloud = update_world(request->group_name, CloudFreshness::WaitForJointPlan);
-    auto initial = state(), current = initial;
+    auto initial = state(true), current = initial;
     RCLCPP_INFO(get_logger(), "【OPT · 场景】输入 %zu 点 ｜ 保留 %zu 点 ｜ %.1f ms",
                 cloud.raw_count, cloud.points.size(), elapsed_ms(phase_started));
     const bool single_waypoint = request->waypoints.size() == 1;
@@ -1109,7 +1190,8 @@ void PlanningNode::plan_joint(
       planner->validate(request->group_name, initial, trajectory, true, std::nullopt,
                         /*mesh_along_path=*/true);
     const double validation_ms = single_waypoint ? 0. : elapsed_ms(phase_started);
-    publish(request->group_name, initial, trajectory);
+    validate_start(initial, trajectory);
+    publish(request->group_name, initial, trajectory, !execution->enabled());
     phase_started = Clock::now();
     execution->submit(request->group_name, trajectory, [] { return false; });
     RCLCPP_DEBUG(get_logger(),
@@ -1147,9 +1229,9 @@ void PlanningNode::plan_pose(const std::shared_ptr<interfaces::srv::PlanPoseGoal
   try {
     if (execution->active()) throw std::runtime_error("execution busy");
     execution->clear();
-    auto initial = state(), current = initial;
     auto phase_started = Clock::now();
     const auto &cloud = update_world(request->group_name);
+    auto initial = state(true), current = initial;
     RCLCPP_INFO(get_logger(), "【OPT · 场景】输入 %zu 点 ｜ 保留 %zu 点 ｜ %.1f ms",
                 cloud.raw_count, cloud.points.size(), elapsed_ms(phase_started));
     if (request->waypoints.empty() ||
@@ -1176,6 +1258,7 @@ void PlanningNode::plan_pose(const std::shared_ptr<interfaces::srv::PlanPoseGoal
         request->other_ee_link.empty() ? opposite : request->other_ee_link;
     if (!request->other_waypoints.empty() && other_tool != opposite)
       throw std::invalid_argument("secondary tool must be the opposite arm");
+    const bool single_waypoint = request->waypoints.size() == 1;
     std::vector<Trajectory> parts;
     std::vector<std::map<std::string, Transform>> route;
     for (size_t i = 0; i < request->waypoints.size(); ++i) {
@@ -1194,7 +1277,9 @@ void PlanningNode::plan_pose(const std::shared_ptr<interfaces::srv::PlanPoseGoal
                     rotation.x(), rotation.y(), rotation.z(), rotation.w());
       }
       phase_started = Clock::now();
-      auto result = planner->plan_pose(request->group_name, current, targets);
+      auto result = planner->plan_pose(request->group_name, current, targets, 3,
+                                       /*rrt_on_first_attempt=*/false,
+                                       /*validate_for_dispatch=*/single_waypoint);
       log_opt_result(get_logger(), i + 1, request->waypoints.size(), result, elapsed_ms(phase_started));
       if (!result.success) throw std::runtime_error(result.message);
       for (size_t j = 0; j < result.trajectory.joint_names.size(); ++j)
@@ -1203,23 +1288,28 @@ void PlanningNode::plan_pose(const std::shared_ptr<interfaces::srv::PlanPoseGoal
     }
     phase_started = Clock::now();
     Trajectory trajectory;
-    try {
-      trajectory = prepare_opt_trajectory(parts, robot->profile.groups.at(request->group_name),
-                                          planner->dynamic_limits(request->group_name), get_logger());
-    } catch (const std::runtime_error &error) {
-      if (std::string(error.what()) != "via waypoint cannot be passed continuously") throw;
-      RCLCPP_WARN(get_logger(), "【OPT · 拼接】无法连续通过路点，改用联合多路点求解");
-      const auto unified_started = Clock::now();
-      auto unified = planner->plan_pose_waypoints(request->group_name, initial, route);
-      log_opt_result(get_logger(), route.size(), route.size(), unified, elapsed_ms(unified_started));
-      if (!unified.success) throw std::runtime_error(unified.message);
-      trajectory = std::move(unified.trajectory);
+    if (single_waypoint) {
+      trajectory = std::move(parts.front());
+    } else {
+      try {
+        trajectory = prepare_opt_trajectory(parts, robot->profile.groups.at(request->group_name),
+                                            planner->dynamic_limits(request->group_name), get_logger());
+      } catch (const std::runtime_error &error) {
+        if (std::string(error.what()) != "via waypoint cannot be passed continuously") throw;
+        RCLCPP_WARN(get_logger(), "【OPT · 拼接】无法连续通过路点，改用联合多路点求解");
+        const auto unified_started = Clock::now();
+        auto unified = planner->plan_pose_waypoints(request->group_name, initial, route);
+        log_opt_result(get_logger(), route.size(), route.size(), unified, elapsed_ms(unified_started));
+        if (!unified.success) throw std::runtime_error(unified.message);
+        trajectory = std::move(unified.trajectory);
+      }
     }
     const double blend_ms = elapsed_ms(phase_started);
     phase_started = Clock::now();
-    planner->validate(request->group_name, initial, trajectory);
-    const double validation_ms = elapsed_ms(phase_started);
-    publish(request->group_name, initial, trajectory);
+    if (!single_waypoint) planner->validate(request->group_name, initial, trajectory);
+    const double validation_ms = single_waypoint ? 0. : elapsed_ms(phase_started);
+    validate_start(initial, trajectory);
+    publish(request->group_name, initial, trajectory, !execution->enabled());
     phase_started = Clock::now();
     execution->submit(request->group_name, trajectory, [] { return false; });
     RCLCPP_DEBUG(get_logger(),
@@ -1247,8 +1337,8 @@ void PlanningNode::compute_ik(const std::shared_ptr<interfaces::srv::ComputeIK::
     return;
   }
   try {
-    auto joints = state();
     update_world(request->group_name);
+    auto joints = state(true);
     auto result = planner->inverse_kinematics(
         request->group_name, joints,
         {{robot->profile.tools.at(request->group_name), in_base(request->pose)}});

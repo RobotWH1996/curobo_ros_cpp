@@ -31,6 +31,12 @@ class MockController {
           }
           workers_.emplace_back([this, handle, generation] {
             auto result = std::make_shared<Follow::Result>();
+            if (fail_execution) {
+              result->error_code = Follow::Result::PATH_TOLERANCE_VIOLATED;
+              handle->abort(result);
+              ++failed;
+              return;
+            }
             const auto &trajectory = handle->get_goal()->trajectory;
             const auto end = rclcpp::Time(trajectory.header.stamp) +
                              rclcpp::Duration(trajectory.points.back().time_from_start);
@@ -57,8 +63,8 @@ class MockController {
     std::lock_guard<std::mutex> guard(mutex_);
     return commands;
   }
-  std::atomic_int delay_ms{0}, cancelled{0};
-  std::atomic_bool reject{false};
+  std::atomic_int delay_ms{0}, cancelled{0}, failed{0};
+  std::atomic_bool reject{false}, fail_execution{false};
 
  private:
   rclcpp::Node::SharedPtr node_;
@@ -181,6 +187,50 @@ int main(int argc, char **argv) {
       std::cout << "PARTIAL_ADMISSION_CANCEL_PASS" << std::endl;
       executor.clear();
       gripper.reject = false;
+      gripper.fail_execution = true;
+      auto long_arm_motion = prefix;
+      long_arm_motion.points.back().time_from_start = duration(2.);
+      const int previous_arm_cancels = arm.cancelled;
+      executor.submit("left_arm", long_arm_motion, [] { return false; });
+      const auto failure_started = Clock::now();
+      bool gripper_failed = false;
+      try {
+        executor.wait([] { return false; });
+      } catch (const std::runtime_error &error) {
+        gripper_failed = std::string(error.what()).find("left_gripper_controller") != std::string::npos;
+      }
+      while (arm.cancelled == previous_arm_cancels && elapsed_ms(failure_started) < 600.)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      if (!gripper_failed || arm.cancelled == previous_arm_cancels || elapsed_ms(failure_started) >= 600.)
+        throw std::runtime_error("gripper execution failure did not promptly stop the arm");
+      std::cout << "PARALLEL_FAILURE_CANCEL_PASS" << std::endl;
+      executor.clear();
+      const int preceding_arm_cancels = arm.cancelled;
+      const int preceding_failures = gripper.failed;
+      executor.submit("left_arm", long_arm_motion, [] { return false; });
+      const auto preceding_started = Clock::now();
+      while (gripper.failed == preceding_failures && elapsed_ms(preceding_started) < 500.)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      if (gripper.failed == preceding_failures)
+        throw std::runtime_error("mock gripper did not return the preceding failure");
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      const auto arm_goals_before = arm.snapshot().size();
+      const auto gripper_goals_before = gripper.snapshot().size();
+      bool continuation_failed = false;
+      try {
+        executor.submit("left_arm", concatenate({long_arm_motion, suffix}), [] { return false; });
+      } catch (const std::runtime_error &error) {
+        continuation_failed =
+            std::string(error.what()).find("left_gripper_controller") != std::string::npos;
+      }
+      while (arm.cancelled == preceding_arm_cancels && elapsed_ms(preceding_started) < 600.)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      if (!continuation_failed || arm.cancelled == preceding_arm_cancels ||
+          arm.snapshot().size() != arm_goals_before || gripper.snapshot().size() != gripper_goals_before)
+        throw std::runtime_error("continuation replaced a failed gripper goal instead of stopping the arm");
+      std::cout << "FAILED_PRECEDING_CONTINUATION_CANCEL_PASS" << std::endl;
+      executor.clear();
+      gripper.fail_execution = false;
       executor.submit("left_arm", prefix, [] { return false; });
       arms = arm.snapshot();
       if (arms.back().points.front().positions[0] != 0. ||

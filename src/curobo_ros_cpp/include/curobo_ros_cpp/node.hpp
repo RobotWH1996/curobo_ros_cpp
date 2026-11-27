@@ -92,10 +92,13 @@ class PlanningNode : public rclcpp::Node {
     return value.get_value<Value>();
   }
   // 返回基于默认状态和最新关节反馈合并的全身快照。
-  // fresh 启用抓放的反馈接收年龄和必需关节校验。没有任何反馈时抛异常。
+  // fresh 逐项检查运动或碰撞相关关节的反馈接收年龄及数值。
   JointMap state(bool fresh = false);
+  // 下发首块前检查碰撞场景的参考关节状态及轨迹首帧。
+  void validate_start(const JointMap &expected, const Trajectory &trajectory,
+                      double gripper_tolerance = .002);
   // 将带坐标系的位姿转换到规划基座系。空 frame_id 按基座系解释。
-  // 对其他帧查询最新 TF，超时或位姿无效时抛异常。
+  // 对其他帧按位姿时间戳查询 TF，零时间戳使用最新值。
   Transform in_base(const geometry_msgs::msg::PoseStamped &pose);
   // 由持有 input_mutex_ 的调用方检查最新点云。
   bool cloud_is_fresh(double max_age_ms) const;
@@ -149,6 +152,19 @@ class PlanningNode : public rclcpp::Node {
   const PreparedCloud &prepare_world(const std::string &group,
                                      const sensor_msgs::msg::PointCloud2::ConstSharedPtr &cloud,
                                      bool silent = false);
+  struct CloudPreparation {
+    PreparedCloud cloud;
+    Clock::time_point started;
+    double tf_ms;
+    bool aligned;
+    bool filter_enabled;
+  };
+  std::optional<CloudPreparation> prepare_world_cloud(
+      const std::string &group, const sensor_msgs::msg::PointCloud2::ConstSharedPtr &cloud,
+      const Payloads &held, bool silent);
+  const PreparedCloud &commit_world_cloud(
+      const std::string &group, const sensor_msgs::msg::PointCloud2::ConstSharedPtr &cloud,
+      CloudPreparation candidate, bool silent);
   enum class PointCloudMode { Off, Optional, Required };
   // 处理关节路点规划服务。根据执行配置发布或提交验收后的轨迹。
   void plan_joint(const std::shared_ptr<interfaces::srv::PlanJointGoal::Request> request,
@@ -219,9 +235,9 @@ class PlanningNode : public rclcpp::Node {
   JointHistory joint_history_;
   std::map<std::string, std::set<std::string>> self_filter_joints_;
   std::map<std::string, Clock::time_point> joint_received_;  // 每个关节的反馈接收时间
-  double joint_stamp_ = 0.;                // 上一帧关节消息的 ROS 时间，秒
+  std::map<std::string, int64_t> joint_capture_;  // 每个关节最近接受的采集时间（ROS 纳秒）
+  std::set<std::string> planning_joints_;  // 需要实测的规划关节和碰撞连杆的关节依赖
   sensor_msgs::msg::PointCloud2::SharedPtr cloud_;  // 最新点云，可为空
-  Clock::time_point joint_time_;           // 最近一次关节消息的单调接收时间，供抓放使用
   Clock::time_point cloud_time_;           // 收到点云的本机时间
   interfaces::msg::MpcTarget::SharedPtr target_;    // 最新 MPC 目标
   Clock::time_point target_time_;          // 收到 MPC 目标的本机时间
@@ -236,6 +252,7 @@ class PlanningNode : public rclcpp::Node {
   std::optional<int64_t> payload_change_stamp_;
   std::map<std::string, std::set<std::string>> payload_pose_joints_;
   std::string cached_group_;               // 生成 cached_cloud_ 时的规划组
+  std::string cached_mode_;                // 生成 GPU 场景时的碰撞表示
   sensor_msgs::msg::PointCloud2::ConstSharedPtr cached_message_;
   bool cached_aligned_ = false;            // 临时保留的未过滤点云等待历史状态后重新处理
   bool cached_payload_ = false;            // 缓存时手上是否有工件

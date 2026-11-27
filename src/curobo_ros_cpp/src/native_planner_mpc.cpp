@@ -166,6 +166,7 @@ bool NativePlanner::validate_mpc_continuation(const std::string &name,
                                               const Trajectory &trajectory,
                                               double from, double until,
                                               double velocity_scale) {
+  require_valid_world();
   auto &group = get(name, true);
   const auto ordered = select_joints(trajectory, group.names);
   const double length = until - from;

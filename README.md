@@ -125,7 +125,7 @@ ros2 launch curobo_ros_cpp curobo_motion_planning_deploy.launch.py mode:=deploy
 
 日志出现「可以接收任务」时，节点已完成初始化。
 
-`debug.yaml` 把 `execute_trajectory` 设为 true，规划后向仿真控制器提交 `FollowJointTrajectory`。`deploy.yaml` 设为 false，只把轨迹发到话题，交给外部控制层。
+`debug.yaml` 把 `execute_trajectory` 设为 true，规划后通过 `FollowJointTrajectory` 向控制器提交，预览使用独立的可视化话题。`deploy.yaml` 设为 false，使用轨迹话题交给外部控制层。
 
 ## 一次抓取怎么规划
 
@@ -144,7 +144,7 @@ ros2 launch curobo_ros_cpp curobo_motion_planning_deploy.launch.py mode:=deploy
     └── 失败且图搜索是 rrt                 # 第 2、3 次才允许双向 RRT，给样条换初值
 ```
 
-结束段的目标已经是关节角，跳过逆解，直接从当前关节优化到目标关节。接触、抬升、撤退不走这棵树，它们是无碰撞查询的笛卡尔插补，但仍检查关节限位、速度限位、直线、姿态和连续性。
+结束段的目标已经是关节角，跳过逆解，直接从当前关节优化到目标关节。单臂抓取、抬升、放置和撤退使用笛卡尔插补，检查关节限位、动态限位、直线、姿态和连续性，跳过碰撞查询。预抓取、预放置及其他非接触段继续检查碰撞。
 
 `attempts=1` 且 `graph_ms=0` 表示第一次优化已经通过，没有调用 RRT。启动时的 `warmup_iterations` 是空跑，和这里的尝试次数无关。
 
@@ -165,7 +165,7 @@ ros2 launch curobo_ros_cpp curobo_motion_planning_deploy.launch.py mode:=deploy
     └── 提交
 ```
 
-`/place` 同样两段：接近和放置用 OPT 与接触插补，释放后把物体留在场景里，撤退沿用接触段规则。`gripper_duration` 仍留在消息里，节点不使用它。
+`/place` 的接近和放置用 OPT 与接触插补，携物参与非接触段的碰撞检查。释放后把工件留在场景里，撤退沿用接触段规则。`gripper_duration` 仍留在消息里，节点不使用它。
 
 `pointcloud_mode` 是启动参数，修改后重启节点。代码、debug 和 deploy 默认都用 `optional`。
 
@@ -258,7 +258,7 @@ ros2 service call /confirm_held_object std_srvs/srv/SetBool '{data: false}'
 └── /curobo/mpc_plan                       # FollowMpc 的周期结果
 ```
 
-跟随期间持续发送 `MpcTarget` 与运动关节反馈。`mpc_target_max_age` 和 `mpc_joint_state_max_age` 默认都是 1 秒，以本机单调接收时间判断。目标或关节反馈过期时，Action 中止并请求取消控制器目标。`/curobo/mpc_plan` 的成功结果携带交接起点，轨迹点的 `time_from_start` 相对该起点计时。
+跟随期间持续发送 `MpcTarget` 与规划及碰撞模型需要的关节反馈。`mpc_target_max_age` 和 `mpc_joint_state_max_age` 默认都是 1 秒，以本机单调接收时间判断。目标或关节反馈过期时，Action 中止并停止相应执行后端。话题执行模式的 `/curobo/mpc_plan` 成功结果携带交接起点，轨迹点的 `time_from_start` 相对该起点计时。直接控制器模式通过 Action 反馈结果。
 
 普通 MPC 可用 `./src/curobo_ros_cpp/tests/call_follow_mpc.sh` 测试三个循环路点。调试配置启用 `mpc_follow_joint_goal`，用碰撞检查通过的 IK 解确定关节终点，再由 MPC 滚动求解。debug 和 deploy 默认都启用 `mpc_follow_joint_goal`，跟随速度倍率均为 `0.425`（再乘以 `mpc_velocity_scale`）。路点停留时间由 `tests/follow_mpc_waypoints.yaml` 配置。
 
@@ -282,13 +282,14 @@ source install/setup.bash
 colcon build --packages-select curobo_ros_cpp --cmake-args -DBUILD_TARGETED_VALIDATION=ON
 source install/setup.bash
 export ROS_LOCALHOST_ONLY=1
-ROS_DOMAIN_ID=175 build/curobo_ros_cpp/validate_executor
+ctest --test-dir build/curobo_ros_cpp --output-on-failure
+export CUROBO_SNAPSHOT_DIR=/path/to/recorded_case
 ROS_DOMAIN_ID=176 build/curobo_ros_cpp/validate_snapshot \
-  --ros-args --params-file /tmp/curobo_cpp_20261112/case/parameters.yaml \
+  --ros-args --params-file "$CUROBO_SNAPSHOT_DIR/parameters.yaml" \
   -p execute_trajectory:=false
 ```
 
-`validate_executor` 自行启动假控制器，验证分块续接、取消和确认超时。`validate_snapshot` 使用已录制的关节、TF 和点云，覆盖碰撞、抓放、规划服务和 MPC。回放依赖 `ai` 上已有的 `/tmp/curobo_cpp_20261112/case/` 样本及本工作区的 AOT 产物。
+`validate_executor` 自行启动假控制器，验证分块续接、取消和确认超时。`validate_snapshot` 使用已录制的关节、TF 和点云，覆盖碰撞、抓放、规划服务和 MPC。使用隔离的 ROS 域，回放目录应包含 `case.yaml`、`cloud.bin` 和对应的参数文件，规划产物从节点配置的 `artifacts_directory` 读取。
 
 ## 离线导出
 

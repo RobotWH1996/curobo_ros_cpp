@@ -5,6 +5,7 @@
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 
 namespace curobo_ros_cpp {
 namespace {
@@ -26,10 +27,14 @@ Eigen::VectorXd eigen(const std::vector<float> &values) {
 NativePlanner::NativePlanner(RobotModel &robot, std::string artifacts,
                              PlannerSettings configuration)
     : settings(std::move(configuration)), robot_(robot), artifacts_(std::move(artifacts)) {
-  if (settings.device.rfind("cuda:", 0) == 0) {
-    const int device = std::stoi(settings.device.substr(5));
-    check_cuda(cudaSetDevice(device));
-  }
+  if (settings.device != "cuda:0")
+    throw std::invalid_argument("mpc_device must be cuda:0 in the ROS native runtime");
+  if (!std::isfinite(settings.dt) || settings.dt <= 0. ||
+      settings.dt > std::numeric_limits<float>::max() || static_cast<float>(settings.dt) == 0.F)
+    throw std::invalid_argument("interpolation_dt must be a positive, finite CUDA float");
+  if (settings.iterations <= 0)
+    throw std::invalid_argument("trajopt_num_iters must be positive");
+  check_cuda(cudaSetDevice(0));
   curobo::robot::SceneConfig scene;
   scene.max_cuboids = 32;
   scene.max_capsules = 0;
@@ -54,6 +59,17 @@ std::unique_ptr<NativePlanner::Group> NativePlanner::create_group(const std::str
                         ? role_root
                         : std::filesystem::path(artifacts_) / name / std::to_string(knots);
   group->metadata = YAML::LoadFile((root / "deployment.json").string());
+  const auto &metadata = group->metadata;
+  if ((metadata["group"] && metadata["group"].as<std::string>() != name) ||
+      (metadata["role"] && metadata["role"].as<std::string>() != (mpc_mode ? "mpc" : "opt")))
+    throw std::runtime_error("artifact planning group or solver role differs from configuration");
+  if (const auto target = metadata["target_device"]; target && target["arch"]) {
+    cudaDeviceProp device{};
+    check_cuda(cudaGetDeviceProperties(&device, 0));
+    const auto architecture = "sm_" + std::to_string(device.major) + std::to_string(device.minor);
+    if (target["arch"].as<std::string>() != architecture)
+      throw std::runtime_error("artifact GPU architecture differs from the runtime device");
+  }
   const auto kin = YAML::LoadFile((root / "robot_kinematics_manifest.json").string());
   const auto trajopt = YAML::LoadFile((root / "robot_trajopt_manifest.json").string());
   group->interpolation_steps = trajopt["spline_layout"]["interpolation_steps"].as<int>();
@@ -111,12 +127,16 @@ std::unique_ptr<NativePlanner::Group> NativePlanner::create_group(const std::str
   opt.interpolation_dt = settings.dt;
   const int artifact_capacity = trajopt["interpolation_buffer_size"].as<int>();
   if (!mpc_mode && settings.interpolation_buffer_size > 0) {
-    const double artifact_dt = trajopt["interpolation_dt"].as<double>();
+    const double artifact_dt = trajopt["interpolation_dt"].as<float>();
     const int artifact_min = trajopt["minimum_interpolation_buffer_size"].as<int>();
-    const int effective_min =
-        static_cast<int>(std::ceil((artifact_min - 1) * artifact_dt / settings.dt)) + 1;
+    const double required_samples = std::ceil(
+        (static_cast<double>(artifact_min) - 1.) * artifact_dt / opt.interpolation_dt) + 1.;
+    if (!std::isfinite(required_samples) || required_samples < 1. || required_samples > artifact_capacity)
+      throw std::invalid_argument("interpolation_dt exceeds exported interpolation buffer capacity");
     opt.interpolation_buffer_size =
-        std::clamp(settings.interpolation_buffer_size, effective_min, artifact_capacity);
+        std::clamp(settings.interpolation_buffer_size, static_cast<int>(required_samples), artifact_capacity);
+  } else if (!mpc_mode && settings.interpolation_buffer_size < 0) {
+    throw std::invalid_argument("trajopt_interpolation_buffer_size must be non-negative");
   }
   configuration.use_cuda_graph = settings.cuda_graph;
   configuration.inverse_kinematics.num_seeds = settings.ik_seeds;
@@ -239,6 +259,7 @@ std::vector<float> NativePlanner::positions(const Group &group, const JointMap &
 }
 // 把当前关节写进锁定关节和活动关节，保证模型和机器人一致。
 void NativePlanner::synchronize(const std::string &name, const JointMap &state, bool mpc) {
+  require_valid_world();
   auto &group = get(name, mpc);
   auto transforms = group.nominal_fixed;
   for (const auto &joint : group.fixed_joints) {

@@ -244,6 +244,7 @@ std::shared_ptr<interfaces::action::FollowMpc::Result> PlanningNode::follow_mpc(
     Trajectory path;
   };
   std::deque<QueuedPrefix> queued;
+  std::optional<rclcpp::Time> reviewed_prefix_end;
   sensor_msgs::msg::PointCloud2::SharedPtr processed_cloud;
   auto accepted_at = started;
   double knot_dt = .14;
@@ -281,7 +282,7 @@ std::shared_ptr<interfaces::action::FollowMpc::Result> PlanningNode::follow_mpc(
     if (!target_->has_left && !target_->has_right) return "MPC target cleared";
     if (scene_ready && pointcloud_mode_ != PointCloudMode::Off && !cloud_is_fresh(cloud_max_age_ms))
       return "MPC pointcloud expired or unavailable";
-    for (const auto &name : robot->profile.groups.at(group))
+    for (const auto &name : planning_joints_)
       if (const auto failure = joint_failure(name)) return failure;
     return nullptr;
   };
@@ -375,6 +376,7 @@ std::shared_ptr<interfaces::action::FollowMpc::Result> PlanningNode::follow_mpc(
         reset = true;
         accepted = Trajectory{};
         queued.clear();
+        reviewed_prefix_end.reset();
         consumed_knots = 0;
       }
       check();
@@ -407,7 +409,7 @@ std::shared_ptr<interfaces::action::FollowMpc::Result> PlanningNode::follow_mpc(
       JointMap velocities;
       {
         std::lock_guard<std::mutex> guard(input_mutex_);
-        for (const auto &name : robot->profile.groups.at(group))
+        for (const auto &name : planning_joints_)
           if (const auto failure = joint_failure(name)) throw std::runtime_error(failure);
         for (const auto &joint : joints_) joints[joint.first] = joint.second;
         velocities = joint_velocity_;
@@ -539,27 +541,30 @@ std::shared_ptr<interfaces::action::FollowMpc::Result> PlanningNode::follow_mpc(
         std::optional<rclcpp::Time> reference_origin;
         bool brake_rebased = false;
         double obstacle_brake_ms = 0.;
+        const auto prefix_safe = [&](const rclcpp::Time &stamp, const rclcpp::Time &until) {
+          const auto safe_interval = [&](const Trajectory &path, const rclcpp::Time &origin,
+                                         const rclcpp::Time &end) {
+            const double first = std::max(0., (stamp - origin).seconds());
+            const double last = std::min((end - origin).seconds(),
+                                         seconds(path.points.back().time_from_start));
+            return last <= first ||
+                planner->validate_mpc_continuation(group, path, first, last, execution_scale);
+          };
+          for (size_t i = 0; i < queued.size(); ++i) {
+            const auto &end = i + 1 < queued.size() ? queued[i + 1].origin : accepted_origin;
+            if (!safe_interval(queued[i].path, queued[i].origin, std::min(until, end)))
+              return false;
+          }
+          return safe_interval(accepted, accepted_origin, until);
+        };
         if (continuing && scene_changed) {
           planner->synchronize(group, joints, true);
           const auto stamp = now();
-          const auto is_safe = [&](const rclcpp::Time &until) {
-            const auto safe_interval = [&](const Trajectory &path, const rclcpp::Time &origin,
-                                           const rclcpp::Time &end) {
-              const double first = std::max(0., (stamp - origin).seconds());
-              const double last = std::min((end - origin).seconds(),
-                                           seconds(path.points.back().time_from_start));
-              return last <= first ||
-                  planner->validate_mpc_continuation(group, path, first, last, execution_scale);
-            };
-            for (size_t i = 0; i < queued.size(); ++i) {
-              const auto &end = i + 1 < queued.size() ? queued[i + 1].origin : accepted_origin;
-              if (!safe_interval(queued[i].path, queued[i].origin, std::min(until, end)))
-                return false;
-            }
-            return safe_interval(accepted, accepted_origin, until);
-          };
-          const auto review_end = stamp + rclcpp::Duration(duration(kObstacleLookahead));
-          if (!is_safe(review_end)) {
+          const auto review_end = std::max(stamp + rclcpp::Duration(duration(kObstacleLookahead)),
+                                          accepted_origin + rclcpp::Duration(duration(handoff_time)));
+          if (prefix_safe(stamp, review_end)) {
+            reviewed_prefix_end = review_end;
+          } else {
             const auto brake_started = Clock::now();
             const auto first_origin = queued.empty() || execution->enabled()
                 ? accepted_origin : queued.front().origin;
@@ -588,9 +593,9 @@ std::shared_ptr<interfaces::action::FollowMpc::Result> PlanningNode::follow_mpc(
                 }
               }
               const double seam = (start_at - source_origin).seconds();
-              if (seam >= seconds(source->points.back().time_from_start))
+              if (seam < 0. || seam >= seconds(source->points.back().time_from_start))
                 throw std::runtime_error("MPC queued trajectory ends before the earliest braking splice");
-              if (!is_safe(start_at))
+              if (!prefix_safe(stamp, start_at))
                 throw std::runtime_error("MPC queued prefix failed safety validation before the earliest braking splice");
               if (start_at < now() + submit_lead) continue;
               const auto start = sample_trajectory(*source, seam);
@@ -631,6 +636,7 @@ std::shared_ptr<interfaces::action::FollowMpc::Result> PlanningNode::follow_mpc(
               proposal.success = true;
               braking = true;
               obstacle_origin = start_at;
+              reviewed_prefix_end = start_at;
               start_source = "新障碍制动";
               break;
             }
@@ -830,8 +836,7 @@ std::shared_ptr<interfaces::action::FollowMpc::Result> PlanningNode::follow_mpc(
           const double elapsed = std::max(0., (now() - accepted_origin).seconds());
           const double recovery_time = elapsed + kRecoveryLead;
           if (recovery_time < seconds(accepted.points.back().time_from_start)) {
-            if (!planner->validate_mpc_continuation(group, accepted, elapsed, recovery_time,
-                                                    execution_scale))
+            if (!prefix_safe(now(), accepted_origin + rclcpp::Duration(duration(recovery_time))))
               throw std::runtime_error("MPC queued prefix failed safety validation; stopping stream; "
                                        "new prediction: " + proposal.message);
             const auto start = sample_trajectory(accepted, recovery_time);
@@ -875,6 +880,13 @@ std::shared_ptr<interfaces::action::FollowMpc::Result> PlanningNode::follow_mpc(
           if (!obstacle_origin && target_superseded(target)) {
             initialize_next_seed = true;
             continue;
+          }
+          // A later splice can outlive the last obstacle review, even on a tick with no new cloud.
+          if (continuing && reviewed_prefix_end && origin > *reviewed_prefix_end) {
+            planner->synchronize(group, joints, true);
+            if (!prefix_safe(now(), origin))
+              throw std::runtime_error("MPC queued prefix failed safety validation up to the new handoff");
+            reviewed_prefix_end = origin;
           }
           lead_ms = (origin - now()).seconds() * 1000.;
           const bool within_window = origin >= now() + rclcpp::Duration(duration(kMpcSubmitLead));
@@ -931,6 +943,7 @@ std::shared_ptr<interfaces::action::FollowMpc::Result> PlanningNode::follow_mpc(
             accepted = trajectory;
             accepted_target = target;
             accepted_origin = origin;
+            reviewed_prefix_end.reset();
             accepted_at = Clock::now();
             consumed_knots = 0;
             reset = false;
@@ -944,8 +957,10 @@ std::shared_ptr<interfaces::action::FollowMpc::Result> PlanningNode::follow_mpc(
               lead_ms = (origin - now()).seconds() * 1000.;
               if (!execution->enabled() && lead_ms < kMpcSubmitLead * 1000.)
                 throw std::runtime_error("MPC obstacle brake missed the publish deadline; stopping stream");
-              mpc_pub_->publish(message);
-              published = true;
+              if (!execution->enabled()) {
+                mpc_pub_->publish(message);
+                published = true;
+              }
               RCLCPP_INFO(get_logger(),
                           "【MPC 跟随 · 新障碍】已发布制动 ｜ 求解 %.1f ms ｜ 提前量 %.1f ms ｜ 重选接续 %s",
                           obstacle_brake_ms, lead_ms, brake_rebased ? "是" : "否");
@@ -992,7 +1007,7 @@ std::shared_ptr<interfaces::action::FollowMpc::Result> PlanningNode::follow_mpc(
                     message.left.position_error, message.right.position_error, message.solve_time * 1000.,
                     dispatch, message.message.c_str());
       }
-      if (!published) mpc_pub_->publish(message);
+      if (!published && !execution->enabled()) mpc_pub_->publish(message);
       if (result->success) break;
       auto feedback = std::make_shared<interfaces::action::FollowMpc::Feedback>();
       feedback->left_target_valid = message.left.target_valid;
@@ -1021,7 +1036,7 @@ std::shared_ptr<interfaces::action::FollowMpc::Result> PlanningNode::follow_mpc(
   }
   if (!result->success && owns_execution) {
     execution->cancel();
-    if (rclcpp::ok()) {
+    if (rclcpp::ok() && !execution->enabled()) {
       interfaces::msg::MpcPlan stopped_plan;
       stopped_plan.header.stamp = now();
       stopped_plan.header.frame_id = base;
